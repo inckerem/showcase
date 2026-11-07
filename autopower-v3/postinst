@@ -1,0 +1,49 @@
+#!/bin/sh
+set -e
+if [ "${1:-}" = configure ]; then
+  if [ -L /var/lib/showcase-power ]; then echo 'Gecersiz guc dizini' >&2; exit 1; fi
+  mkdir -p /var/lib/showcase-power
+  chown 0:0 /var/lib/showcase-power
+  chmod 0755 /var/lib/showcase-power
+  if [ -L /var/lib/showcase-power/lock ] || { [ -e /var/lib/showcase-power/lock ] && [ ! -f /var/lib/showcase-power/lock ]; }; then
+    echo 'Gecersiz kilit dosyasi' >&2; exit 1
+  fi
+  if [ ! -e /var/lib/showcase-power/lock ]; then (umask 022; : > /var/lib/showcase-power/lock); fi
+  chown 0:0 /var/lib/showcase-power/lock
+  chmod 0644 /var/lib/showcase-power/lock
+  if [ -L /var/lib/showcase-power/initialized ] || { [ -e /var/lib/showcase-power/initialized ] && [ ! -f /var/lib/showcase-power/initialized ]; }; then
+    echo 'Gecersiz servis durum dosyasi' >&2; exit 1
+  fi
+  if [ ! -e /var/lib/showcase-power/initialized ]; then
+    /usr/libexec/showcase-powerd --reset
+    (umask 022; : > /var/lib/showcase-power/initialized)
+    chown 0:0 /var/lib/showcase-power/initialized
+    chmod 0644 /var/lib/showcase-power/initialized
+  fi
+  if [ -L /var/lib/showcase-power/enabled ] || { [ -e /var/lib/showcase-power/enabled ] && [ ! -f /var/lib/showcase-power/enabled ]; }; then
+    echo 'Gecersiz etkinlestirme dosyasi' >&2; exit 1
+  fi
+  (umask 022; : > /var/lib/showcase-power/enabled)
+  chown 0:0 /var/lib/showcase-power/enabled
+  chmod 0644 /var/lib/showcase-power/enabled
+  /bin/launchctl unload /Library/LaunchDaemons/tr.net.kcs.showcase.powerd.plist 2>/dev/null || true
+  if ! /bin/launchctl load /Library/LaunchDaemons/tr.net.kcs.showcase.powerd.plist; then
+    rm -f /var/lib/showcase-power/enabled
+    echo 'Guc servisi yuklenemedi.' >&2
+    exit 1
+  fi
+  running=0
+  for attempt in 1 2 3 4 5 6 7 8; do
+    job=$(/bin/launchctl list tr.net.kcs.showcase.powerd 2>/dev/null || true)
+    case "$job" in *'"PID" = '[1-9]*';'*) running=1; break ;; esac
+    sleep 1
+  done
+  if [ "$running" -ne 1 ]; then
+    rm -f /var/lib/showcase-power/enabled
+    /bin/launchctl unload /Library/LaunchDaemons/tr.net.kcs.showcase.powerd.plist 2>/dev/null || true
+    echo 'Guc servisi calisir durumda dogrulanamadi.' >&2
+    exit 1
+  fi
+  echo 'Showcase uygulamasini tamamen kapatin; sonra sarj kablosunu cikarip yeniden takin.'
+fi
+exit 0

@@ -52,11 +52,11 @@ static void bt_progress(uint64_t bits) {
 /* ══════════════════════════════════════════════════
  *  Configuration — populated from argv at startup.
  *  CLI args:  --name <car>   --ssid <hotspot>   --pass <password>
- *  Defaults are kept in case the binary is run standalone.
+ *  Credentials must be supplied explicitly; --pass is kept for standalone use.
  * ══════════════════════════════════════════════════ */
 static char kDeviceName[32]    = "RoadLink";
-static char kWifiSSID[64]      = "RoadLink-CarPlay";
-static char kWifiPassword[64]  = "roadlink1234";
+static char kWifiSSID[64]      = "";
+static char kWifiPassword[64]  = "";
 static const uint8_t kWifiSecurityType = 2;   /* 0=None, 1=WEP, 2=WPA/WPA2 */
 #define BT_READY_PATH "/tmp/showcase_bt_ready"
 #define BT_DOWN_PATH  "/tmp/showcase_bt_down"
@@ -76,19 +76,43 @@ static int g_wifi_channel = 0;          /* 0 = unknown / omit */
 static uint8_t g_ap_bssid[6] = {0};
 static int g_have_ap_bssid = 0;
 
-static void parse_args(int argc, char *argv[]) {
+static int parse_args(int argc, char *argv[]) {
+    int have_ssid = 0, have_password = 0;
+    if ((argc % 2) == 0) return -1;
     for (int i = 1; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--name") || !strcmp(argv[i], "-n")) {
             strncpy(kDeviceName, argv[i+1], sizeof(kDeviceName) - 1);
             kDeviceName[sizeof(kDeviceName) - 1] = '\0';
         } else if (!strcmp(argv[i], "--ssid") || !strcmp(argv[i], "-s")) {
+            if (!argv[i+1][0] || strlen(argv[i+1]) >= sizeof(kWifiSSID)) return -1;
             strncpy(kWifiSSID, argv[i+1], sizeof(kWifiSSID) - 1);
             kWifiSSID[sizeof(kWifiSSID) - 1] = '\0';
+            have_ssid = 1;
         } else if (!strcmp(argv[i], "--pass") || !strcmp(argv[i], "-p")) {
+            if (have_password || !argv[i+1][0] || strlen(argv[i+1]) >= sizeof(kWifiPassword)) return -1;
             strncpy(kWifiPassword, argv[i+1], sizeof(kWifiPassword) - 1);
             kWifiPassword[sizeof(kWifiPassword) - 1] = '\0';
+            have_password = 1;
+        } else if (!strcmp(argv[i], "--pass-stdin")) {
+            if (have_password) return -1;
+            size_t used = 0;
+            unsigned char byte;
+            for (;;) {
+                ssize_t n = read(STDIN_FILENO, &byte, 1);
+                if (n < 0 && errno == EINTR) continue;
+                if (n < 0) { memset(kWifiPassword, 0, sizeof(kWifiPassword)); return -1; }
+                if (n == 0) break;
+                if (used >= sizeof(kWifiPassword) - 1 || byte == 0) {
+                    memset(kWifiPassword, 0, sizeof(kWifiPassword)); return -1;
+                }
+                kWifiPassword[used++] = (char)byte;
+            }
+            if (used == 0) return -1;
+            kWifiPassword[used] = '\0';
+            have_password = 1;
         }
     }
+    return have_ssid && have_password ? 0 : -1;
 }
 
 /* ══════════════════════════════════════════════════
@@ -188,6 +212,7 @@ static int wifi_config_request_count = 0;
 static int wifi_config_send_count = 0;
 static int wifi_config_retry_count = 0;
 static int mfi_auth_succeeded = 0;
+static int mfi_challenge_answered = 0;
 static int handoff_watchdog_armed = 0;
 static unsigned int handoff_generation = 0;
 static char wifi_ipv6[INET6_ADDRSTRLEN] = "";
@@ -206,6 +231,7 @@ static void reset_wireless_handoff_state(void) {
     wifi_config_send_count = 0;
     wifi_config_retry_count = 0;
     mfi_auth_succeeded = 0;
+    mfi_challenge_answered = 0;
     handoff_watchdog_armed = 0;
     wifi_ipv6[0] = '\0';
 }
@@ -563,6 +589,7 @@ static void send_auth_response(uint8_t *chal, int clen) {
         PB pb; pb_init(&pb,256);
         pb_blob(&pb,0x0000,sig,sigLen);
         send_control_msg(0xAA03,pb.buf,pb.off); pb_free(&pb);
+        mfi_challenge_answered = 1;
     }
     free(sig);
 }
@@ -918,7 +945,21 @@ static void bluetooth_handoff_signal_handler(int sig) {
 /* ═══════════════════════════════════════════════
  *  Control message handler
  * ═══════════════════════════════════════════════ */
+static bool valid_control_params(const uint8_t *params, int plen) {
+    if (plen < 0) return false;
+    /* Every control parameter has a four-byte length/id header. Reject the
+     * entire message before any handler can act on a truncated parameter. */
+    for (int off = 0; off < plen;) {
+        if (plen - off < 4) return false;
+        int param_len = (params[off] << 8) | params[off + 1];
+        if (param_len < 4 || param_len > plen - off) return false;
+        off += param_len;
+    }
+    return true;
+}
+
 static void handle_ctrl_msg(uint16_t msg_id, uint8_t *params, int plen) {
+    if (!valid_control_params(params, plen)) return;
     printf("[CTRL] msg=0x%04X (%d bytes)\n", msg_id, plen);
 
     switch (msg_id) {
@@ -935,12 +976,26 @@ static void handle_ctrl_msg(uint16_t msg_id, uint8_t *params, int plen) {
         }
         break;
     }
-    case 0xAA04: printf("[CP] *** AUTH FAILED ***\n"); break;
+    case 0xAA04:
+        mfi_auth_succeeded = 0;
+        mfi_challenge_answered = 0;
+        printf("[CP] *** AUTH FAILED ***\n"); break;
     case 0xAA05:
+        if (!mfi_challenge_answered) {
+            printf("[CP] Ignoring unexpected auth success\n");
+            break;
+        }
+        mfi_challenge_answered = 0;
         mfi_auth_succeeded = 1;
         printf("[CP] *** AUTH SUCCEEDED! ***\n");
         save_last_iphone();
         bt_progress(BT_PROGRESS_AUTHORIZED);
+        if (wifi_config_requested || transport_notification_seen) {
+            if (send_accessory_wifi_config("deferred after authentication")) {
+                if (transport_notification_seen) wifi_config_sent_post_transport = 1;
+                else wifi_config_sent_pre_transport = 1;
+            }
+        }
         maybe_start_handoff_watchdog();
         break;
 
@@ -1000,6 +1055,10 @@ static void handle_ctrl_msg(uint16_t msg_id, uint8_t *params, int plen) {
                wireless_carplay_connecting_seen,
                start_session_sent);
 
+        if (!mfi_auth_succeeded) {
+            printf("[WIFI] Deferring configuration until authentication succeeds\n");
+            break;
+        }
         if (transport_notification_seen) {
             printf("[WIFI] 0x5702 after 0x4E0E: sending POST-TRANSPORT retry minimal 0x5703 retry=%d\n",
                    wifi_config_retry_count + 1);
@@ -1137,7 +1196,7 @@ static void handle_ctrl_msg(uint16_t msg_id, uint8_t *params, int plen) {
                wifi_config_sent_post_transport);
 
         printf("[WIFI] 0x4E0E received: sending POST-TRANSPORT from 0x4E0E minimal 0x5703\n");
-        if (send_accessory_wifi_config("POST-TRANSPORT from 0x4E0E minimal")) {
+        if (mfi_auth_succeeded && send_accessory_wifi_config("POST-TRANSPORT from 0x4E0E minimal")) {
             wifi_config_sent_post_transport = 1;
             maybe_start_handoff_watchdog();
         }
@@ -1146,7 +1205,7 @@ static void handle_ctrl_msg(uint16_t msg_id, uint8_t *params, int plen) {
          * join our WiFi. Send 0x4301 CarPlayStartSession with the receiver's
          * connection details so the iPhone knows WHERE to connect for AirPlay.
          * Send immediately — RFCOMM may close shortly after. */
-        send_carplay_start_session("post-0x4E0E");
+        if (mfi_auth_succeeded) send_carplay_start_session("post-0x4E0E");
         break;
     }
 
@@ -1238,6 +1297,83 @@ static void handle_ctrl_msg(uint16_t msg_id, uint8_t *params, int plen) {
 /* ═══════════════════════════════════════════════
  *  BTstack packet handler
  * ═══════════════════════════════════════════════ */
+static uint8_t iap2_rx[65535];
+static size_t iap2_rx_len;
+
+static void handle_iap2_frame(uint8_t *pkt, size_t sz) {
+    if (sz >= 6 && memcmp(pkt, iap2_detect, 6) == 0 && !iap2_detected) {
+        iap2_detected=1; alarm(0);
+        srand(time(NULL));
+        my_initial_psn=(rand()%254)+1;
+        my_next_psn=my_initial_psn+1;
+        send_syn();
+        return;
+    }
+    if (sz < 9 || pkt[0] != 0xff || pkt[1] != 0x5a || ck(pkt, 8) != pkt[8]) return;
+    if (sz > 9 && ck(pkt + 9, (int)sz - 10) != pkt[sz - 1]) return;
+    uint8_t ctrl=pkt[4], seq=pkt[5], ack=pkt[6], session=pkt[7];
+    if (ctrl == 0x10) {
+        link_established=0; reset_wireless_handoff_state();
+        my_initial_psn=(rand()%254)+1; my_next_psn=my_initial_psn+1;
+        send_syn(); return;
+    }
+    if ((ctrl & 0xc0) == 0xc0 && !link_established) {
+        peer_psn=seq;
+        if (ack == my_initial_psn) { send_ack(); link_established=1; }
+        return;
+    }
+    if (!link_established) return;
+    peer_psn=seq;
+    if ((ctrl & 0x40) && session == 1 && sz > 10) {
+        size_t off=9, end=sz-1;
+        while (end-off >= 6) {
+            uint8_t *m=pkt+off;
+            size_t mlen=((size_t)m[2]<<8)|m[3];
+            if (m[0]!=0x40 || m[1]!=0x40 || mlen<6 || mlen>end-off) return;
+            off+=mlen;
+        }
+        if (off!=end) return;
+        send_ack();
+        off=9;
+        while (off<end) {
+            uint8_t *m=pkt+off;
+            size_t mlen=((size_t)m[2]<<8)|m[3];
+            handle_ctrl_msg((m[4]<<8)|m[5], m+6, (int)mlen-6);
+            off+=mlen;
+        }
+    }
+}
+
+/* RFCOMM delivers a stream; one callback need not equal one iAP2 frame. */
+static void receive_iap2(const uint8_t *data, size_t len) {
+    while (len--) {
+        if (iap2_rx_len == sizeof(iap2_rx)) iap2_rx_len = 0;
+        iap2_rx[iap2_rx_len++] = *data++;
+        for (;;) {
+            if (iap2_rx_len && iap2_rx[0] != 0xff) {
+                memmove(iap2_rx, iap2_rx+1, --iap2_rx_len); continue;
+            }
+            if (iap2_rx_len < 2) break;
+            if (iap2_rx[1] != 0x55 && iap2_rx[1] != 0x5a) {
+                memmove(iap2_rx, iap2_rx+1, --iap2_rx_len); continue;
+            }
+            size_t frame_len;
+            if (iap2_rx[1] == 0x55) frame_len=6;
+            else {
+                if (iap2_rx_len < 4) break;
+                frame_len=((size_t)iap2_rx[2]<<8)|iap2_rx[3];
+                if (frame_len < 9) {
+                    memmove(iap2_rx, iap2_rx+1, --iap2_rx_len); continue;
+                }
+            }
+            if (iap2_rx_len < frame_len) break;
+            handle_iap2_frame(iap2_rx, frame_len);
+            iap2_rx_len -= frame_len;
+            memmove(iap2_rx, iap2_rx+frame_len, iap2_rx_len);
+        }
+    }
+}
+
 static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
     if(packet_debug_count < 24) {
         printf("[BT] packet type=%u ch=0x%04x len=%u", type, ch, sz);
@@ -1255,54 +1391,14 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
         exit(62);
     }
 
-    if(type==4&&pkt[0]==0x6c) return;
+    if(type==4&&sz>=1&&pkt[0]==0x6c) return;
 
     if(type==7) {
-        if(sz>=6&&memcmp(pkt,iap2_detect,6)==0&&!iap2_detected) {
-            printf("[CP] *** DETECT ECHO ***\n");
-            iap2_detected=1; alarm(0);
-            srand(time(NULL));
-            my_initial_psn=(rand()%254)+1;
-            if (my_initial_psn == 0xFF) my_initial_psn = 0x7F;
-            my_next_psn=my_initial_psn+1;
-            send_syn(); return;
-        }
-        if(sz>=5&&pkt[0]==0xFF&&pkt[1]==0x5A) {
-            uint8_t ctrl=pkt[4],seq=pkt[5],ack=pkt[6],session=pkt[7];
-            if(ctrl==0x10){
-                printf("[CP] RST\n"); link_established=0; usleep(500000);
-                my_initial_psn=(rand()%254)+1;
-                if (my_initial_psn == 0xFF) my_initial_psn = 0x7F;
-                my_next_psn=my_initial_psn+1;
-                send_syn(); return;
-            }
-            if((ctrl&0xC0)==0xC0&&!link_established) {
-                peer_psn=seq;
-                printf("[SYN-ACK] seq=0x%02X ack=0x%02X\n", seq, ack);
-                if(sz>9) {
-                    printf("[SYN-ACK] payload(%d):", sz-9);
-                    for(int i=9;i<sz&&i<40;i++) printf(" %02X",pkt[i]);
-                    printf("\n");
-                }
-                if(ack==my_initial_psn){send_ack();link_established=1;printf("[CP] *** LINK UP ***\n");}
-                return;
-            }
-            peer_psn=seq;
-            if((ctrl&0x40)&&session!=0&&sz>10) {
-                send_ack();
-                uint8_t *m=&pkt[9]; int pl=sz-10;
-                if(pl>=6&&m[0]==0x40&&m[1]==0x40) {
-                    uint16_t mlen=(m[2]<<8)|m[3], mid=(m[4]<<8)|m[5];
-                    handle_ctrl_msg(mid,&m[6],mlen-6);
-                }
-                return;
-            }
-            if(ctrl==0x40) return;
-        }
+        if (active_cid && ch == active_cid) receive_iap2(pkt, sz);
         return;
     }
 
-    if(type==5||type!=4) return;
+    if(type!=4 || sz<1) return;
 
     /* Capture BD_ADDR from HCI Read BD_ADDR command complete */
     if(pkt[0]==0x0E && sz>=12 && !have_local_addr) {
@@ -1350,9 +1446,10 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
 
     switch(pkt[0]) {
     case 0x60:
-        if(pkt[2]==2) perform_bt_setup();
+        if(sz>=3 && pkt[2]==2) perform_bt_setup();
         break;
     case 0x04: {
+        if(sz<8) break;
         bd_addr_t a;memcpy(a,&pkt[2],6);
         if (bluetooth_handoff_requested) {
             printf("[HANDOFF] ignoring Bluetooth reconnect after Wi-Fi handoff\n");
@@ -1374,7 +1471,7 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
     case 0x05:
         printf("[CP] Disconnected handle=0x%04X reason=0x%02X\n",
                sz > 4 ? R16(pkt,3) : 0, sz > 5 ? pkt[5] : 0xff);
-        active_cid=0;iap2_detected=0;link_established=0;reset_wireless_handoff_state();
+        active_cid=0;iap2_detected=0;link_established=0;iap2_rx_len=0;reset_wireless_handoff_state();
         schedule_page(PAGE_RETRY_MS);
         break;
     case 0x06:
@@ -1393,6 +1490,7 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
         if(sz > 24) { print_hci_addr("[CP] Link key notification for ", &pkt[2]); printf(" type=0x%02X\n", pkt[24]); }
         break;
     case 0x31:{
+        if(sz<8) break;
         bd_addr_t a;memcpy(a,&pkt[2],6);
         if(sz >= 8) { print_hci_addr("[CP] IO capability request from ", &pkt[2]); printf("\n"); }
 #ifdef SHOWCASE_ROOTLESS
@@ -1409,6 +1507,7 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
         }
         break;
     case 0x33:{
+        if(sz<12) break;
         bd_addr_t a;memcpy(a,&pkt[2],6);
 #ifdef SHOWCASE_ROOTLESS
         if(sz >= 12) {
@@ -1447,22 +1546,24 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
         }
         break;
     case 0x82:{
+        if(sz<11) break;
         uint16_t c=R16(pkt,9);
         bt_send_cmd(&rfcomm_accept_connection,c);
         printf("[CP] RFCOMM IN\n");
         break;
     }
     case 0x80:
+        if(sz<3) break;
         page_busy = 0;
         if(pkt[2]!=0){
             printf("[PAGE] iAP2 channel failed status=0x%02X; retrying\n", pkt[2]);
             schedule_page(PAGE_RETRY_MS);
         }
-        if(pkt[2]==0){
+        if(pkt[2]==0 && sz>=16){
             for(int i=0;i<6;i++) peer_addr[i]=pkt[8-i];
             have_peer=1;
             active_cid=R16(pkt,12);rfcomm_mtu=R16(pkt,14);
-            iap2_detected=0;link_established=0;detect_count=0;reset_wireless_handoff_state();
+            iap2_detected=0;link_established=0;detect_count=0;iap2_rx_len=0;reset_wireless_handoff_state();
             printf("[CP] RFCOMM OPEN cid=0x%04x mtu=%d\n",active_cid,rfcomm_mtu);
             bt_progress(BT_PROGRESS_CONNECTED);
             usleep(100000);
@@ -1473,7 +1574,7 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
         break;
     case 0x81:
         printf("[CP] RFCOMM CLOSED\n");
-        alarm(0);active_cid=0;iap2_detected=0;link_established=0;reset_wireless_handoff_state();
+        alarm(0);active_cid=0;iap2_detected=0;link_established=0;iap2_rx_len=0;reset_wireless_handoff_state();
         schedule_page(PAGE_RETRY_MS);
         break;
     }
@@ -1489,7 +1590,10 @@ int main(int argc, char *argv[]) {
     unlink(BT_ID_PATH);
     signal(SIGUSR1, bluetooth_handoff_signal_handler);
     bt_progress(0);
-    parse_args(argc, argv);
+    if (parse_args(argc, argv) != 0) {
+        fprintf(stderr, "[BT] Missing or invalid Wi-Fi credentials or arguments\n");
+        return 2;
+    }
     @autoreleasepool {
         printf("[CP] Showcase / carplay_bt\n");
         printf("[CP] Name=%s  SSID=\"%s\"\n", kDeviceName, kWifiSSID);

@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+case "${1:-}" in
+  remove|purge)
+    if [ ! -L /var/lib/showcase-power ] && [ -d /var/lib/showcase-power ]; then
+      rm -f /var/lib/showcase-power/stopped /var/lib/showcase-power/lock /var/lib/showcase-power/enabled /var/lib/showcase-power/initialized /var/lib/showcase-power/state.plist
+      rmdir /var/lib/showcase-power 2>/dev/null || true
+    fi
+    if [ -x /usr/bin/notifyutil ]; then /usr/bin/notifyutil -p tr.net.kcs.showcase.power.disable || true; fi
+    ;;
+esac
+exit 0

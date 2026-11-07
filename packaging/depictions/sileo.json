@@ -1,7 +1,7 @@
 {
   "minVersion": "0.4",
   "class": "DepictionTabView",
-  "tintColor": "#0A84FF",
+  "tintColor": "#3B82F6",
   "tabs": [
     {
       "class": "DepictionStackView",
@@ -9,7 +9,16 @@
       "views": [
         {
           "class": "DepictionHeaderView",
-          "title": "Showcase"
+          "title": "Showcase KCS"
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "Kerem Cloud Services edition of [Amine Rostane’s original Showcase](https://github.com/amineross/showcase). Source: [github.com/inckerem/showcase](https://github.com/inckerem/showcase). GPL-3.0-or-later."
+        },
+        {
+          "class": "DepictionTableTextView",
+          "title": "No hotspot?",
+          "text": "Settings → Wi-Fi Setup → Existing Wi-Fi network. Connect both devices to the same router."
         },
         {
           "class": "DepictionMarkdownView",
@@ -23,12 +32,12 @@
         {
           "class": "DepictionTableTextView",
           "title": "Rootless package",
-          "text": "iOS 12 or newer, iphoneos-arm64"
+          "text": "Source available; not yet published in KCS repo"
         },
         {
           "class": "DepictionTableTextView",
           "title": "Rootless Bluetooth",
-          "text": "Legacy UART or Apple ConvergedIPC/Skywalk, selected at runtime"
+          "text": "Source available; not yet published in KCS repo"
         },
         {
           "class": "DepictionTableTextView",
@@ -41,7 +50,7 @@
         },
         {
           "class": "DepictionMarkdownView",
-          "markdown": "An iPhone or iPad with Personal Hotspot."
+          "markdown": "An iPhone or iPad with Personal Hotspot, or both devices connected to the same Wi-Fi router."
         },
         {
           "class": "DepictionMarkdownView",
@@ -73,7 +82,7 @@
         },
         {
           "class": "DepictionMarkdownView",
-          "markdown": "Showcase reports anonymous usage: a random ID, your device model, iOS version, jailbreak, Showcase version, package, language and country. It never sends your name, Apple ID, serial number or IP address. Settings > Anonymous Usage shows each value and turns any of them off. The server code is in the repository under telemetry/."
+          "markdown": "KCS usage sharing is off by default. Settings > Anonymous Usage lets you opt in and select fields. Diagnostics are uploaded to KCS only after you press Send Logs to KCS and confirm; archives may contain Wi-Fi names, device details and Bluetooth captures. Server source: [telemetry/](https://github.com/inckerem/showcase/tree/main/telemetry)."
         }
       ]
     },
@@ -81,6 +90,38 @@
       "class": "DepictionStackView",
       "tabname": "Changelog",
       "views": [
+        {
+          "class": "DepictionHeaderView",
+          "title": "1.0 Beta 5-8 · KCS"
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "Adds existing Wi-Fi setup for receivers without Personal Hotspot, KCS branding, opt-in KCS usage reporting, and confirmed diagnostics upload. Original Showcase by Amine Rostane."
+        },
+        {
+          "class": "DepictionHeaderView",
+          "title": "1.0 Beta 5-6"
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "Choose an existing Wi-Fi network or Personal Hotspot in Settings. Shared-network CarPlay is experimental and needs testing on a real device."
+        },
+        {
+          "class": "DepictionHeaderView",
+          "title": "1.0 Beta 5-4"
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "Adds Turkish and fixes compatibility with older Cydia package installers."
+        },
+        {
+          "class": "DepictionHeaderView",
+          "title": "1.0 Beta 5-3"
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "Adds shared-network mode for portable Wi-Fi routers; Personal Hotspot can remain off when the iPad and iPhone use the same network."
+        },
         {
           "class": "DepictionHeaderView",
           "title": "1.0 Beta 5-2"

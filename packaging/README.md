@@ -34,4 +34,4 @@ The rootful package depends on `uikittools`. The rootless package depends on `ui
 
 Rootful packages use `iphoneos-arm`; rootless packages use `iphoneos-arm64`. Both set iOS 12.0 as the deployment target.
 
-Do not commit `payload/`, `build/`, or `repo/` to the source branch. Publish the generated `repo/` directory to the web path that serves `https://aminerostane.com/repo`.
+Do not commit `payload/`, `build/`, or `repo/` to the source branch. Publish the generated `repo/` directory to the web path that serves `https://kcs.net.tr/repo/`. See `telemetry/README.md` for the separate PHP API deployment.

@@ -6,9 +6,20 @@ Bluetooth, iPhone, iPad, Sileo and tcpdump stay as they are.
 Run generate.py after editing; tests/test_localization.py checks coverage.
 """
 
-LANGUAGES = ('fr', 'es', 'zh-Hans', 'ja')
+LANGUAGES = ('fr', 'es', 'zh-Hans', 'ja', 'tr')
 
 T = {
+    'Stop CarPlay to change Wi-Fi settings.': ('Arrêtez CarPlay pour modifier les réglages Wi-Fi.', 'Detén CarPlay para cambiar los ajustes Wi-Fi.', '请先停止 CarPlay，再更改 Wi-Fi 设置。', 'Wi-Fi設定を変更するにはCarPlayを停止してください。'),
+    'Connected to “%@”. To use this network, enter its name and password below, then tap Save.': ('Connecté à « %@ ». Pour utiliser ce réseau, saisissez son nom et son mot de passe ci-dessous, puis touchez Enregistrer.', 'Conectado a “%@”. Para usar esta red, introduce su nombre y contraseña abajo y pulsa Guardar.', '已连接到“%@”。要使用此网络，请在下方输入其名称和密码，然后轻点保存。', '「%@」に接続中です。このネットワークを使うには、下に名前とパスワードを入力して保存をタップしてください。'),
+    'Existing Wi-Fi network': ('Réseau Wi-Fi existant', 'Red Wi-Fi existente', '现有 Wi-Fi 网络', '既存のWi-Fiネットワーク'),
+    'Personal Hotspot': ('Partage de connexion', 'Punto de acceso personal', '个人热点', 'インターネット共有'),
+    'Wi-Fi details': ('Infos Wi-Fi', 'Datos Wi-Fi', 'Wi-Fi 信息', 'Wi-Fi情報'),
+    'Wi-Fi name must be at most 32 bytes.': ('Le nom Wi-Fi ne doit pas dépasser 32 octets.', 'El nombre Wi-Fi no puede superar los 32 bytes.', 'Wi-Fi 名称不能超过 32 字节。', 'Wi-Fi名は32バイト以内にしてください。'),
+    'Wi-Fi password must be 8 to 63 UTF-8 bytes.': ('Le mot de passe Wi-Fi doit contenir entre 8 et 63 octets UTF-8.', 'La contraseña Wi-Fi debe tener entre 8 y 63 bytes UTF-8.', 'Wi-Fi 密码必须为 8 至 63 个 UTF-8 字节。', 'Wi-FiパスワードはUTF-8で8〜63バイトにしてください。'),
+    'Connect this device to the Wi-Fi network first.': ('Connectez d’abord cet appareil au réseau Wi-Fi.', 'Conecta primero este dispositivo a la red Wi-Fi.', '请先将此设备连接到 Wi-Fi 网络。', 'まずこのデバイスをWi-Fiネットワークに接続してください。'),
+    'Could not read the connected Wi-Fi name. Check Wi-Fi in Settings and try again.': ('Impossible de lire le nom du réseau Wi-Fi connecté. Vérifiez le Wi-Fi dans Réglages et réessayez.', 'No se pudo leer el nombre de la red Wi-Fi. Comprueba Wi-Fi en Ajustes y vuelve a intentarlo.', '无法读取已连接的 Wi-Fi 名称。请在设置中检查 Wi-Fi 后重试。', '接続中のWi-Fi名を読み取れません。設定でWi-Fiを確認し、もう一度お試しください。'),
+    'This device is connected to “%@”, but Showcase is configured for “%@”. Connect both devices to the same network and update Wi-Fi settings.': ('Cet appareil est connecté à « %@ », mais Showcase utilise « %@ ». Connectez les deux appareils au même réseau et modifiez les réglages Wi-Fi.', 'Este dispositivo está conectado a “%@”, pero Showcase está configurado para “%@”. Conecta ambos dispositivos a la misma red y actualiza los ajustes Wi-Fi.', '此设备连接到“%@”，但 Showcase 配置为“%@”。请将两个设备连接到同一网络并更新 Wi-Fi 设置。', 'このデバイスは「%@」に接続されていますが、Showcaseには「%@」が設定されています。両方を同じネットワークに接続し、Wi-Fi設定を更新してください。'),
+    "Enter the portable router's Wi-Fi name and password. Connect both devices to that network.": ('Saisissez le nom et le mot de passe Wi-Fi du routeur portable. Connectez les deux appareils à ce réseau.', 'Introduce el nombre y la contraseña Wi-Fi del router portátil. Conecta ambos dispositivos a esa red.', '输入便携式路由器的 Wi-Fi 名称和密码，并将两个设备连接到该网络。', 'ポータブルルーターのWi-Fi名とパスワードを入力し、両方のデバイスをそのネットワークに接続してください。'),
     'Wi-Fi network is required.': (
         'Un réseau Wi-Fi est requis.',
         'Se necesita una red Wi-Fi.',
@@ -233,7 +244,6 @@ T = {
     'Device Language': ("Langue de l’appareil", 'Idioma del dispositivo', '设备语言', 'デバイスの言語'),
     'Detailed Logging': ('Journal détaillé', 'Registro detallado', '详细日志', '詳細なログ'),
     'Preparing Logs…': ('Préparation du journal…', 'Preparando los registros…', '正在准备日志…', 'ログを準備中…'),
-    'Send Logs': ('Envoyer le journal', 'Enviar registros', '发送日志', 'ログを送信'),
     'Install tcpdump': ('Installer tcpdump', 'Instalar tcpdump', '安装 tcpdump', 'tcpdumpをインストール'),
     'Stop and Send Network Capture': (
         'Arrêter et envoyer la capture réseau',
@@ -309,4 +319,29 @@ T = {
         'GitHubでスターをお願いします！'),
     'Copy Link': ('Copier le lien', 'Copiar enlace', '拷贝链接', 'リンクをコピー'),
     'Open GitHub': ('Ouvrir GitHub', 'Abrir GitHub', '打开 GitHub', 'GitHubを開く'),
+    'Usage data goes to Kerem Cloud Services only when you enable sharing. Each item can be turned off.': (
+        'Les données d’utilisation sont envoyées à Kerem Cloud Services uniquement si vous activez le partage. Chaque élément peut être désactivé.',
+        'Los datos de uso se envían a Kerem Cloud Services solo si activas el envío. Puedes desactivar cada elemento.',
+        '仅在您启用共享后，使用数据才会发送给 Kerem Cloud Services。每项均可单独关闭。',
+        '共有を有効にした場合のみ、利用データが Kerem Cloud Services に送信されます。項目ごとに無効にできます。'),
+    'Send Logs to KCS': ('Envoyer les journaux à KCS', 'Enviar registros a KCS', '向 KCS 发送日志', 'KCSにログを送信'),
+    'The diagnostics archive may contain Wi-Fi names, device details and Bluetooth captures. Send it to Kerem Cloud Services?': (
+        'L’archive de diagnostic peut contenir des noms Wi-Fi, des informations sur l’appareil et des captures Bluetooth. L’envoyer à Kerem Cloud Services ?',
+        'El archivo de diagnóstico puede contener nombres Wi-Fi, datos del dispositivo y capturas Bluetooth. ¿Enviarlo a Kerem Cloud Services?',
+        '诊断归档可能包含 Wi-Fi 名称、设备信息和蓝牙抓包。要发送给 Kerem Cloud Services 吗？',
+        '診断アーカイブには Wi-Fi 名、端末情報、Bluetooth の記録が含まれる場合があります。Kerem Cloud Services に送信しますか？'),
+    'Send': ('Envoyer', 'Enviar', '发送', '送信'),
+    'Logs sent to KCS': ('Journaux envoyés à KCS', 'Registros enviados a KCS', '日志已发送至 KCS', 'ログをKCSに送信しました'),
+    'Could not send logs': ('Impossible d’envoyer les journaux', 'No se pudieron enviar los registros', '无法发送日志', 'ログを送信できませんでした'),
+    'KCS edition. Original Showcase by Amine Rostane. Licensed under GPL-3.0.': (
+        'Édition KCS. Showcase original par Amine Rostane. Sous licence GPL-3.0.',
+        'Edición KCS. Showcase original de Amine Rostane. Licencia GPL-3.0.',
+        'KCS 版本。原版 Showcase 由 Amine Rostane 开发。采用 GPL-3.0 许可。',
+        'KCS版。オリジナルのShowcaseはAmine Rostaneが開発。GPL-3.0ライセンス。'),
 }
+
+from turkish import TURKISH
+
+if set(TURKISH) != set(T):
+    raise ValueError(f'Turkish translation keys differ: {set(TURKISH) ^ set(T)}')
+T = {key: values + (TURKISH[key],) for key, values in T.items()}

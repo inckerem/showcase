@@ -1,0 +1,28 @@
+#!/bin/sh
+set -e
+wasEnabled=0
+if [ -e /var/lib/showcase-power/enabled ]; then wasEnabled=1; fi
+restore_marker() {
+  if [ "$wasEnabled" -eq 1 ]; then
+    (umask 022; : > /var/lib/showcase-power/enabled)
+    chown 0:0 /var/lib/showcase-power/enabled
+    chmod 0644 /var/lib/showcase-power/enabled
+  fi
+}
+rm -f /var/lib/showcase-power/enabled
+if [ -x /usr/libexec/showcase-powerd ]; then /usr/libexec/showcase-powerd --disable || true; fi
+if ! jobs=$(/bin/launchctl list 2>/dev/null); then
+  restore_marker
+  echo 'Servis yoneticisine erisilemedi; Cydia islemi tamamlamadi.' >&2
+  exit 1
+fi
+case "$jobs" in
+  *tr.net.kcs.showcase.powerd*)
+  if ! /bin/launchctl unload /Library/LaunchDaemons/tr.net.kcs.showcase.powerd.plist; then
+    restore_marker
+    echo 'Guc servisi durdurulamadi; Cydia islemi tamamlamadi.' >&2
+    exit 1
+  fi
+  ;;
+esac
+exit 0

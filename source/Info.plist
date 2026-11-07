@@ -9,7 +9,7 @@
     <key>CFBundleName</key>
     <string>Showcase</string>
     <key>CFBundleDisplayName</key>
-    <string>Showcase</string>
+    <string>Showcase KCS</string>
     <key>CFBundleVersion</key>
     <string>@BUNDLE_VERSION@</string>
     <key>CFBundleShortVersionString</key>
@@ -23,6 +23,7 @@
         <string>es</string>
         <string>zh-Hans</string>
         <string>ja</string>
+        <string>tr</string>
     </array>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>

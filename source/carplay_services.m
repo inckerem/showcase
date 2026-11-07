@@ -36,6 +36,7 @@
 #include <float.h>
 #include <stdarg.h>
 #include <pthread.h>
+#include <limits.h>
 #include <mach/mach_time.h>
 #include "carplay_pair.h"
 #include "baa_broker.h"
@@ -138,6 +139,12 @@ static bool g_baa_broker_mode = false;
  * Bluetooth), which is the Showcase default. true: claim MainAudio and play
  * the negotiated buffered/low-latency streams on this receiver. */
 static bool g_receiver_audio = false;
+/* When true, the receiver and sender are both on an existing Wi-Fi LAN
+ * (for example a portable router).  Personal Hotspot's bridge100 is not
+ * present in this mode, so mDNS and the wire announcement must use the
+ * normal Wi-Fi interface instead. */
+static bool g_shared_wifi = false;
+static char g_wifi_interface[IFNAMSIZ] = "bridge100";
 /* Places CarPlay's dock on the right edge, for right-hand-drive cars and for
  * displays mounted to the driver's right. */
 static bool g_right_hand_drive = false;
@@ -171,6 +178,11 @@ static void parse_args(int argc, char *argv[]) {
             g_right_hand_drive = true;
         } else if (!strcmp(argv[i], "--audio") && i + 1 < argc) {
             g_receiver_audio = strcmp(argv[++i], "receiver") == 0;
+        } else if (!strcmp(argv[i], "--shared-wifi")) {
+            g_shared_wifi = true;
+        } else if (!strcmp(argv[i], "--wifi-interface") && i + 1 < argc) {
+            g_shared_wifi = true;
+            snprintf(g_wifi_interface, sizeof(g_wifi_interface), "%s", argv[++i]);
         } else if (!strcmp(argv[i], "--baa-broker")) {
             g_baa_broker_mode = true;
         }
@@ -516,13 +528,19 @@ static int run_baa_broker(void) {
     address.sun_family = AF_UNIX;
     strncpy(address.sun_path, BAA_BROKER_PATH,
             sizeof(address.sun_path) - 1);
-    if (bind(server, (struct sockaddr *)&address, sizeof(address)) < 0 ||
-        listen(server, 4) < 0) {
+    if (bind(server, (struct sockaddr *)&address, sizeof(address)) < 0) {
         printf("[BAA] Broker socket failed: %s\n", strerror(errno));
         close(server);
         return 1;
     }
-    chmod(BAA_BROKER_PATH, 0600);
+    /* Never accept signing requests on a socket whose permissions could not
+     * be restricted. Set permissions before listen to avoid an open window. */
+    if (chmod(BAA_BROKER_PATH, 0600) < 0 || listen(server, 4) < 0) {
+        printf("[BAA] Broker socket protection/listen failed: %s\n", strerror(errno));
+        close(server);
+        unlink(BAA_BROKER_PATH);
+        return 1;
+    }
     printf("[BAA] Broker ready on %s\n", BAA_BROKER_PATH);
 
     while (1) {
@@ -577,6 +595,23 @@ typedef struct {
 
 static encrypted_ctx_t g_enc = {0};
 static encrypted_ctx_t g_event_enc = {0};
+/* The pairing and session implementation is process-wide. Only its owner may
+ * mutate it; unrelated discovery connections must not inherit its cipher. */
+static pthread_mutex_t g_control_owner_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_control_owner = -1;
+static bool control_is_encrypted(int sock) {
+    pthread_mutex_lock(&g_control_owner_lock);
+    bool active = g_control_owner == sock && g_enc.active;
+    pthread_mutex_unlock(&g_control_owner_lock);
+    return active;
+}
+static bool control_claim(int sock) {
+    pthread_mutex_lock(&g_control_owner_lock);
+    if (g_control_owner < 0) g_control_owner = sock;
+    bool owned = g_control_owner == sock;
+    pthread_mutex_unlock(&g_control_owner_lock);
+    return owned;
+}
 static dispatch_semaphore_t g_event_send_lock = NULL;
 static bool process_event_command_frame(const uint8_t *bytes, size_t length);
 
@@ -593,7 +628,7 @@ static int enc_recv_frame(int sock, encrypted_ctx_t *enc, uint8_t *outBuf, size_
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 if (hdrRead == 0) return -2;
-                continue;
+                return -1; /* incomplete header: cannot restart mid-record */
             }
             return -1;
         }
@@ -616,8 +651,8 @@ static int enc_recv_frame(int sock, encrypted_ctx_t *enc, uint8_t *outBuf, size_
         if (n < 0) {
             int saved = errno;
             if (saved == EAGAIN || saved == EWOULDBLOCK) {
-                if (frameRead == 0) { free(frame); return -2; }
-                continue;
+                free(frame);
+                return -1; /* header was consumed; never treat this as idle */
             }
             free(frame);
             return -1;
@@ -731,28 +766,36 @@ typedef struct {
     char xAppleHKP[32];
     char xApplePD[16];
     char xAppleAT[16];
+    bool invalid;
 } HTTPReq;
+
+#define HTTP_STREAM_LIMIT 65536
+static const char *http_find(const char *start, const char *end,
+                             const char *needle, size_t size) {
+    for (const char *p = start; (size_t)(end - p) >= size; p++)
+        if (memcmp(p, needle, size) == 0) return p;
+    return NULL;
+}
 
 static bool parse_http(const uint8_t *buf, size_t len, HTTPReq *r) {
     memset(r, 0, sizeof(*r));
-    if (len < 10) return false;
-
-    /* Request line: METHOD SP PATH SP PROTOCOL CRLF */
     const char *s = (const char *)buf;
     const char *end = s + len;
-    const char *lineEnd = strstr(s, "\r\n");
-    if (!lineEnd) return false;
+    const char *mark = http_find(s, end, "\r\n\r\n", 4);
+    if (!mark) { r->invalid = len >= HTTP_STREAM_LIMIT; return false; }
+    const char *lineEnd = http_find(s, mark + 2, "\r\n", 2);
+    if (!lineEnd) { r->invalid = true; return false; }
 
     /* Method */
     const char *sp1 = memchr(s, ' ', lineEnd - s);
-    if (!sp1) return false;
+    if (!sp1 || sp1 == s) { r->invalid = true; return false; }
     size_t n = sp1 - s;
     if (n >= sizeof(r->method)) n = sizeof(r->method) - 1;
     memcpy(r->method, s, n);
 
     /* Path */
     const char *sp2 = memchr(sp1 + 1, ' ', lineEnd - sp1 - 1);
-    if (!sp2) return false;
+    if (!sp2 || sp2 == sp1 + 1 || sp2 + 1 == lineEnd) { r->invalid = true; return false; }
     n = sp2 - (sp1 + 1);
     if (n >= sizeof(r->path)) n = sizeof(r->path) - 1;
     memcpy(r->path, sp1 + 1, n);
@@ -764,21 +807,17 @@ static bool parse_http(const uint8_t *buf, size_t len, HTTPReq *r) {
 
     /* Headers */
     r->headerStart = (const uint8_t *)(lineEnd + 2);
-    const char *bodyMark = strstr(lineEnd + 2, "\r\n\r\n");
-    if (bodyMark) {
-        r->headerLen = bodyMark - (const char *)r->headerStart;
-        r->body = (const uint8_t *)(bodyMark + 4);
-        r->bodyLen = (buf + len) - r->body;
-    } else {
-        r->headerLen = (buf + len) - (const uint8_t *)r->headerStart;
-    }
+    r->headerLen = (size_t)((mark + 2) - (const char *)r->headerStart);
+    r->body = (const uint8_t *)(mark + 4);
+    r->bodyLen = (size_t)((buf + len) - r->body);
 
     /* Parse key headers */
     const char *hp = (const char *)r->headerStart;
     const char *hend = hp + r->headerLen;
+    bool haveLength = false;
     while (hp < hend) {
-        const char *le = strstr(hp, "\r\n");
-        if (!le) break;
+        const char *le = http_find(hp, hend, "\r\n", 2);
+        if (!le) { r->invalid = true; return false; }
         const char *colon = memchr(hp, ':', le - hp);
         if (colon) {
             size_t nameLen = colon - hp;
@@ -787,11 +826,20 @@ static bool parse_http(const uint8_t *buf, size_t len, HTTPReq *r) {
             size_t valLen = le - val;
 
             if (nameLen == 14 && strncasecmp(hp, "Content-Length", 14) == 0) {
-                r->contentLength = (size_t)atol(val);
+                if (haveLength || valLen == 0) { r->invalid = true; return false; }
+                haveLength = true;
+                size_t value = 0;
+                for (const char *p = val; p < le; p++) {
+                    if (*p < '0' || *p > '9' || value > (HTTP_STREAM_LIMIT - (size_t)(*p - '0')) / 10) {
+                        r->invalid = true; return false;
+                    }
+                    value = value * 10 + (size_t)(*p - '0');
+                }
+                r->contentLength = value;
             } else if (nameLen == 12 && strncasecmp(hp, "Content-Type", 12) == 0) {
                 if (valLen < sizeof(r->contentType))
                     memcpy(r->contentType, val, valLen);
-            } else if (nameLen == 12 && strncasecmp(hp, "X-Apple-HKP", 11) == 0 && nameLen >= 11) {
+            } else if (nameLen == 11 && strncasecmp(hp, "X-Apple-HKP", 11) == 0) {
                 if (valLen < sizeof(r->xAppleHKP))
                     memcpy(r->xAppleHKP, val, valLen);
             } else if (nameLen == 10 && strncasecmp(hp, "X-Apple-PD", 10) == 0) {
@@ -801,12 +849,23 @@ static bool parse_http(const uint8_t *buf, size_t len, HTTPReq *r) {
                 if (valLen < sizeof(r->xAppleAT))
                     memcpy(r->xAppleAT, val, valLen);
             } else if (nameLen == 4 && strncasecmp(hp, "CSeq", 4) == 0) {
-                r->cseq = atoi(val);
+                int value = 0;
+                for (const char *p = val; p < le && *p >= '0' && *p <= '9'; p++) {
+                    if (value > (INT_MAX - (*p - '0')) / 10) { r->invalid = true; return false; }
+                    value = value * 10 + (*p - '0');
+                }
+                r->cseq = value;
             }
         }
         hp = le + 2;
     }
-    return r->method[0] != '\0';
+    size_t headerSize = (size_t)(r->body - buf);
+    if (headerSize > HTTP_STREAM_LIMIT || r->contentLength > HTTP_STREAM_LIMIT - headerSize) {
+        r->invalid = true; return false;
+    }
+    if (r->bodyLen < r->contentLength) return false;
+    r->bodyLen = r->contentLength;
+    return true;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -830,7 +889,7 @@ static void send_response(int sock, const char *proto, int status,
         const char *h = hdr.UTF8String;
         size_t hLen = strlen(h);
 
-        if (g_enc.active) {
+        if (control_is_encrypted(sock)) {
             /* Encrypted mode: build one HTTP byte stream, then segment it
              * into Apple's 1 KiB authenticated transport records. */
             size_t totalPt = hLen + bodyLen;
@@ -1394,7 +1453,9 @@ static void handle_pair_verify(int sock, const HTTPReq *r) {
         if (pair_derive_control_keys(g_pair, g_enc.readKey, g_enc.writeKey) == 0) {
             g_enc.readNonce = 0;
             g_enc.writeNonce = 0;
+            pthread_mutex_lock(&g_control_owner_lock);
             g_enc.active = true;
+            pthread_mutex_unlock(&g_control_owner_lock);
             printf("[AP] *** Encrypted transport layer ACTIVE ***\n");
         }
 
@@ -1474,7 +1535,6 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
             id obj = [NSPropertyListSerialization
                 propertyListWithData:d options:0 format:NULL error:NULL];
             if (obj) {
-                printf("[AP] auth-setup plist: %s\n", [[obj description] UTF8String]);
                 isPlist = true;
 
                 /* Extract public key — try known keys */
@@ -1483,23 +1543,18 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
                     NSDictionary *dict = (NSDictionary *)obj;
                     pkData = dict[@"pk"] ?: dict[@"publicKey"] ?: dict[@"epk"];
                     if (!pkData) {
-                        /* Dump all keys for analysis */
+                        /* Inspect types and lengths without logging values. */
                         for (NSString *key in dict) {
                             id val = dict[key];
                             if ([val isKindOfClass:[NSData class]]) {
                                 NSData *dv = (NSData *)val;
-                                printf("[AP] auth-setup key '%s': %zu bytes:", [key UTF8String], dv.length);
-                                const uint8_t *b = (const uint8_t *)dv.bytes;
-                                for (size_t i = 0; i < dv.length && i < 64; i++) printf(" %02x", b[i]);
-                                if (dv.length > 64) printf(" ...");
-                                printf("\n");
+                                printf("[AP] auth-setup field: data (%zu bytes)\n", dv.length);
                                 if (dv.length == 32 && !pkData) pkData = dv;
                             } else if ([val isKindOfClass:[NSNumber class]]) {
-                                printf("[AP] auth-setup key '%s': %s\n",
-                                       [key UTF8String], [[val description] UTF8String]);
+                                printf("[AP] auth-setup field: number\n");
                             } else if ([val isKindOfClass:[NSString class]]) {
-                                printf("[AP] auth-setup key '%s': %s\n",
-                                       [key UTF8String], [val UTF8String]);
+                                printf("[AP] auth-setup field: string (%zu bytes)\n",
+                                       [(NSString *)val lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
                             }
                         }
                     }
@@ -1510,9 +1565,7 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
                     }
                 }
             } else {
-                printf("[AP] auth-setup: not a plist, hex (%zu):", r->bodyLen);
-                for (size_t i = 0; i < r->bodyLen && i < 128; i++) printf(" %02x", r->body[i]);
-                printf("\n");
+                printf("[AP] auth-setup: not a plist (%zu bytes)\n", r->bodyLen);
             }
         }
     }
@@ -2028,9 +2081,19 @@ static int bind_tcp_port_ipv4(uint16_t *outPort) {
     sa.sin_addr.s_addr = INADDR_ANY;
     sa.sin_port = 0;
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { close(fd); return -1; }
-    listen(fd, 1);
+    if (listen(fd, 1) < 0) {
+        int savedErrno = errno;
+        close(fd);
+        errno = savedErrno;
+        return -1;
+    }
     socklen_t sl = sizeof(sa);
-    getsockname(fd, (struct sockaddr *)&sa, &sl);
+    if (getsockname(fd, (struct sockaddr *)&sa, &sl) < 0) {
+        int savedErrno = errno;
+        close(fd);
+        errno = savedErrno;
+        return -1;
+    }
     *outPort = ntohs(sa.sin_port);
     printf("[NET] bound TCP IPv4 fallback port %u fd=%d\n", *outPort, fd);
     return fd;
@@ -2243,10 +2306,10 @@ static bool build_peer_sockaddr(const char *host, uint16_t port,
                        scope, host);
             }
         } else if (IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr)) {
-            sin6->sin6_scope_id = if_nametoindex("bridge100");
-            if (sin6->sin6_scope_id) snprintf(scope, sizeof(scope), "bridge100");
-            printf("[TIMING] IPv6 link-local had no scope; using bridge100 scope_id=%u\n",
-                   sin6->sin6_scope_id);
+            sin6->sin6_scope_id = if_nametoindex(g_wifi_interface);
+            if (sin6->sin6_scope_id) snprintf(scope, sizeof(scope), "%s", g_wifi_interface);
+            printf("[TIMING] IPv6 link-local had no scope; using %s scope_id=%u\n",
+                   g_wifi_interface, sin6->sin6_scope_id);
         }
         *outLen = sizeof(struct sockaddr_in6);
         if (display && displayLen) {
@@ -2589,11 +2652,6 @@ static void event_thread_func(void *ctx) {
                     continue;
                 printf("[EVENT] Decrypted %d bytes (nonce=%llu)\n",
                        ptLen, g_event_enc.readNonce - 1);
-                int dump = ptLen > 256 ? 256 : ptLen;
-                printf("[EVENT] ASCII: ");
-                for (int i = 0; i < dump; i++)
-                    printf("%c", (buf[i] >= 0x20 && buf[i] < 0x7f) ? buf[i] : '.');
-                printf("\n");
                 fflush(stdout);
             }
         } else {
@@ -4055,12 +4113,6 @@ static void *screen_thread_func(void *arg) {
                 if (videoFrameCount <= 3) {
                     printf("[SCREEN] VideoFrame #%d: %u bytes ct, decrypt=%s, nonce=%llu\n",
                            videoFrameCount, ctLen, authOK ? "OK" : "FAIL", chachaNonce);
-                    if (ctLen >= 8) {
-                        printf("[SCREEN] Decrypted hex: ");
-                        int dl = ctLen > 32 ? 32 : ctLen;
-                        for (int i = 0; i < dl; i++) printf("%02x ", body[i]);
-                        printf("...\n");
-                    }
                     fflush(stdout);
                 }
 
@@ -4390,8 +4442,6 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
                 propertyListWithData:d options:0 format:NULL error:NULL];
             if ([obj isKindOfClass:[NSDictionary class]]) {
                 reqDict = (NSDictionary *)obj;
-                printf("[AP] SETUP plist: %s\n",
-                       [[obj description] UTF8String]);
             }
         }
     }
@@ -4786,8 +4836,6 @@ static void handle_teardown(int sock, const HTTPReq *r) {
             id obj = [NSPropertyListSerialization
                 propertyListWithData:d options:0 format:NULL error:NULL];
             if (obj) {
-                printf("[AP] TEARDOWN plist: %s\n",
-                       [[obj description] UTF8String]);
                 if ([obj isKindOfClass:[NSDictionary class]]) {
                     NSArray *streams = obj[@"streams"];
                     if ([streams isKindOfClass:[NSArray class]] &&
@@ -4806,11 +4854,6 @@ static void handle_teardown(int sock, const HTTPReq *r) {
                         }
                     }
                 }
-            } else {
-                printf("[AP] TEARDOWN hex (%zu):", r->bodyLen);
-                size_t n = r->bodyLen > 256 ? 256 : r->bodyLen;
-                for (size_t i = 0; i < n; i++) printf(" %02X", r->body[i]);
-                printf("\n");
             }
         }
     }
@@ -4984,13 +5027,6 @@ static void handle_rtsp_generic(int sock, const HTTPReq *r) {
     printf("[AP] -> %s %s (CSeq=%d, bodyLen=%zu)\n",
            r->method, r->path, r->cseq, r->bodyLen);
 
-    if (r->body && r->bodyLen > 0) {
-        printf("[AP] body hex (%zu):", r->bodyLen);
-        size_t dumpLen = r->bodyLen > 256 ? 256 : r->bodyLen;
-        for (size_t i = 0; i < dumpLen; i++) printf(" %02X", r->body[i]);
-        printf("\n");
-    }
-
     const char *proto = strncmp(r->protocol, "RTSP", 4) == 0 ?
                         "RTSP/1.0" : "HTTP/1.1";
     send_response(sock, proto, 200, "OK", NULL, NULL, 0, r->cseq);
@@ -5129,15 +5165,9 @@ static void handle_post_generic(int sock, const HTTPReq *r) {
             id obj = [NSPropertyListSerialization
                 propertyListWithData:d options:0 format:NULL error:NULL];
             if (obj) {
-                printf("[AP] plist: %s\n", [[obj description] UTF8String]);
                 if (strstr(r->path, "/command") &&
                     [obj isKindOfClass:[NSDictionary class]])
                     handle_command_dictionary(obj);
-            } else {
-                printf("[AP] hex (%zu):", r->bodyLen);
-                size_t n = r->bodyLen > 256 ? 256 : r->bodyLen;
-                for (size_t i = 0; i < n; i++) printf(" %02X", r->body[i]);
-                printf("\n");
             }
         }
     }
@@ -5211,7 +5241,9 @@ static void route_request(int sock, const HTTPReq *r) {
  * ═══════════════════════════════════════════════════════════════ */
 
 static void handle_client(int c) {
-    uint8_t buf[65536];
+    /* Room for one final encrypted record containing the end of a maximal
+     * request and the beginning of the next pipelined request. */
+    uint8_t buf[HTTP_STREAM_LIMIT + ENCRYPTED_MAX_READ_SIZE];
     size_t bufUsed = 0;
 
     /* Set recv timeout — must be long enough for iPhone to send SETUP Phase 2
@@ -5229,144 +5261,79 @@ static void handle_client(int c) {
     setsockopt(c, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
 
     while (1) {
-        /* ── Encrypted mode: read framed ChaCha20-Poly1305 messages ── */
-        if (g_enc.active) {
-            uint8_t ptBuf[16384];
-            int ptLen = enc_recv_frame(c, &g_enc, ptBuf, sizeof(ptBuf));
-            if (ptLen == -2) {
-                printf("[AP] Encrypted channel idle, still alive\n");
-                fflush(stdout);
-                continue;
-            }
-            if (ptLen <= 0) {
-                if (ptLen == 0)
-                    printf("[AP] Client closed connection (encrypted)\n");
-                else
-                    printf("[AP] Encrypted recv error or timeout\n");
+        if (control_is_encrypted(c)) {
+            uint8_t ptBuf[ENCRYPTED_MAX_READ_SIZE];
+            int n = enc_recv_frame(c, &g_enc, ptBuf, sizeof(ptBuf));
+            if (n == -2) continue;
+            if (n <= 0) break;
+            if ((size_t)n > sizeof(buf) - bufUsed) {
+                printf("[AP] Encrypted request exceeds stream limit\n");
                 break;
             }
-
-            printf("[ENC] Decrypted frame: %d bytes (nonce=%llu)\n",
-                   ptLen, g_enc.readNonce - 1);
-
-            /* Dump first 128 bytes */
-            printf("[ENC] Plaintext hex (%d):", ptLen);
-            int dump = ptLen > 128 ? 128 : ptLen;
-            for (int i = 0; i < dump; i++) printf(" %02X", ptBuf[i]);
-            if (ptLen > 128) printf(" ...");
-            printf("\n");
-            printf("[ENC] ASCII: ");
-            for (int i = 0; i < dump; i++)
-                printf("%c", (ptBuf[i] >= 0x20 && ptBuf[i] < 0x7f) ? ptBuf[i] : '.');
-            printf("\n");
-            fflush(stdout);
-
-            /* Parse decrypted plaintext as HTTP/RTSP */
-            HTTPReq r;
-            if (parse_http(ptBuf, ptLen, &r)) {
-                if (r.contentLength == 0 || r.bodyLen >= r.contentLength) {
-                    /* Route using encrypted send */
-                    printf("\n[AP] ── %s %s %s (encrypted) ──\n", r.method, r.path, r.protocol);
-                    fflush(stdout);
-
-                    /* Temporarily swap send_response for encrypted sends */
-                    bool rtsp = (strncmp(r.protocol, "RTSP", 4) == 0);
-                    const char *proto = rtsp ? "RTSP/1.0" : "HTTP/1.1";
-
-                    if (strcasecmp(r.method, "GET") == 0 && strstr(r.path, "/info")) {
-                        handle_info(c, &r);
-                    } else if (strcasecmp(r.method, "POST") == 0) {
-                        if (strstr(r.path, "/pair-setup"))
-                            handle_pair_setup(c, &r);
-                        else if (strstr(r.path, "/pair-verify"))
-                            handle_pair_verify(c, &r);
-                        else if (strstr(r.path, "/fp-setup"))
-                            handle_fp_setup(c, &r);
-                        else if (strstr(r.path, "/auth-setup"))
-                            handle_auth_setup(c, &r);
-                        else if (strstr(r.path, "/feedback"))
-                            handle_feedback(c, &r);
-                        else
-                            handle_post_generic(c, &r);
-                    } else if (strcasecmp(r.method, "SETUP") == 0) {
-                        handle_rtsp_setup(c, &r);
-                    } else if (strcasecmp(r.method, "RECORD") == 0) {
-                        handle_record(c, &r);
-                    } else if (strcasecmp(r.method, "SETRATE") == 0) {
-                        handle_setrate(c, &r);
-                    } else if (strcasecmp(r.method,
-                                          "SETRATEANCHORTIME") == 0) {
-                        handle_setrate_anchor_time(c, &r);
-                    } else if (strcasecmp(r.method,
-                                          "FLUSHBUFFERED") == 0) {
-                        handle_flush_buffered(c, &r);
-                    } else if (strcasecmp(r.method, "TEARDOWN") == 0) {
-                        handle_teardown(c, &r);
-                    } else if (strcasecmp(r.method, "OPTIONS") == 0) {
-                        handle_options(c, &r);
-                    } else {
-                        handle_rtsp_generic(c, &r);
-                    }
-                    fflush(stdout);
-                } else {
-                    printf("[ENC] Incomplete body (have %zu, need %zu)\n",
-                           r.bodyLen, r.contentLength);
-                }
-            } else {
-                printf("[ENC] Could not parse decrypted data as HTTP/RTSP\n");
-            }
-            continue;
-        }
-
-        /* ── Plaintext mode: normal HTTP/RTSP parsing ── */
-        ssize_t n = recv(c, buf + bufUsed, sizeof(buf) - bufUsed, 0);
-        if (n <= 0) {
-            if (n == 0)
-                printf("[AP] Client closed connection\n");
-            else if (errno == EAGAIN || errno == EWOULDBLOCK)
-                printf("[AP] Client timeout (600s idle)\n");
-            else
-                printf("[AP] recv error: %s\n", strerror(errno));
-            break;
-        }
-        bufUsed += n;
-
-        /* Try to parse a complete request */
-        HTTPReq r;
-        if (!parse_http(buf, bufUsed, &r)) {
-            /* Not enough data yet, keep reading */
-            if (bufUsed >= sizeof(buf) - 1) {
-                printf("[AP] Buffer overflow, dropping\n");
-                bufUsed = 0;
-            }
-            continue;
-        }
-
-        /* Check if we have the full body */
-        if (r.contentLength > 0 && r.bodyLen < r.contentLength) {
-            /* Need more body data */
-            continue;
-        }
-
-        /* Route the request */
-        route_request(c, &r);
-
-        /* Calculate total request size and shift buffer */
-        size_t headerSize = (r.body ? (r.body - buf) : bufUsed);
-        size_t totalSize = headerSize + r.contentLength;
-        if (totalSize < bufUsed) {
-            memmove(buf, buf + totalSize, bufUsed - totalSize);
-            bufUsed -= totalSize;
+            memcpy(buf + bufUsed, ptBuf, (size_t)n);
+            bufUsed += (size_t)n;
         } else {
-            bufUsed = 0;
+            /* Peek so the final plaintext pair-verify request cannot consume
+             * bytes belonging to the first encrypted transport record. */
+            if (bufUsed == sizeof(buf)) {
+                printf("[AP] Request exceeds stream limit\n");
+                break;
+            }
+            ssize_t n = recv(c, buf + bufUsed, sizeof(buf) - bufUsed, MSG_PEEK);
+            if (n <= 0) {
+                if (n < 0 && errno == EINTR) continue;
+                break;
+            }
+            HTTPReq preview;
+            bool complete = parse_http(buf, bufUsed + (size_t)n, &preview);
+            if (preview.invalid) {
+                printf("[AP] Invalid or oversized request\n");
+                break;
+            }
+            size_t take = (size_t)n;
+            if (complete) {
+                size_t total = (size_t)(preview.body - buf) + preview.contentLength;
+                take = total - bufUsed;
+            }
+            n = recv(c, buf + bufUsed, take, 0);
+            if (n <= 0) {
+                if (n < 0 && errno == EINTR) continue;
+                break;
+            }
+            bufUsed += (size_t)n;
+        }
+
+        /* One TCP read or encrypted record may contain partial, complete, or
+         * multiple requests. Route only complete bounded messages. */
+        while (bufUsed > 0) {
+            HTTPReq r;
+            if (!parse_http(buf, bufUsed, &r)) {
+                if (r.invalid || bufUsed == sizeof(buf)) goto client_done;
+                break;
+            }
+            size_t total = (size_t)(r.body - buf) + r.contentLength;
+            bool readOnly = strcasecmp(r.method, "GET") == 0 ||
+                            strcasecmp(r.method, "OPTIONS") == 0;
+            if (!readOnly && !control_claim(c)) {
+                const char *proto = strncmp(r.protocol, "RTSP", 4) == 0 ?
+                                    "RTSP/1.0" : "HTTP/1.1";
+                send_response(c, proto, 503, "Service Unavailable",
+                              NULL, NULL, 0, r.cseq);
+            } else {
+                route_request(c, &r);
+            }
+            memmove(buf, buf + total, bufUsed - total);
+            bufUsed -= total;
         }
     }
+client_done:
+    pthread_mutex_lock(&g_control_owner_lock);
+    bool endedSession = g_control_owner == c && g_enc.active;
+    if (g_control_owner == c && !endedSession) g_control_owner = -1;
+    pthread_mutex_unlock(&g_control_owner_lock);
     close(c);
     printf("[AP] Connection closed\n");
-    /* A session uses one encrypted control connection. Once it ends, by
-     * TEARDOWN, the iPhone closing it, or the iPhone leaving Wi-Fi, exit so
-     * Showcase stops the session the same way the Stop button does. */
-    if (g_enc.active) {
+    if (endedSession) {
         printf("[AP] CarPlay session ended; exiting\n");
         fflush(stdout);
         exit(0);
@@ -5460,6 +5427,17 @@ static int try_connect(const char *host, uint16_t port, uint32_t ifIndex,
     for (const struct addrinfo *ai = res; ai; ai = ai->ai_next) {
         int s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (s < 0) { lastError = errno; continue; }
+
+#ifdef IP_BOUND_IF
+        /* Keep the discovered control service on the same network on which
+         * Bonjour found it, even when another interface has a default route. */
+        if (ifIndex && setsockopt(s, IPPROTO_IP, IP_BOUND_IF, &ifIndex, sizeof(ifIndex)) != 0) {
+            lastError = errno;
+            if (verbose) printf("[CTRL] Cannot bind interface %u: %s\n", ifIndex, strerror(lastError));
+            close(s);
+            continue;
+        }
+#endif
 
         char addrStr[NI_MAXHOST], portS[NI_MAXSERV];
         getnameinfo(ai->ai_addr, ai->ai_addrlen,
@@ -5979,13 +5957,14 @@ static bool mdns_put_a(uint8_t *buf, size_t cap, size_t *off,
     return mdns_put_bytes(buf, cap, off, &addr_be, 4);
 }
 
-static uint32_t bridge100_ipv4_addr(void) {
+static uint32_t wifi_ipv4_addr(void) {
     struct ifaddrs *ifas = NULL;
-    uint32_t out = inet_addr("172.20.10.1");
+    uint32_t out = g_shared_wifi ? INADDR_ANY : inet_addr("172.20.10.1");
     if (getifaddrs(&ifas) == 0) {
         for (struct ifaddrs *ifa = ifas; ifa; ifa = ifa->ifa_next) {
             if (!ifa->ifa_name || !ifa->ifa_addr) continue;
-            if (strcmp(ifa->ifa_name, "bridge100") != 0) continue;
+            if (strcmp(ifa->ifa_name, g_wifi_interface) != 0) continue;
+            if (!(ifa->ifa_flags & IFF_UP)) continue;
             if (ifa->ifa_addr->sa_family != AF_INET) continue;
             struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
             out = sin->sin_addr.s_addr;
@@ -6008,6 +5987,11 @@ static void local_mdns_target_name(char *out, size_t out_len) {
 }
 
 static int send_unsolicited_mdns_airplay_announcement(void) {
+    uint32_t wifiAddress = wifi_ipv4_addr();
+    if (wifiAddress == INADDR_ANY) {
+        printf("[MDNS] No IPv4 address on %s; skipping wire announcement\n", g_wifi_interface);
+        return -1;
+    }
     char airplay_inst[128];
     char raop_inst[160];
     char target[160];
@@ -6040,7 +6024,7 @@ static int send_unsolicited_mdns_airplay_announcement(void) {
     ok &= mdns_put_txt_bytes(pkt, sizeof(pkt), &off, raop_inst,
                              TXTRecordGetBytesPtr(&raopTxt),
                              TXTRecordGetLength(&raopTxt), 4500);
-    ok &= mdns_put_a(pkt, sizeof(pkt), &off, target, bridge100_ipv4_addr(), 120);
+    ok &= mdns_put_a(pkt, sizeof(pkt), &off, target, wifiAddress, 120);
 
     TXTRecordDeallocate(&apTxt);
     TXTRecordDeallocate(&raopTxt);
@@ -6066,7 +6050,7 @@ static int send_unsolicited_mdns_airplay_announcement(void) {
     memset(&local, 0, sizeof(local));
     local.sin_family = AF_INET;
     local.sin_port = htons(5353);
-    local.sin_addr.s_addr = bridge100_ipv4_addr();
+    local.sin_addr.s_addr = wifiAddress;
     if (bind(fd, (struct sockaddr *)&local, sizeof(local)) != 0) {
         /* Do not fail the announcement solely because mDNSResponder owns 5353.
          * A 5353 source port is preferred, but the packet still helps as a
@@ -6074,7 +6058,7 @@ static int send_unsolicited_mdns_airplay_announcement(void) {
         memset(&local, 0, sizeof(local));
         local.sin_family = AF_INET;
         local.sin_port = 0;
-        local.sin_addr.s_addr = bridge100_ipv4_addr();
+        local.sin_addr.s_addr = wifiAddress;
         bind(fd, (struct sockaddr *)&local, sizeof(local));
     }
 
@@ -6084,7 +6068,7 @@ static int send_unsolicited_mdns_airplay_announcement(void) {
     setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
 
     struct in_addr ifaddr;
-    ifaddr.s_addr = bridge100_ipv4_addr();
+    ifaddr.s_addr = wifiAddress;
     setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &ifaddr, sizeof(ifaddr));
 
     struct sockaddr_in dst;
@@ -6207,12 +6191,16 @@ int main(int argc, char *argv[]) {
      * briefly remove and recreate the bridge during the Bluetooth-to-Wi-Fi
      * transition; DNS-SD interface 0 safely advertises on eligible
      * interfaces instead of killing the receiver during that race. */
-    unsigned int br = if_nametoindex("bridge100");
+    unsigned int br = if_nametoindex(g_wifi_interface);
+    if (g_shared_wifi && (!br || wifi_ipv4_addr() == INADDR_ANY)) {
+        printf("[SVC] FATAL: selected shared Wi-Fi interface %s has no IPv4 address\n", g_wifi_interface);
+        return 1;
+    }
     if (br == 0) {
         printf("[SVC] WARN: bridge100 is transiently unavailable; "
                "registering DNS-SD on all eligible interfaces\n");
     } else {
-        printf("[SVC] bridge100 ifIndex = %u\n", br);
+        printf("[SVC] %s ifIndex = %u\n", g_wifi_interface, br);
     }
 
     /* Start AirPlay HTTP/RTSP server on port 7000 */
@@ -6286,11 +6274,12 @@ int main(int argc, char *argv[]) {
      * re-announce _airplay/_raop while the phone is expected to join. */
     start_mdns_reannounce_loop(regRef, raopRef);
 
-    /* Browse for _carplay-ctrl._tcp on bridge100.
+    /* Browse for _carplay-ctrl._tcp on the active Wi-Fi network.
      * Browse fires immediately with cached results, but ctrl_connect_thread
      * re-resolves with kDNSServiceFlagsForceMulticast on each round,
      * so stale ports get refreshed automatically. */
-    printf("[MDNS] Browsing for _carplay-ctrl._tcp on bridge100 (if=%u)...\n", br);
+    printf("[MDNS] Browsing for _carplay-ctrl._tcp on %s (if=%u)...\n",
+           g_shared_wifi ? "shared Wi-Fi" : "bridge100", br);
     DNSServiceRef browseRef = NULL;
     err = DNSServiceBrowse(&browseRef, 0, br,
                            "_carplay-ctrl._tcp", NULL,

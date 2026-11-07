@@ -1,18 +1,24 @@
-# Showcase
+# Showcase · KCS Edition
+
+Kerem Cloud Services maintains this fork of [Amine Rostane's original Showcase](https://github.com/amineross/showcase). The original work and this fork are licensed under GPL-3.0-or-later; original authorship remains credited. The package ID stays `com.rostane.showcase` so existing installations can update in place.
+
+**Cydia/Sileo/Zebra source:** `https://kcs.net.tr/repo/`
+
+Receivers without Personal Hotspot can use **Settings → Wi-Fi Setup → Existing Wi-Fi network**. Connect the receiver and iPhone to the same router, enter that router's Wi-Fi name and password, and save. The router must allow clients to talk to each other. The Personal Hotspot option remains available.
 
 ## Updates
 
-This repository contains the Showcase source. Install the packaged tweak from the Rostane source in Sileo.
+This repository contains the KCS maintained source. Install the package from the KCS source in Cydia, Sileo, or Zebra.
 
 ```text
-https://aminerostane.com/repo
+https://kcs.net.tr/repo/
 ```
 
 Beta 5-2
 
 - Turns on Prioritize Quality once for everyone, including existing setups. Turn it off in Settings > Display and it stays off.
 - Adds a star button on the home screen that links to this repository.
-- Adds anonymous usage reporting, on by default. Settings > Anonymous Usage turns it off or turns off single items. See [Anonymous Usage](#anonymous-usage).
+- The original release added anonymous usage reporting. The KCS edition starts with sharing off; Settings > Anonymous Usage lets users opt in item by item. See [Anonymous Usage](#anonymous-usage).
 
 Beta 5
 
@@ -37,7 +43,7 @@ Beta 4-2
 
 Beta 4
 
-- Starts Personal Hotspot by itself, and asks you to turn it on in Settings when iOS refuses.
+- Starts Personal Hotspot by itself, or uses an already-connected shared Wi-Fi network.
 - Lets you pick where sound plays by tapping the receiver or the CarPlay sender on the Sound page.
 - Shortens the connection steps and drops the small explanation text.
 - Returns to CarPlay when you tap anywhere on the dimmed controls screen.
@@ -53,12 +59,12 @@ Showcase ships in rootful and rootless package layouts. Both use iOS 12 as the d
 Add the package source in Sileo, Cydia, or Zebra.
 
 ```text
-https://aminerostane.com/repo
+https://kcs.net.tr/repo/
 ```
 
-Then install `Showcase`.
+Then install `Showcase (Rootful)`. The KCS repository currently publishes the rootful iOS 12 package and the optional vehicle power package. Rootless and Taurine source/build templates are present, but their KCS packages have not been published.
 
-On Taurine (iOS 14), install `Showcase for Taurine` instead. It starts Bluetooth in the order Taurine needs, waits longer for the controller and adds BTQuiet, which slows Bluetooth clients' reconnects while Showcase owns the controller. It replaces the regular package.
+The Taurine variant requires a different Bluetooth startup order and BTQuiet. It is not currently available from the KCS repository.
 
 Install guide and protocol write-up
 
@@ -68,7 +74,7 @@ https://aminerostane.com/articles/showcase
 
 | Item | Requirement |
 | --- | --- |
-| Receiver | Jailbroken iPhone or iPad with Personal Hotspot |
+| Receiver | Jailbroken iPhone or iPad with Personal Hotspot, or shared Wi-Fi access |
 | Tested rootful receiver | iPad Air 1, A1475, iPad4,2, iOS 12.5.8, checkra1n |
 | Tested rootless receiver | iPhone 7, iPhone9,3, iOS 15.8.4, Dopamine rootless |
 | Runtime packages | Rootful uses `uikittools`; rootless uses `uikittools` and `ldid` |
@@ -82,6 +88,7 @@ The package bundles `BTdaemon`, `libBTstack.dylib`, and the BTstack launch daemo
 - Wireless CarPlay discovery over Bluetooth and AirPlay/mDNS.
 - BTstack takeover while the receiver runs.
 - iAP2 link setup, identification, BAA authentication, Wi-Fi handoff, and EAP session setup.
+- Experimental shared-network mode: choose **Settings > Wi-Fi Setup > Existing Wi-Fi network**, enter the portable router's name and WPA/WPA2 password, and connect both devices to that router. Showcase does not start Personal Hotspot in this mode. It verifies the receiver's connected SSID and advertises only on the selected Wi-Fi interface. Bluetooth-to-Wi-Fi handoff on a third-party router still requires real-device testing.
 - AirPlay pair-setup, pair-verify, auth-setup, RTSP control, timing, event channel, and screen stream setup.
 - H.264 screen stream decryption with ChaCha20-Poly1305.
 - Single-finger touch forwarding over the encrypted event channel.
@@ -112,7 +119,7 @@ The sharper stream started with [@edouaz](https://github.com/edouaz) in [#26](ht
 
 ## Anonymous Usage
 
-Showcase reports how many people use it and on what, so I know which devices and jailbreaks to support. Settings > Anonymous Usage lists every item with the value Showcase sends, and turns each one off, or all of them.
+The KCS edition reports anonymous usage only when enabled in Settings > Anonymous Usage. The screen lists each value and lets users turn off individual fields. A new random KCS installation ID is created; the identifier previously used for the original developer is not reused.
 
 | Item | Example |
 | --- | --- |
@@ -125,13 +132,15 @@ Showcase reports how many people use it and on what, so I know which devices and
 | `language` | `fr` |
 | `country` | `true` asks the server to store the country Cloudflare sees for the request |
 
-Showcase posts these as JSON to `https://aminerostane.com/api/ping` 10 seconds after launch, only when the items differ from the last report or 30 days have passed. If the request fails, Showcase drops it and tries again next launch; nothing shows on screen.
+When enabled, Showcase posts these as JSON to `https://kcs.net.tr/repo/api/ping.php` 10 seconds after launch, only when the items differ from the last report or 30 days have passed. If the request fails, Showcase drops it and tries again next launch.
 
-The endpoint is a Cloudflare Worker, `telemetry/worker.js`, with a D1 database. It keeps one row per `id` with first and last report dates and stores no IP address. An item turned off is cleared from that row on the next report. The app side is `send_anonymous_usage()` in `source/Showcase.m`.
+The KCS endpoint is PHP with a private SQLite database. It keeps one row per `id` with first and last report dates and does not save the IP address in that database. Normal web server access logs may still contain IP addresses. An item turned off is cleared from that row on the next report. The app side is `send_anonymous_usage()` in `source/Showcase.m`.
+
+**Diagnostics:** Settings > Troubleshooting > Send Logs to KCS asks for confirmation before uploading a diagnostics tar archive. The archive can contain Wi-Fi names, device details, and Bluetooth captures. It is stored outside the public web root; there is no public download endpoint. No diagnostics archive is uploaded automatically.
 
 ## Languages
 
-Showcase speaks English, French, Spanish, Simplified Chinese and Japanese. It follows the device's preferred languages; Settings > Language picks another one. iOS places and features use Apple's own names in each language.
+Showcase speaks English, French, Spanish, Simplified Chinese, Japanese and Turkish. It follows the device's preferred languages; Settings > Language picks another one. iOS places and features use Apple's own names in each language.
 
 Translations live in `tools/localization/translations.py`. After changing a string or a translation, run `tools/localization/generate.py` to rewrite `source/Localizations/*.lproj`, then `tests/test_localization.py`.
 
@@ -145,7 +154,7 @@ source/Localizations/
               generated translations
 packaging/    Debian control files, depictions, package scripts
 tweak/        BTQuiet, shipped only in the Taurine package
-telemetry/    Cloudflare Worker and schema behind anonymous usage
+telemetry/    KCS PHP endpoints for opt-in usage and manually submitted diagnostics
 tools/localization/
               translation table and generator
 icon/         app icons
@@ -187,7 +196,7 @@ The `.deb` files land in `packaging/build/`. The APT repository lands in `packag
 
 For GitHub Releases, upload both `.deb` files from `packaging/build/` after you rebuild the packages. The rootful asset ends in `iphoneos-arm.deb`; the rootless asset ends in `iphoneos-arm64.deb`.
 
-For Sileo, Cydia, and Zebra, publish the generated `packaging/repo/` contents to the web path that serves `https://aminerostane.com/repo`.
+For Sileo, Cydia, and Zebra, publish the generated `packaging/repo/` contents to the web path that serves `https://kcs.net.tr/repo/`.
 
 ## Logs
 

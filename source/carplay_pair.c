@@ -703,29 +703,35 @@ static tlv_t *tlv_parse(const uint8_t *buf, size_t len) {
     while (i + 2 <= len) {
         uint8_t type = buf[i];
         uint8_t tlen = buf[i + 1];
-        if (i + 2 + tlen > len) break;
+        if (i + 2 + tlen > len) goto invalid;
 
         /* Check if this is a continuation of the previous item */
         if (t->count > 0 && t->items[t->count - 1].type == type) {
             tlv_item_t *prev = &t->items[t->count - 1];
+            if (tlen == 0) { i += 2; continue; }
             uint8_t *newdata = realloc(prev->data, prev->len + tlen);
-            if (!newdata) break;
+            if (!newdata) goto invalid;
             memcpy(newdata + prev->len, buf + i + 2, tlen);
             prev->data = newdata;
             prev->len += tlen;
         } else {
-            if (t->count >= MAX_TLV_ITEMS) break;
+            if (t->count >= MAX_TLV_ITEMS) goto invalid;
             tlv_item_t *item = &t->items[t->count];
             item->type = type;
             item->len = tlen;
             item->data = malloc(tlen > 0 ? tlen : 1);
-            if (!item->data) break;
+            if (!item->data) goto invalid;
             if (tlen > 0) memcpy(item->data, buf + i + 2, tlen);
             t->count++;
         }
         i += 2 + tlen;
     }
+    if (i != len) goto invalid;
     return t;
+invalid:
+    for (int j = 0; j < t->count; j++) free(t->items[j].data);
+    free(t);
+    return NULL;
 }
 
 static const tlv_item_t *tlv_find(const tlv_t *t, uint8_t type) {
@@ -977,11 +983,7 @@ int pair_derive_control_keys(pair_ctx_t *ctx, uint8_t readKey[32], uint8_t write
                 (const unsigned char *)"Control-Read-Encryption-Key", 27,
                 writeKey, 32);
 
-    printf("[PAIR] Control read  key: ");
-    for (int i = 0; i < 32; i++) printf("%02x", readKey[i]);
-    printf("\n[PAIR] Control write key: ");
-    for (int i = 0; i < 32; i++) printf("%02x", writeKey[i]);
-    printf("\n");
+    printf("[PAIR] Control keys derived\n");
     return 0;
 }
 
@@ -1004,11 +1006,7 @@ int pair_derive_event_keys(pair_ctx_t *ctx, uint8_t readKey[32], uint8_t writeKe
                 (const unsigned char *)"Events-Write-Encryption-Key", 27,
                 writeKey, 32);
 
-    printf("[PAIR] Event read  key: ");
-    for (int i = 0; i < 32; i++) printf("%02x", readKey[i]);
-    printf("\n[PAIR] Event write key: ");
-    for (int i = 0; i < 32; i++) printf("%02x", writeKey[i]);
-    printf("\n");
+    printf("[PAIR] Event keys derived\n");
     return 0;
 }
 
@@ -1027,9 +1025,7 @@ int pair_derive_stream_key(pair_ctx_t *ctx, uint64_t streamConnectionID, uint8_t
                 (const unsigned char *)saltBuf, saltLen,
                 (const unsigned char *)"DataStream-Output-Encryption-Key", 32,
                 outKey, 32);
-    printf("[PAIR] Stream key (connID=%llu): ", (unsigned long long)streamConnectionID);
-    for (int i = 0; i < 32; i++) printf("%02x", outKey[i]);
-    printf("\n");
+    printf("[PAIR] Stream key derived (connID=%llu)\n", (unsigned long long)streamConnectionID);
     return 0;
 }
 
@@ -1057,7 +1053,7 @@ static uint8_t *make_error_response(uint8_t state, uint8_t error_code, size_t *o
 /* M1 → M2: Generate SRP salt + server public key */
 static uint8_t *handle_setup_m1(pair_ctx_t *ctx, const tlv_t *in, size_t *out_len) {
     printf("[PAIR] pair-setup M1 received (State=1, Method=PairSetup)\n");
-    printf("[PAIR] *** PIN: %s *** (enter this if iPhone prompts)\n", ctx->pin);
+    printf("[PAIR] Pairing PIN configured\n");
 
     /* Reset SRP state for new pairing attempt */
     free(ctx->srp_verifier);
@@ -1190,6 +1186,8 @@ static uint8_t *handle_setup_m3(pair_ctx_t *ctx, const tlv_t *in, size_t *out_le
  * Nonces: "PS-Msg05" for M5 decrypt, "PS-Msg06" for M6 encrypt. */
 static uint8_t *handle_setup_m5(pair_ctx_t *ctx, const tlv_t *in, size_t *out_len) {
     printf("[PAIR] pair-setup M5 received (State=5)\n");
+    uint8_t peer_identifier[MAX_PEER_IDENTIFIER_LEN];
+    size_t peer_identifier_len = 0;
 
     if (!ctx->srp_has_session_key) {
         printf("[PAIR] ERROR: No session key (M4 not completed?)\n");
@@ -1244,39 +1242,34 @@ static uint8_t *handle_setup_m5(pair_ctx_t *ctx, const tlv_t *in, size_t *out_le
             printf("[PAIR]   Identifier (%zu): %.*s\n",
                    ident->len, (int)ident->len, ident->data);
         }
-        if (pk && pk->len >= ED25519_KEY_LEN) {
-            memcpy(ctx->client_pk, pk->data, ED25519_KEY_LEN);
-            ctx->client_pk_set = 1;
-            printf("[PAIR]   Client Ed25519 pk: ");
-            for (int i = 0; i < ED25519_KEY_LEN; i++) printf("%02x", ctx->client_pk[i]);
-            printf("\n");
-            if (ident && pair_ctx_add_peer(ctx, ident->data, ident->len,
-                                          ctx->client_pk) == 0) {
-                printf("[PAIR]   Controller saved in registry (%zu total)\n",
-                       ctx->peer_count);
+        if (pk && pk->len == ED25519_KEY_LEN && ident && ident->len > 0 &&
+            ident->len <= MAX_PEER_IDENTIFIER_LEN && sig && sig->len == 64) {
+            uint8_t controllerX[32];
+            const char *salt = "Pair-Setup-Controller-Sign-Salt";
+            const char *info = "Pair-Setup-Controller-Sign-Info";
+            hkdf_sha512(ctx->srp_session_key, SRP_SKEY_LEN,
+                        (const unsigned char *)salt, (int)strlen(salt),
+                        (const unsigned char *)info, (int)strlen(info), controllerX, 32);
+            uint8_t signed_data[32 + MAX_PEER_IDENTIFIER_LEN + ED25519_KEY_LEN];
+            memcpy(signed_data, controllerX, 32);
+            memcpy(signed_data + 32, ident->data, ident->len);
+            memcpy(signed_data + 32 + ident->len, pk->data, ED25519_KEY_LEN);
+            if (crypto_ed25519_check(sig->data, pk->data, signed_data,
+                                     32 + ident->len + ED25519_KEY_LEN) == 0) {
+                memcpy(ctx->client_pk, pk->data, ED25519_KEY_LEN);
+                memcpy(peer_identifier, ident->data, ident->len);
+                peer_identifier_len = ident->len;
+                ctx->client_pk_set = 1;
             }
-        }
-        if (sig) {
-            printf("[PAIR]   Signature (%zu bytes)\n", sig->len);
-        }
-        if (!ctx->client_pk_set) {
-            printf("[PAIR] ERROR: No PublicKey found in sub-TLV\n");
+            crypto_wipe(controllerX, sizeof(controllerX));
+            crypto_wipe(signed_data, sizeof(signed_data));
         }
         tlv_free(sub);
-    } else {
-        /* Try raw Ed25519 pk format (fallback) */
-        if (pt_len == ED25519_KEY_LEN) {
-            memcpy(ctx->client_pk, plaintext, ED25519_KEY_LEN);
-            ctx->client_pk_set = 1;
-            printf("[PAIR] Client Ed25519 pk (raw 32 bytes)\n");
-        } else {
-            printf("[PAIR] ERROR: Failed to parse sub-TLV and not raw pk\n");
-        }
     }
     free(plaintext);
 
     if (!ctx->client_pk_set) {
-        printf("[PAIR] ERROR: Could not extract client Ed25519 pk\n");
+        printf("[PAIR] ERROR: Invalid controller identity or signature\n");
         return make_error_response(6, 2, out_len);
     }
 
@@ -1362,7 +1355,12 @@ static uint8_t *handle_setup_m5(pair_ctx_t *ctx, const tlv_t *in, size_t *out_le
     uint8_t *resp = tlv_build(resp_items, 2, out_len);
     free(enc_out);
 
-    ctx->setup_state = 6;
+    if (resp && pair_ctx_add_peer(ctx, peer_identifier, peer_identifier_len,
+                                  ctx->client_pk) != 0) {
+        free(resp);
+        return make_error_response(6, 1, out_len);
+    }
+    if (resp) ctx->setup_state = 6;
     printf("[PAIR] *** PAIR-SETUP COMPLETE ***\n");
     printf("[PAIR] pair-setup M6 sent (State=6, EncryptedData=%zu)\n", enc_out_len);
     return resp;
@@ -1373,6 +1371,7 @@ uint8_t *pair_setup_handle(pair_ctx_t *ctx, const uint8_t *body, size_t bodyLen,
                             size_t *out_len) {
     *out_len = 0;
     if (!ctx || !body || bodyLen == 0) return NULL;
+    if (ctx->setup_state == 6) ctx->setup_state = 0;
 
     tlv_t *in = tlv_parse(body, bodyLen);
     if (!in) {
@@ -1395,12 +1394,18 @@ uint8_t *pair_setup_handle(pair_ctx_t *ctx, const uint8_t *body, size_t bodyLen,
 
     switch (state) {
         case 1:  /* M1 */
+            ctx->setup_state = 0;
             resp = handle_setup_m1(ctx, in, out_len);
             break;
         case 3:  /* M3 */
+            if (ctx->setup_state != 2) { resp = make_error_response(4, 2, out_len); break; }
+            ctx->setup_state = 0;
             resp = handle_setup_m3(ctx, in, out_len);
             break;
         case 5:  /* M5 */
+            if (ctx->setup_state != 4) { resp = make_error_response(6, 2, out_len); break; }
+            ctx->setup_state = 0;
+            ctx->client_pk_set = 0;
             resp = handle_setup_m5(ctx, in, out_len);
             break;
         default:
@@ -1656,7 +1661,7 @@ static uint8_t *handle_verify_m3(pair_ctx_t *ctx, const tlv_t *in, size_t *out_l
     };
     uint8_t *resp = tlv_build(items, 1, out_len);
 
-    ctx->verify_state = 4;
+    if (resp) ctx->verify_state = 4;
     printf("[PAIR] *** PAIR-VERIFY COMPLETE ***\n");
     printf("[PAIR] pair-verify M4 sent (State=4, success)\n");
     return resp;
@@ -1667,6 +1672,7 @@ uint8_t *pair_verify_handle(pair_ctx_t *ctx, const uint8_t *body, size_t bodyLen
                               size_t *out_len) {
     *out_len = 0;
     if (!ctx || !body || bodyLen == 0) return NULL;
+    if (ctx->verify_state == 4) ctx->verify_state = 0;
 
     tlv_t *in = tlv_parse(body, bodyLen);
     if (!in) {
@@ -1688,9 +1694,13 @@ uint8_t *pair_verify_handle(pair_ctx_t *ctx, const uint8_t *body, size_t bodyLen
 
     switch (state) {
         case 1:
+            ctx->verify_state = 0;
+            ctx->client_ecdh_pk_set = 0;
             resp = handle_verify_m1(ctx, in, out_len);
             break;
         case 3:
+            if (ctx->verify_state != 2) { resp = make_error_response(4, 2, out_len); break; }
+            ctx->verify_state = 0;
             resp = handle_verify_m3(ctx, in, out_len);
             break;
         default:

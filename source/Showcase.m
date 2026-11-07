@@ -26,10 +26,12 @@
 #include <sys/sysctl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <netinet/in.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
+#include <pthread.h>
 #include <spawn.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -61,13 +63,13 @@ extern char **environ;
 #define MOBILE_GLOBAL_PREFERENCES @"/var/mobile/Library/Preferences/.GlobalPreferences.plist"
 
 static NSArray<NSString *> *showcase_languages(void) {
-    return @[@"en", @"fr", @"es", @"zh-Hans", @"ja"];
+    return @[@"en", @"fr", @"es", @"zh-Hans", @"ja", @"tr"];
 }
 
 /* The language's own name, as iOS lists it. */
 static NSString *showcase_language_name(NSString *language) {
     NSDictionary *names = @{@"en": @"English", @"fr": @"Français", @"es": @"Español",
-                            @"zh-Hans": @"简体中文", @"ja": @"日本語"};
+                            @"zh-Hans": @"简体中文", @"ja": @"日本語", @"tr": @"Türkçe"};
     return names[language] ?: language;
 }
 
@@ -138,13 +140,16 @@ static NSString *L(NSString *english) {
 #define DEDICATED_RADIO_KEY     @"leaveOtherWiFiDuringCarPlay"
 #define HELD_WIFI_NETWORK_KEY   @"heldWiFiNetworkSSID"
 #define HOTSPOT_OWNED_KEY       @"hotspotStartedByShowcase"
+#define SHARED_WIFI_KEY         @"useExistingWiFi"
 /* Beta 6 turns Prioritize Quality on once; later choices are kept. */
 #define QUALITY_DEFAULT_SET_KEY @"qualityDefaultApplied"
-#define USAGE_KEY               @"anonymousUsageEnabled"
-#define USAGE_ID_KEY            @"anonymousUsageID"
-#define USAGE_SENT_KEY          @"anonymousUsageSentPayload"
-#define USAGE_SENT_DATE_KEY     @"anonymousUsageSentDate"
-#define GITHUB_URL              @"https://github.com/amineross/showcase"
+#define USAGE_KEY               @"kcsAnonymousUsageEnabled"
+#define USAGE_ID_KEY            @"kcsAnonymousUsageID"
+#define USAGE_SENT_KEY          @"kcsAnonymousUsageSentPayload"
+#define USAGE_SENT_DATE_KEY     @"kcsAnonymousUsageSentDate"
+#define GITHUB_URL              @"https://github.com/inckerem/showcase"
+#define USAGE_URL               @"https://kcs.net.tr/repo/api/ping.php"
+#define LOGS_URL                @"https://kcs.net.tr/repo/api/logs.php"
 #define MIS_STATE_OFF           1022
 #define MIS_STATE_ON            1023
 #define SHOWCASE_BT_PROGRESS_NOTIFICATION "com.rostane.showcase.bt-progress"
@@ -192,7 +197,7 @@ static void ip_log_open(void) {
  * Configuration
  * ═══════════════════════════════════════════════════════════════ */
 
-#define APP_NAME          "Showcase"
+#define APP_NAME          "Showcase KCS"
 /* Release builds pass APP_VERSION from the VERSION file. */
 #ifndef APP_VERSION
 #define APP_VERSION       "development"
@@ -200,7 +205,7 @@ static void ip_log_open(void) {
 #ifndef PACKAGE_VERSION
 #define PACKAGE_VERSION   "development"
 #endif
-#define APP_AUTHOR        "Amine Rostane"
+#define APP_AUTHOR        "Kerem Cloud Services"
 #define SOCK_PATH         "/tmp/ipadplay.sock"   /* IPC socket — kept for compat with carplay_services */
 #define BLUETOOTHD_PLIST  "/System/Library/LaunchDaemons/com.apple.bluetoothd.plist"
 #define BT_READY_PATH     "/tmp/showcase_bt_ready"
@@ -418,6 +423,11 @@ static void restore_system_bluetooth(const char *reason) {
 
 static volatile int g_touch_fd = -1;
 static volatile uint32_t g_touch_epoch = 0;
+static pthread_mutex_t g_ipc_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_flow_epoch = 0;
+static bool g_flow_cancelled = true;
+static bool flow_cancelled(void) { return __atomic_load_n(&g_flow_cancelled, __ATOMIC_ACQUIRE); }
+static uint32_t flow_epoch(void) { return __atomic_load_n(&g_flow_epoch, __ATOMIC_ACQUIRE); }
 static dispatch_queue_t g_touch_write_queue = NULL;
 static volatile float g_carplay_w = 0;
 static volatile float g_carplay_h = 0;
@@ -1234,6 +1244,34 @@ static void *showcase_wifi_manager(void) {
     return manager;
 }
 
+/* Nil means MobileWiFi could not determine the associated network. */
+static NSString *showcase_current_wifi_ssid(void) {
+    void *manager = showcase_wifi_manager();
+    CFArrayRef (*copyDevices)(void *) = showcase_mobilewifi_symbol("WiFiManagerClientCopyDevices");
+    void *(*copyCurrent)(void *) = showcase_mobilewifi_symbol("WiFiDeviceClientCopyCurrentNetwork");
+    CFStringRef (*ssidOf)(void *) = showcase_mobilewifi_symbol("WiFiNetworkGetSSID");
+    if (!manager || !copyDevices || !copyCurrent || !ssidOf) return nil;
+    CFArrayRef devices = copyDevices(manager);
+    NSString *ssid = nil;
+    for (CFIndex i = 0; devices && i < CFArrayGetCount(devices); i++) {
+        void *network = copyCurrent((void *)CFArrayGetValueAtIndex(devices, i));
+        if (!network) continue;
+        CFStringRef name = ssidOf(network);
+        if (name) ssid = [(__bridge NSString *)name copy];
+        CFRelease(network);
+        if (ssid.length) break;
+    }
+    if (devices) CFRelease(devices);
+    return ssid.length ? ssid : nil;
+}
+
+/* Existing Wi-Fi is the default for this build; an explicit setting persists. */
+static BOOL showcase_use_existing_wifi(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    id value = [defaults objectForKey:SHARED_WIFI_KEY];
+    return value ? [value boolValue] : YES;
+}
+
 /* Returns the network that was left, or nil when none was joined. */
 static NSString *showcase_hold_other_wifi(void) {
     void *manager = showcase_wifi_manager();
@@ -1322,7 +1360,7 @@ static void showcase_release_other_wifi(const char *reason) {
  *   language   Showcase's language
  *   country    asks the server to keep the country Cloudflare reports
  *
- * It is posted to https://aminerostane.com/api/ping (telemetry/worker.js)
+ * It is posted to KCS's endpoint only when the user enables sharing.
  * when it differs from the last one sent, or after 30 days. The server keeps
  * one row per id and never stores IP addresses. Failures are ignored.
  * ═══════════════════════════════════════════════════════════════ */
@@ -1384,7 +1422,7 @@ static void send_anonymous_usage(void) {
     }
     payload[@"id"] = identifier;
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:
-        [NSURL URLWithString:@"https://aminerostane.com/api/ping"]];
+        [NSURL URLWithString:USAGE_URL]];
     request.HTTPMethod = @"POST";
     request.timeoutInterval = 15;
     [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
@@ -1469,8 +1507,10 @@ static dispatch_queue_t touch_write_queue(void) {
 
 static void send_ipc_payload(uint8_t type, const void *payload,
                              uint32_t payloadLength) {
+    pthread_mutex_lock(&g_ipc_lock);
     int fd = g_touch_fd;
     uint32_t epoch = g_touch_epoch;
+    pthread_mutex_unlock(&g_ipc_lock);
     if (fd < 0) return;
 
     NSMutableData *message =
@@ -1484,20 +1524,25 @@ static void send_ipc_payload(uint8_t type, const void *payload,
     if (payloadLength) memcpy(bytes + 5, payload, payloadLength);
 
     dispatch_async(touch_write_queue(), ^{
-        if (g_touch_fd != fd || g_touch_epoch != epoch) return;
+        pthread_mutex_lock(&g_ipc_lock);
+        int writer = (g_touch_fd == fd && g_touch_epoch == epoch) ? dup(fd) : -1;
+        pthread_mutex_unlock(&g_ipc_lock);
+        if (writer < 0) return;
         const uint8_t *cursor = message.bytes;
         size_t remaining = message.length;
         while (remaining > 0) {
-            ssize_t written = write(fd, cursor, remaining);
+            ssize_t written = write(writer, cursor, remaining);
             if (written < 0 && errno == EINTR) continue;
             if (written <= 0) {
                 ip_log("IPC write failed type=0x%02x: %s",
                        type, strerror(errno));
+                close(writer);
                 return;
             }
             cursor += written;
             remaining -= (size_t)written;
         }
+        close(writer);
     });
 }
 
@@ -1534,6 +1579,29 @@ static BOOL is_ap_up(void) {
     }
     freeifaddrs(ifa);
     return up;
+}
+
+/* A portable router/shared Wi-Fi network uses the normal Wi-Fi interface
+ * rather than Personal Hotspot's bridge100.  Only treat an interface as
+ * usable when it is up and already has an address; this prevents falling
+ * through to shared mode while Wi-Fi is merely powered on. */
+static NSString *shared_wifi_interface(void) {
+    struct ifaddrs *ifa = NULL, *cur;
+    if (getifaddrs(&ifa) != 0) return nil;
+    NSString *name = nil;
+    for (cur = ifa; cur != NULL; cur = cur->ifa_next) {
+        if (!cur->ifa_name || !(cur->ifa_flags & IFF_UP)) continue;
+        if (strcmp(cur->ifa_name, "en0") != 0 &&
+            strcmp(cur->ifa_name, "en1") != 0) continue;
+        if (!cur->ifa_addr) continue;
+        if (cur->ifa_addr->sa_family != AF_INET) continue;
+        struct sockaddr_in *address = (struct sockaddr_in *)cur->ifa_addr;
+        if (address->sin_addr.s_addr == INADDR_ANY) continue;
+        name = [NSString stringWithUTF8String:cur->ifa_name];
+        if ([name isEqualToString:@"en0"]) break;
+    }
+    freeifaddrs(ifa);
+    return name;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -1741,7 +1809,11 @@ static pid_t spawn_daemon(const char *path, char *const argv[], const char *logf
     }
 
     NSMutableString *cmdline = [NSMutableString stringWithUTF8String:path];
-    for (int i = 1; argv[i] != NULL; i++) [cmdline appendFormat:@" %s", argv[i]];
+    for (int i = 1; argv[i] != NULL; i++) {
+        BOOL redacted = (i > 1 &&
+            (!strcmp(argv[i - 1], "--pass") || !strcmp(argv[i - 1], "-p")));
+        [cmdline appendFormat:@" %s", redacted ? "******" : argv[i]];
+    }
     ip_log("spawn_daemon: %s", [cmdline UTF8String]);
 
     pid_t pid = 0;
@@ -1783,6 +1855,7 @@ static BOOL pid_alive(pid_t pid) {
 static BOOL wait_for_bt_ready_or_exit(pid_t pid, int seconds) {
     int loops = seconds * 10;
     for (int i = 0; i < loops; i++) {
+        if (flow_cancelled()) return NO;
         if (access(BT_READY_PATH, F_OK) == 0) {
             ip_log("[BT] ready sentinel observed at %s", BT_READY_PATH);
             return YES;
@@ -1818,6 +1891,7 @@ static BOOL wait_for_bt_ready_or_exit(pid_t pid, int seconds) {
 
 static BOOL wait_for_pid_alive(pid_t pid, int seconds, const char *name) {
     for (int i = 0; i < seconds; i++) {
+        if (flow_cancelled()) return NO;
         if (!pid_alive(pid)) {
             ip_log("%s exited during startup wait at %d/%d sec", name, i, seconds);
             return NO;
@@ -1829,6 +1903,7 @@ static BOOL wait_for_pid_alive(pid_t pid, int seconds, const char *name) {
 
 static BOOL wait_for_path(const char *path, int seconds, const char *name) {
     for (int i = 0; i < seconds * 10; i++) {
+        if (flow_cancelled()) return NO;
         if (access(path, F_OK) == 0) {
             ip_log("%s ready at %s", name, path);
             return YES;
@@ -1982,6 +2057,24 @@ static NSString *validateSSID(NSString *ssid) {
     return nil;
 }
 
+static NSString *validateNetworkSSID(NSString *ssid) {
+    if (!showcase_use_existing_wifi()) return validateSSID(ssid);
+    if (!ssid.length) return L(@"Wi-Fi network is required.");
+    if ([ssid lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > 32)
+        return L(@"Wi-Fi name must be at most 32 bytes.");
+    return nil;
+}
+
+static NSString *validateNetworkPassword(NSString *password) {
+    NSUInteger bytes = [password lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+    if (showcase_use_existing_wifi()) {
+        if (bytes < 8 || bytes > 63) return L(@"Wi-Fi password must be 8 to 63 UTF-8 bytes.");
+    } else if (password.length < 8) {
+        return L(@"Hotspot passwords must be at least 8 characters.");
+    }
+    return nil;
+}
+
 @interface CarStore : NSObject
 @property (nonatomic, strong) NSMutableArray<Car *> *cars;
 @property (nonatomic, strong) Car *selected;
@@ -1994,6 +2087,7 @@ static NSString *validateSSID(NSString *ssid) {
 - (void)selectCar:(Car *)car;
 - (BOOL)apReady;
 - (void)setAPSSID:(NSString *)ssid password:(NSString *)pw;
+- (void)selectExistingWiFi:(BOOL)shared;
 @end
 
 @implementation CarStore
@@ -2002,8 +2096,8 @@ static NSString *validateSSID(NSString *ssid) {
     return self;
 }
 - (BOOL)apReady {
-    return self.apSSID.length > 0 && self.apPassword.length > 0
-        && validateSSID(self.apSSID) == nil;
+    return validateNetworkSSID(self.apSSID) == nil &&
+        validateNetworkPassword(self.apPassword) == nil;
 }
 - (void)load {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
@@ -2033,6 +2127,19 @@ static NSString *validateSSID(NSString *ssid) {
         self.apPassword = legacyPass;
         ip_log("migrated legacy AP creds from car embedded fields");
     }
+    if ([d boolForKey:@"networkCredentialsSeparated"]) {
+        BOOL shared = showcase_use_existing_wifi();
+        self.apSSID = [d stringForKey:shared ? @"sharedNetworkSSID" : @"hotspotNetworkSSID"] ?: @"";
+        self.apPassword = [d stringForKey:shared ? @"sharedNetworkPassword" : @"hotspotNetworkPassword"] ?: @"";
+    } else {
+        /* Older versions had only one pair. Preserve it in both modes once,
+         * then subsequent edits are independent; this avoids losing an
+         * existing working hotspot configuration during migration. */
+        [d setObject:self.apSSID forKey:@"sharedNetworkSSID"];
+        [d setObject:self.apPassword forKey:@"sharedNetworkPassword"];
+        [d setObject:self.apSSID forKey:@"hotspotNetworkSSID"];
+        [d setObject:self.apPassword forKey:@"hotspotNetworkPassword"];
+    }
 
     NSString *selName = [d stringForKey:@"selectedCarName"];
     self.selected = nil;
@@ -2051,6 +2158,10 @@ static NSString *validateSSID(NSString *ssid) {
     [d setObject:(self.selected.name ?: @"") forKey:@"selectedCarName"];
     [d setObject:(self.apSSID ?: @"")        forKey:@"apSSID"];
     [d setObject:(self.apPassword ?: @"")    forKey:@"apPassword"];
+    BOOL shared = showcase_use_existing_wifi();
+    [d setObject:(self.apSSID ?: @"") forKey:shared ? @"sharedNetworkSSID" : @"hotspotNetworkSSID"];
+    [d setObject:(self.apPassword ?: @"") forKey:shared ? @"sharedNetworkPassword" : @"hotspotNetworkPassword"];
+    [d setBool:YES forKey:@"networkCredentialsSeparated"];
     [d synchronize];
 }
 - (void)addCar:(Car *)car {
@@ -2069,6 +2180,15 @@ static NSString *validateSSID(NSString *ssid) {
 - (void)setAPSSID:(NSString *)ssid password:(NSString *)pw {
     self.apSSID = ssid ?: @"";
     self.apPassword = pw ?: @"";
+    [self save];
+}
+- (void)selectExistingWiFi:(BOOL)shared {
+    if (shared == showcase_use_existing_wifi()) return;
+    [self save];
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setBool:shared forKey:SHARED_WIFI_KEY];
+    self.apSSID = [d stringForKey:shared ? @"sharedNetworkSSID" : @"hotspotNetworkSSID"] ?: @"";
+    self.apPassword = [d stringForKey:shared ? @"sharedNetworkPassword" : @"hotspotNetworkPassword"] ?: @"";
     [self save];
 }
 @end
@@ -3219,6 +3339,8 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 @property (nonatomic, assign) NSInteger hotspotAttempt;
 @property (nonatomic, strong) NSTimer *hotspotWatchdog;
 @property (nonatomic, strong) NSTimer *discoveryTimer;
+@property (nonatomic, assign) BOOL sharedWifiSession;
+@property (nonatomic, copy) NSString *sharedWifiInterface;
 
 /* Floating chrome */
 @property (nonatomic, strong) UIButton *closeButton;       /* top-right, only ACTIVE */
@@ -3237,7 +3359,7 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 @property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
 
 /* State */
-@property (nonatomic, assign) ShowcaseState state;
+@property (atomic, assign) ShowcaseState state;
 
 /* Children */
 @property (nonatomic, assign) pid_t btdaemonPid;
@@ -3261,6 +3383,7 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 /* Networking */
 @property (nonatomic, assign) int listenFd;
 @property (nonatomic, assign) int clientFd;
+@property (nonatomic, strong) dispatch_semaphore_t ipcDone;
 @property (nonatomic, strong) dispatch_queue_t bgQueue;
 @property (nonatomic, strong) dispatch_queue_t videoQueue;
 
@@ -3324,7 +3447,7 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     NSMutableDictionary *defaults = [@{
         DEDICATED_RADIO_KEY: @YES,
         AUTO_START_KEY: @YES,
-        USAGE_KEY: @YES
+        USAGE_KEY: @NO
     } mutableCopy];
     for (NSArray *item in usage_items()) defaults[item[0]] = @YES;
     [[NSUserDefaults standardUserDefaults] registerDefaults:defaults];
@@ -3336,6 +3459,7 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
         [prefs setBool:YES forKey:QUALITY_DEFAULT_SET_KEY];
         [prefs synchronize];
     }
+#ifndef SHOWCASE_SIMULATOR_TEST
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{ send_anonymous_usage(); });
     _diagnosticsEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:DIAGNOSTICS_ENABLED_KEY];
@@ -3356,6 +3480,7 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
         }
         restore_system_bluetooth("launch recovery");
     });
+#endif
     self.cars = [[CarStore alloc] init];
 
     self.window = [[UIWindow alloc] initWithFrame:[[UIScreen mainScreen] bounds]];
@@ -3392,12 +3517,20 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 #ifdef SHOWCASE_UI_PREVIEW
     [self schedulePreviewFromFile];
 #endif
+#ifdef SHOWCASE_SIMULATOR_TEST
+    self.baaReady = YES;
+    [self renderState];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        [self presentSettingsPage:@"hotspot"];
+    });
+#else
     [self startBAA];
     /* The first preheat fails when the iPad is offline at launch, for example
      * before it rejoins Wi-Fi. Retry when the network changes. */
     int networkToken = 0;
     notify_register_dispatch("com.apple.system.config.network_change", &networkToken,
                              dispatch_get_main_queue(), ^(int token) { [self networkChanged]; });
+#endif
     return YES;
 }
 
@@ -3561,7 +3694,7 @@ static pid_t reusable_baa_broker(void) {
 - (void)handleForeground {
     [self endBackgroundTask];
     ip_log("foregrounded — continuing state=%ld", (long)self.state);
-    if (self.state == StateActive || self.state == StateAwaitingPhone) {
+    if (self.state != StateIdle && self.state != StateStopping) {
         g_video_needs_resync = 1;
         g_video_suspended = 0;
         dispatch_async(self.videoQueue, ^{
@@ -3632,9 +3765,9 @@ static pid_t reusable_baa_broker(void) {
 
     /* Primary button */
     self.primaryButton = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.primaryButton.backgroundColor = [UIColor whiteColor];
-    [self.primaryButton setTitleColor:[UIColor blackColor] forState:UIControlStateNormal];
-    [self.primaryButton setTitleColor:[UIColor colorWithWhite:0 alpha:0.4] forState:UIControlStateHighlighted];
+    self.primaryButton.backgroundColor = [UIColor colorWithRed:0.23 green:0.51 blue:0.96 alpha:1];
+    [self.primaryButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [self.primaryButton setTitleColor:[UIColor colorWithWhite:1 alpha:0.55] forState:UIControlStateHighlighted];
     self.primaryButton.titleLabel.font = [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
     [self.primaryButton addTarget:self action:@selector(primaryTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.setupOverlay addSubview:self.primaryButton];
@@ -3789,6 +3922,9 @@ static pid_t reusable_baa_broker(void) {
 /* ─── State machine ────────────────────────────────────────── */
 
 - (void)transitionTo:(ShowcaseState)s {
+    @synchronized (self) {
+    if (flow_cancelled() && s != StateIdle && s != StateStopping) return;
+    uint32_t epoch = flow_epoch();
     ShowcaseState old = self.state;
     self.state = s;
 
@@ -3803,6 +3939,7 @@ static pid_t reusable_baa_broker(void) {
     }
 
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (epoch != flow_epoch()) return;
         if (s == StatePreparingNet)
             [self completeConnectStep:ConnectStepBluetooth];
         else if (s == StateAwaitingPhone)
@@ -3810,6 +3947,7 @@ static pid_t reusable_baa_broker(void) {
         [self renderState];
         [self refreshPresentedSettings];
     });
+    }
 }
 
 /* ─── Connection progress ──────────────────────────────────── */
@@ -3858,7 +3996,8 @@ static pid_t reusable_baa_broker(void) {
 - (void)updateConnectSteps {
     self.stepsView.pendingTitles = @[
         @"Bluetooth", L(@"CarPlay services"), @"iPhone", L(@"Verification"),
-        L(@"Hotspot details"), @"Wi-Fi", L(@"Pairing"), @"CarPlay", L(@"Video")
+        self.sharedWifiSession ? L(@"Wi-Fi details") : L(@"Hotspot details"),
+        @"Wi-Fi", L(@"Pairing"), @"CarPlay", L(@"Video")
     ];
     self.stepsView.doneTitles = self.stepsView.pendingTitles;
     self.stepsView.completed = self.connectCompleted;
@@ -4151,17 +4290,51 @@ static pid_t reusable_baa_broker(void) {
 }
 
 - (void)startFlow {
+    if (self.state != StateIdle) return;
     ip_log("startFlow: car='%s' ssid='%s'",
            [self.cars.selected.name UTF8String],
            [self.cars.apSSID UTF8String]);
-    NSString *deviceName = hotspot_name();
-    if (deviceName && ![deviceName isEqualToString:self.cars.apSSID])
-        ip_log("[HOTSPOT] WARNING: hotspot is named '%s' but Showcase sends '%s'",
-               deviceName.UTF8String, self.cars.apSSID.UTF8String);
+    self.sharedWifiSession = showcase_use_existing_wifi();
+    self.sharedWifiInterface = nil;
+    if (self.sharedWifiSession) {
+        NSString *interface = shared_wifi_interface();
+        NSString *connectedSSID = showcase_current_wifi_ssid();
+        NSString *error = nil;
+        if (!interface) error = L(@"Connect this device to the Wi-Fi network first.");
+        else if (!connectedSSID) error = L(@"Could not read the connected Wi-Fi name. Check Wi-Fi in Settings and try again.");
+        else if (![connectedSSID isEqualToString:self.cars.apSSID]) {
+            error = [NSString stringWithFormat:L(@"This device is connected to “%@”, but Showcase is configured for “%@”. Connect both devices to the same network and update Wi-Fi settings."),
+                     connectedSSID, self.cars.apSSID];
+        }
+        if (error) {
+            ip_log("[WIFI] shared network not ready: %s", error.UTF8String);
+            if (!self.vc.presentedViewController) {
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:L(@"Wi-Fi Setup") message:error preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:L(@"OK") style:UIAlertActionStyleCancel handler:nil]];
+                [self.vc presentViewController:alert animated:YES completion:nil];
+            }
+            return;
+        }
+        self.sharedWifiInterface = interface;
+    } else {
+        NSString *deviceName = hotspot_name();
+        if (deviceName && ![deviceName isEqualToString:self.cars.apSSID])
+            ip_log("[HOTSPOT] WARNING: hotspot is named '%s' but Showcase sends '%s'",
+                   deviceName.UTF8String, self.cars.apSSID.UTF8String);
+    }
+    __atomic_add_fetch(&g_flow_epoch, 1, __ATOMIC_ACQ_REL);
+    __atomic_store_n(&g_flow_cancelled, false, __ATOMIC_RELEASE);
     self.bluetoothHandedOff = NO;
     [self resetConnectProgress];
-    if ([[NSUserDefaults standardUserDefaults] boolForKey:DEDICATED_RADIO_KEY]) {
-        dispatch_async(self.bgQueue, ^{ showcase_hold_other_wifi(); });
+    if (self.sharedWifiSession) {
+        ip_log("[WIFI] using existing shared Wi-Fi network; Personal Hotspot is not required");
+        /* A previous interrupted hotspot-mode session may have left a stale
+         * held-network marker.  The user is intentionally using that network
+         * now, so never restore/disable it as part of this session. */
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:HELD_WIFI_NETWORK_KEY];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+    } else if ([[NSUserDefaults standardUserDefaults] boolForKey:DEDICATED_RADIO_KEY]) {
+        dispatch_async(self.bgQueue, ^{ if (!flow_cancelled()) showcase_hold_other_wifi(); });
     }
     [[NSUserDefaults standardUserDefaults] setBool:NO forKey:HOTSPOT_OWNED_KEY];
     self.hotspotManual = NO;
@@ -4169,7 +4342,14 @@ static pid_t reusable_baa_broker(void) {
     [self.apPollTimer invalidate];
     self.apPollTimer = nil;
     [self transitionTo:StateAwaitingAP];
-    [self startHotspotAttempt];
+    if (self.sharedWifiSession) {
+        /* The iPad is already associated with the portable router.  Do not
+         * touch Mobile Internet Sharing or disconnect that association. */
+        [self transitionTo:StatePreparingBT];
+        dispatch_async(self.bgQueue, ^{ [self bgPrepareBT]; });
+    } else {
+        [self startHotspotAttempt];
+    }
 }
 
 /* ─── Hotspot automation ───────────────────────────────────── */
@@ -4178,6 +4358,7 @@ static pid_t reusable_baa_broker(void) {
  * Wi-Fi power cycle, which clears an access point wifid could not start.
  * After that the user turns the hotspot on in Settings. */
 - (void)startHotspotAttempt {
+    if (self.sharedWifiSession) return;
     NSInteger attempt = self.hotspotAttempt;
     dispatch_async(self.bgQueue, ^{
         if (self.state != StateAwaitingAP) return;
@@ -4206,6 +4387,7 @@ static pid_t reusable_baa_broker(void) {
         if (self.state != StateAwaitingAP) return;
         showcase_set_hotspot(YES);
         usleep(800000);
+        if (flow_cancelled()) return;
         showcase_set_hotspot_discovery(YES);
         ip_log("[HOTSPOT] attempt %ld: hotspot requested", (long)attempt);
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -4255,6 +4437,7 @@ static pid_t reusable_baa_broker(void) {
 }
 
 - (void)refreshDiscovery {
+    if (self.sharedWifiSession) return;
     BOOL connecting = self.state == StateAwaitingAP || [self isConnectingState];
     if (!connecting) {
         [self.discoveryTimer invalidate];
@@ -4303,7 +4486,7 @@ static pid_t reusable_baa_broker(void) {
         [self.apPollTimer invalidate]; self.apPollTimer = nil;
         return;
     }
-    if (is_ap_up()) {
+    if (!self.sharedWifiSession && is_ap_up()) {
         NSString *conf = [NSString stringWithContentsOfFile:@"/var/run/hostapd.conf"
                                                    encoding:NSUTF8StringEncoding
                                                       error:NULL];
@@ -4311,7 +4494,8 @@ static pid_t reusable_baa_broker(void) {
         for (NSString *line in [conf componentsSeparatedByString:@"\n"]) {
             if ([line hasPrefix:@"channel="]) channel = [line substringFromIndex:8];
         }
-        ip_log("AP detected on channel %s; advancing", channel.UTF8String);
+        ip_log("Wi-Fi network detected (%s); advancing", self.sharedWifiSession
+               ? "shared router" : channel.UTF8String);
         [self.apPollTimer invalidate]; self.apPollTimer = nil;
         [self.hotspotWatchdog invalidate]; self.hotspotWatchdog = nil;
         [self transitionTo:StatePreparingBT];
@@ -4320,6 +4504,7 @@ static pid_t reusable_baa_broker(void) {
 }
 
 - (void)bgPrepareBT {
+    if (flow_cancelled()) return;
     NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
     NSString *btPath = [bundlePath stringByAppendingPathComponent:@BT_HELPER_NAME];
     Car *sel = self.cars.selected;
@@ -4400,6 +4585,7 @@ static pid_t reusable_baa_broker(void) {
                              unsupported:NO];
         return;
     }
+    if (flow_cancelled()) return;
 #ifdef SHOWCASE_TAURINE
     /* 1. Start the bundled BTstack daemon while launchd still spawns jobs.
      * On iOS 14 (Taurine) unloading bluetoothd leaves the unload "in
@@ -4408,6 +4594,7 @@ static pid_t reusable_baa_broker(void) {
      * BTdaemon would hang in xpcproxy and never answer. The daemon only
      * touches the UART when a client powers it on. */
     if (![self startBTstackDaemon:launchctl]) return;
+    if (flow_cancelled()) return;
 
     /* 2. Release the UART: bluetoothd holds it (EBUSY) even with Bluetooth
      * off, and BlueTool owns it on iOS 14 and newer. */
@@ -4425,6 +4612,8 @@ static pid_t reusable_baa_broker(void) {
     if (rc != 0) ip_log("  WARNING: BlueTool unload returned %d", rc);
 #endif
     sleep(2);
+
+    if (flow_cancelled()) return;
 
     /* 2. Start bundled BTstack through launchd so the advertised socket exists. */
     char *unloadBTstackArgv[] = { (char*)"launchctl", (char*)"unload",
@@ -4449,6 +4638,8 @@ static pid_t reusable_baa_broker(void) {
     }
     self.btdaemonPid = 0;
 #endif
+
+    if (flow_cancelled()) return;
 
     /* 3. Spawn carplay_bt with car name + global AP creds */
     char nameBuf[64], ssidBuf[128], passBuf[128];
@@ -4477,6 +4668,7 @@ static pid_t reusable_baa_broker(void) {
         return;
     }
     if (!wait_for_bt_ready_or_exit(self.carplayBtPid, BT_READY_SECONDS)) {
+        if (flow_cancelled()) return;
         /* On some rootless boots BlueTool releases the controller after its
          * launchd job has already exited. BTstack then accepts a client and
          * its power command, but emits no HCI events. A complete daemon/client
@@ -4498,6 +4690,7 @@ static pid_t reusable_baa_broker(void) {
         unlink(BT_OWNED_FLAG);
         sleep(2);
         if ([self startBTstackDaemon:launchctl]) {
+            if (flow_cancelled()) return;
             [self stopSystemBluetooth:launchctl];
             unlink(BT_READY_PATH);
             self.carplayBtPid =
@@ -4508,6 +4701,7 @@ static pid_t reusable_baa_broker(void) {
         run_blocking(launchctl, unloadBTstackArgv);
         unlink(BTSTACK_SOCKET);
         sleep(2);
+        if (flow_cancelled()) return;
         rc = run_blocking(launchctl, loadBTstackArgv);
         if (rc == 0 &&
             wait_for_path(BTSTACK_SOCKET, 8, "BTstack retry socket")) {
@@ -4527,6 +4721,7 @@ static pid_t reusable_baa_broker(void) {
         }
     }
 
+    if (flow_cancelled()) return;
     [self transitionTo:StatePreparingNet];
     [self bgPrepareNet];
 }
@@ -4587,12 +4782,15 @@ static pid_t reusable_baa_broker(void) {
 #endif
 
 - (void)bgPrepareNet {
+    if (flow_cancelled()) return;
     NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
     NSString *svcPath = [bundlePath stringByAppendingPathComponent:@SVC_HELPER_NAME];
     Car *sel = self.cars.selected;
     ip_log("bgPrepareNet");
 
-    if (![self startIPCListener]) { [self failWith:@"IPC listener failed"]; return; }
+    self.ipcDone = dispatch_semaphore_create(0);
+    if (![self startIPCListener]) { self.ipcDone = nil; [self failWith:@"IPC listener failed"]; return; }
+    if (flow_cancelled()) return;
 
     char nameBuf[64];
     char widthBuf[16], heightBuf[16], fpsBuf[16], receiveBufferBuf[16];
@@ -4656,6 +4854,8 @@ static pid_t reusable_baa_broker(void) {
         (char*)"--fps", fpsBuf,
         (char*)"--screen-rcvbuf", receiveBufferBuf,
         (char*)"--audio", (char*)(receiverAudio ? "receiver" : "sender"),
+        self.sharedWifiSession ? (char*)"--wifi-interface" : (char*)"--hotspot-wifi",
+        self.sharedWifiSession ? (char*)[self.sharedWifiInterface UTF8String] : (char*)"bridge100",
         rightHandDrive ? (char*)"--right-hand-drive" : NULL,
         NULL
     };
@@ -4676,7 +4876,7 @@ static pid_t reusable_baa_broker(void) {
     /* A paired phone can resume quickly enough to deliver video while the
      * helper-alive check above is still running. Do not overwrite Active
      * with the older setup state when that happens. */
-    if (self.state != StateActive) {
+    if (!flow_cancelled() && self.state != StateActive) {
         [self transitionTo:StateAwaitingPhone];
     } else {
         ip_log("[HANDOFF] Existing paired session resumed during startup");
@@ -4722,7 +4922,33 @@ static pid_t reusable_baa_broker(void) {
     });
 }
 
+/* shutdown() on a listening AF_UNIX socket is not portable to Darwin.
+ * A local connection wakes accept; cancellation makes the loop discard it. */
+static void wake_ipc_listener(void) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return;
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
+    (void)connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    close(fd);
+}
+
 - (void)stopFlow {
+    if (![NSThread isMainThread]) {
+        uint32_t epoch = flow_epoch();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (epoch == flow_epoch()) [self stopFlow];
+        });
+        return;
+    }
+    if (self.state == StateStopping || self.state == StateIdle) return;
+    @synchronized (self) {
+        __atomic_store_n(&g_flow_cancelled, true, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&g_flow_epoch, 1, __ATOMIC_ACQ_REL);
+    }
     BOOL restart = self.restartAfterStop;
     self.restartAfterStop = NO;
     [self endAWDLSuppression];
@@ -4733,17 +4959,24 @@ static pid_t reusable_baa_broker(void) {
     [self.discoveryTimer invalidate]; self.discoveryTimer = nil;
     [self transitionTo:StateStopping];
     dispatch_async(self.bgQueue, ^{
-        if (self.clientFd >= 0) { close(self.clientFd); self.clientFd = -1; }
-        if (self.listenFd >= 0) { close(self.listenFd); self.listenFd = -1; }
-        unlink(SOCK_PATH);
+        pthread_mutex_lock(&g_ipc_lock);
+        if (self.clientFd >= 0) shutdown(self.clientFd, SHUT_RDWR);
+        BOOL wakeListener = self.listenFd >= 0;
         g_touch_fd = -1;
-        __sync_add_and_fetch(&g_touch_epoch, 1);
+        ++g_touch_epoch;
+        pthread_mutex_unlock(&g_ipc_lock);
+        if (wakeListener) wake_ipc_listener();
         g_carplay_w = 0; g_carplay_h = 0;
         g_video_suspended = 0;
         g_video_needs_resync = 0;
 
         kill_pid(self.carplayServicesPid); self.carplayServicesPid = 0;
         kill_pid(self.carplayBtPid);       self.carplayBtPid = 0;
+        if (self.ipcDone) {
+            dispatch_semaphore_wait(self.ipcDone, DISPATCH_TIME_FOREVER);
+            self.ipcDone = nil;
+        }
+        unlink(SOCK_PATH);
         self.btdaemonPid = 0;
         self.bluetoothHandedOff = NO;
 
@@ -4763,15 +4996,16 @@ static pid_t reusable_baa_broker(void) {
             [[NSUserDefaults standardUserDefaults] removeObjectForKey:HOTSPOT_OWNED_KEY];
             ip_log("[HOTSPOT] turned off the hotspot Showcase started");
         }
-        showcase_release_other_wifi("CarPlay stopped");
+        if (!self.sharedWifiSession)
+            showcase_release_other_wifi("CarPlay stopped");
 
         dispatch_async(dispatch_get_main_queue(), ^{
             AVSampleBufferDisplayLayer *layer = (AVSampleBufferDisplayLayer *)self.videoView.layer;
             [layer flushAndRemoveImage];
         });
 
-        [self transitionTo:StateIdle];
         dispatch_async(dispatch_get_main_queue(), ^{
+            [self transitionTo:StateIdle];
             [self presentPendingBluetoothCompatibilityError];
             if (restart && self.state == StateIdle && self.baaReady &&
                 !self.vc.presentedViewController) [self startFlow];
@@ -4781,6 +5015,7 @@ static pid_t reusable_baa_broker(void) {
 
 - (void)failBluetoothWithReason:(NSString *)reason
                     unsupported:(BOOL)unsupported {
+    if (flow_cancelled()) return;
     BluetoothRegistryProbeState registry = bluetooth_registry_probe();
     NSString *report = bluetooth_diagnostic_report(
         reason, self.bluetoothRetryAttempted, registry);
@@ -4841,6 +5076,7 @@ static pid_t reusable_baa_broker(void) {
 }
 
 - (void)failWith:(NSString *)reason {
+    if (flow_cancelled()) return;
     ip_log("FAIL: %s", [reason UTF8String]);
     [self stopFlow];
 }
@@ -4864,6 +5100,10 @@ static pid_t reusable_baa_broker(void) {
  * ─────────────────────────────────────────────────────────────── */
 
 - (void)showWifiSetup {
+    if (showcase_use_existing_wifi()) {
+        [self promptForCredentialsFromController:self.vc];
+        return;
+    }
     WifiSetupViewController *vc = [[WifiSetupViewController alloc] init];
     vc.appDelegate = self;
     vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
@@ -4891,19 +5131,23 @@ static NSString *hotspot_name(void) {
 
 - (void)saveSSID:(NSString *)ssid password:(NSString *)pass host:(UIViewController *)host {
     [self.cars setAPSSID:ssid password:pass];
-    [host dismissViewControllerAnimated:YES completion:^{ [self renderState]; }];
+    if ([host isKindOfClass:[WifiSetupViewController class]])
+        [host dismissViewControllerAnimated:YES completion:^{ [self renderState]; }];
+    else [self renderState];
 }
 
 /* Called by WifiSetupViewController when the user taps "Set credentials".
  * This is a focused alert prompt for SSID + password. */
 - (void)promptForCredentialsFromController:(UIViewController *)host {
-    NSString *deviceName = hotspot_name();
-    NSString *currentSSID = self.cars.apSSID.length ? self.cars.apSSID : (deviceName ?: @"");
+    BOOL shared = showcase_use_existing_wifi();
+    NSString *deviceName = shared ? nil : hotspot_name();
+    NSString *currentSSID = self.cars.apSSID.length ? self.cars.apSSID :
+        ((shared ? showcase_current_wifi_ssid() : deviceName) ?: @"");
     NSString *currentPass = self.cars.apPassword ?: @"";
 
     UIAlertController *ac = [UIAlertController
-        alertControllerWithTitle:L(@"Hotspot Details")
-                         message:nil
+        alertControllerWithTitle:shared ? L(@"Wi-Fi details") : L(@"Hotspot Details")
+                         message:shared ? L(@"Enter the portable router's Wi-Fi name and password. Connect both devices to that network.") : nil
                   preferredStyle:UIAlertControllerStyleAlert];
 
     [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
@@ -4923,10 +5167,8 @@ static NSString *hotspot_name(void) {
         handler:^(UIAlertAction *_a) {
             NSString *ssid = ac.textFields[0].text ?: @"";
             NSString *pass = ac.textFields[1].text ?: @"";
-            NSString *err = validateSSID(ssid);
-            if (!err && pass.length < 8) {
-                err = L(@"Hotspot passwords must be at least 8 characters.");
-            }
+            NSString *err = validateNetworkSSID(ssid);
+            if (!err) err = validateNetworkPassword(pass);
             if (err) {
                 UIAlertController *e = [UIAlertController
                     alertControllerWithTitle:L(@"Try Again")
@@ -5127,6 +5369,13 @@ static NSString *hotspot_name(void) {
 - (BOOL)spawnTcpdumpAtPath:(NSString *)pcapPath useSelfTimeout:(BOOL)useSelfTimeout {
     const char *tcpdump = tcpdump_tool_path();
     if (!tcpdump) return NO;
+    NSString *captureName = (self.sharedWifiSession || (self.state == StateIdle && showcase_use_existing_wifi()))
+        ? (self.sharedWifiInterface ?: shared_wifi_interface()) : @AP_INTERFACE;
+    if (!captureName.length) {
+        ip_log("tcpdump: no active shared Wi-Fi interface");
+        return NO;
+    }
+    const char *captureInterface = captureName.UTF8String;
 
     mkdir("/var/mobile/Library/Showcase", 0755);
     mkdir(TCPDUMP_DIR, 0755);
@@ -5145,20 +5394,20 @@ static NSString *hotspot_name(void) {
      * RTP timing analysis. The larger capture buffer is flushed normally
      * when SIGINT stops tcpdump. */
     char *argvTimed[] = {
-        (char*)"tcpdump", (char*)"-i", (char*)AP_INTERFACE,
+        (char*)"tcpdump", (char*)"-i", (char*)captureInterface,
         (char*)"-B", (char*)"4096", (char*)"-s", (char*)"256",
         (char*)"-G", (char*)"300", (char*)"-W", (char*)"1",
         (char*)"-w", (char*)[pcapPath UTF8String], NULL
     };
     char *argvPlain[] = {
-        (char*)"tcpdump", (char*)"-i", (char*)AP_INTERFACE,
+        (char*)"tcpdump", (char*)"-i", (char*)captureInterface,
         (char*)"-B", (char*)"4096", (char*)"-s", (char*)"256",
         (char*)"-w", (char*)[pcapPath UTF8String], NULL
     };
 
     char **argv = useSelfTimeout ? argvPlain : argvTimed;
     ip_log("tcpdump spawn: %s -i %s -B 4096 -s 256 %s-w %s",
-           tcpdump, AP_INTERFACE, useSelfTimeout ? "" : "-G 300 -W 1 ",
+           tcpdump, captureInterface, useSelfTimeout ? "" : "-G 300 -W 1 ",
            [pcapPath UTF8String]);
 
     int err = posix_spawn(&pid, tcpdump, &actions, NULL, argv, environ);
@@ -5214,17 +5463,17 @@ static NSString *hotspot_name(void) {
 
     const char *tcpdump = tcpdump_tool_path();
     if (!tcpdump) {
-        ip_log("tcpdump missing; cannot capture bridge100");
+        ip_log("tcpdump missing; cannot capture Wi-Fi");
         [self promptInstallTcpdumpIfNeeded];
         return;
     }
 
-    if (!is_ap_up()) {
+    if (!self.sharedWifiSession && !showcase_use_existing_wifi() && !is_ap_up()) {
         ip_log("tcpdump warning: %s is not up yet; capture may exit", AP_INTERFACE);
     }
 
     NSString *stamp = [self timestampStringForFilename];
-    NSString *path = [NSString stringWithFormat:@"%s/showcase_bridge100_%@.pcap", TCPDUMP_DIR, stamp];
+    NSString *path = [NSString stringWithFormat:@"%s/showcase_wifi_%@.pcap", TCPDUMP_DIR, stamp];
 
     /* First try tcpdump's own 5-minute rotation stop, so the child exits even
      * if the app crashes. Older builds that dislike -G/-W fall back to an app
@@ -5463,8 +5712,15 @@ static NSString *hotspot_name(void) {
         ip_log("bind: %s", strerror(errno));
         close(fd); return NO;
     }
-    chmod(SOCK_PATH, 0777);
-    listen(fd, 1);
+    /* Both the app and its service helper run as root. Do not expose video,
+     * audio, or touch IPC to unrelated local processes. Apply permissions
+     * before listening, and fail closed if either operation fails. */
+    if (chmod(SOCK_PATH, 0600) != 0 || listen(fd, 1) != 0) {
+        ip_log("IPC socket setup: %s", strerror(errno));
+        close(fd);
+        unlink(SOCK_PATH);
+        return NO;
+    }
     self.listenFd = fd;
     ip_log("IPC listening on %s", SOCK_PATH);
     dispatch_async(dispatch_get_global_queue(0, 0), ^{ [self ipcAcceptLoop]; });
@@ -5472,30 +5728,46 @@ static NSString *hotspot_name(void) {
 }
 
 - (void)ipcAcceptLoop {
-    while (self.listenFd >= 0) {
-        int c = accept(self.listenFd, NULL, NULL);
+    uint32_t epoch = flow_epoch();
+    int listener = self.listenFd;
+    while (!flow_cancelled() && epoch == flow_epoch()) {
+        int c = accept(listener, NULL, NULL);
         if (c < 0) { if (errno == EINTR) continue; break; }
+        pthread_mutex_lock(&g_ipc_lock);
+        if (flow_cancelled() || epoch != flow_epoch()) {
+            pthread_mutex_unlock(&g_ipc_lock);
+            close(c);
+            break;
+        }
         int noSigPipe = 1;
         setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE,
                    &noSigPipe, sizeof(noSigPipe));
         ip_log("services connected");
         self.clientFd = c;
-        __sync_add_and_fetch(&g_touch_epoch, 1);
+        ++g_touch_epoch;
         g_touch_fd = c;
+        pthread_mutex_unlock(&g_ipc_lock);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!flow_cancelled() && epoch == flow_epoch())
+                send_app_visibility([UIApplication sharedApplication].applicationState == UIApplicationStateActive);
+        });
         [self ipcHandleConnection:c];
+        pthread_mutex_lock(&g_ipc_lock);
         g_touch_fd = -1;
-        __sync_add_and_fetch(&g_touch_epoch, 1);
+        ++g_touch_epoch;
         close(c);
         self.clientFd = -1;
+        pthread_mutex_unlock(&g_ipc_lock);
         ip_log("services disconnected");
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self endAWDLSuppression];
+            if (epoch == flow_epoch()) [self endAWDLSuppression];
         });
         /* CarPlay services exits when the iPhone ends the session or leaves
          * Wi-Fi, and when it fails while connecting. */
         if (self.state != StateIdle && self.state != StateStopping) {
             BOOL wasActive = self.state == StateActive;
             dispatch_async(dispatch_get_main_queue(), ^{
+                if (flow_cancelled() || epoch != flow_epoch()) return;
                 if (wasActive) {
                     ip_log("[SESSION] iPhone ended the session; waiting for it again");
                     self.restartAfterStop = YES;
@@ -5505,15 +5777,38 @@ static NSString *hotspot_name(void) {
             break;
         }
     }
+    pthread_mutex_lock(&g_ipc_lock);
+    if (self.listenFd == listener) self.listenFd = -1;
+    close(listener);
+    pthread_mutex_unlock(&g_ipc_lock);
+    dispatch_semaphore_signal(self.ipcDone);
 }
 
 static bool read_exact(int fd, uint8_t *buf, size_t len) {
     size_t got = 0;
     while (got < len) {
         ssize_t n = read(fd, buf + got, len - got);
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return false;
         got += n;
     }
+    return true;
+}
+
+/* A bounded, little-endian IPC frame. The caller owns the returned payload. */
+static bool read_ipc_frame(int fd, uint8_t *type, uint32_t *length, uint8_t **body) {
+    uint8_t hdr[5];
+    *body = NULL;
+    if (!read_exact(fd, hdr, sizeof(hdr))) return false;
+    uint32_t len = (uint32_t)hdr[0] | ((uint32_t)hdr[1] << 8) |
+                   ((uint32_t)hdr[2] << 16) | ((uint32_t)hdr[3] << 24);
+    if (len == 0 || len > 4 * 1024 * 1024) return false;
+    uint8_t *payload = malloc(len);
+    if (!payload) { ip_log("IPC payload allocation failed (%u bytes)", len); return false; }
+    if (!read_exact(fd, payload, len)) { free(payload); return false; }
+    *type = hdr[4];
+    *length = len;
+    *body = payload;
     return true;
 }
 
@@ -5529,14 +5824,9 @@ static bool read_exact(int fd, uint8_t *buf, size_t len) {
     bool decodeOnlyCatchupActive = false;
 
     while (1) {
-        uint8_t hdr[5];
-        if (!read_exact(fd, hdr, 5)) break;
-        uint32_t len = hdr[0] | (hdr[1]<<8) | (hdr[2]<<16) | (hdr[3]<<24);
-        uint8_t type = hdr[4];
-        if (len == 0 || len > 4*1024*1024) break;
-
-        uint8_t *payload = malloc(len);
-        if (!read_exact(fd, payload, len)) { free(payload); break; }
+        uint8_t type, *payload;
+        uint32_t len;
+        if (!read_ipc_frame(fd, &type, &len, &payload)) break;
 
         if (type == MSG_VIDEO_CONFIG) {
             if (len < 9) { free(payload); continue; }
@@ -5711,8 +6001,9 @@ static bool read_exact(int fd, uint8_t *buf, size_t len) {
                 /* Deferred to here on purpose: pairing, iAP2 handoff and the
                  * whole RTSP negotiation have already completed, so radio
                  * suppression cannot influence them. */
+                uint32_t epoch = flow_epoch();
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    [self beginAWDLSuppression];
+                    if (!flow_cancelled() && epoch == flow_epoch()) [self beginAWDLSuppression];
                 });
             }
 
@@ -6305,7 +6596,9 @@ static UIEdgeInsets showcase_safe_insets(UIView *view) {
 @property (nonatomic, weak) SoundRouteView *soundRoute;
 @property (nonatomic, copy) NSString *draftCarName;
 @property (nonatomic, copy) NSString *draftSSID;
+@property (nonatomic, assign) BOOL sharedSSIDEdited;
 @property (nonatomic, copy) NSString *draftPassword;
+@property (nonatomic, strong) NSMutableDictionary *wifiDrafts;
 @property (nonatomic, assign) CGFloat fieldTitleWidth;
 @end
 
@@ -6366,14 +6659,14 @@ static BOOL g_settings_hardware_loading = NO;
 
 - (BOOL)sessionRunning {
     ShowcaseState s = self.appDelegate.state;
-    return s != StateIdle && s != StateStopping;
+    return s != StateIdle;
 }
 
 - (NSString *)titleForPage:(NSString *)page {
     if ([page isEqualToString:@"root"]) return L(@"Settings");
     if ([page isEqualToString:@"cars"]) return L(@"Cars");
     if ([page isEqualToString:@"car"]) return self.editingCar ? L(@"Edit Car") : L(@"New Car");
-    if ([page isEqualToString:@"hotspot"]) return L(@"Hotspot");
+    if ([page isEqualToString:@"hotspot"]) return showcase_use_existing_wifi() ? L(@"Wi-Fi Setup") : L(@"Hotspot");
     if ([page isEqualToString:@"sound"]) return L(@"Sound");
     if ([page isEqualToString:@"display"]) return L(@"Display");
     if ([page isEqualToString:@"resolution"]) return L(@"Resolution");
@@ -6389,7 +6682,9 @@ static BOOL g_settings_hardware_loading = NO;
 - (void)clearDrafts {
     self.draftCarName = nil;
     self.draftSSID = nil;
+    self.sharedSSIDEdited = NO;
     self.draftPassword = nil;
+    self.wifiDrafts = nil;
     self.carNameField = nil;
     self.ssidField = nil;
     self.passwordField = nil;
@@ -6438,7 +6733,10 @@ static BOOL g_settings_hardware_loading = NO;
 
 - (void)refresh {
     if (!self.isViewLoaded || self.stack.count == 0) return;
-    if (self.activeField.isFirstResponder) return;
+    if (self.activeField.isFirstResponder) {
+        if (!(self.sessionRunning && [self.stack.lastObject isEqualToString:@"hotspot"])) return;
+        [self.view endEditing:YES];
+    }
     [self render];
 }
 
@@ -6482,7 +6780,7 @@ static BOOL g_settings_hardware_loading = NO;
     self.header = [[UIView alloc] initWithFrame:CGRectMake(0, safe.top, W, headerH)];
     [self.view addSubview:self.header];
 
-    CGFloat closeSz = phone ? 34 : 40;
+    CGFloat closeSz = 44;
     UIButton *close = [UIButton buttonWithType:UIButtonTypeCustom];
     close.frame = CGRectMake(W - right - closeSz, (headerH - closeSz) / 2.0, closeSz, closeSz);
     close.backgroundColor = [UIColor colorWithWhite:1 alpha:0.1];
@@ -6497,12 +6795,15 @@ static BOOL g_settings_hardware_loading = NO;
 
     CGFloat detailX = self.wide ? left + sidebarW : 0;
     CGFloat detailW = W - detailX;
+    CGFloat headerInset = self.wide ? 90 : MAX(left, right) + 52;
     UILabel *title = [[UILabel alloc] initWithFrame:
-        CGRectMake(detailX + 90, 0, detailW - 180, headerH)];
+        CGRectMake(detailX + headerInset, 0, MAX(0, detailW - 2 * headerInset), headerH)];
     title.text = [self titleForPage:page];
     title.textAlignment = NSTextAlignmentCenter;
     title.textColor = [UIColor whiteColor];
     title.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+    title.adjustsFontSizeToFitWidth = YES;
+    title.minimumScaleFactor = 0.75;
     [self.header addSubview:title];
 
     if (self.wide) {
@@ -6517,7 +6818,11 @@ static BOOL g_settings_hardware_loading = NO;
         NSString *previous = [self titleForPage:self.stack[self.stack.count - 2]];
         UIButton *back = [self headerButtonWithTitle:
             [NSString stringWithFormat:@"‹  %@", previous] action:@selector(pop)];
-        back.frame = CGRectMake((self.wide ? detailX + 8 : left), 0, 150, headerH);
+        if (!self.wide) {
+            [back setTitle:@"‹" forState:UIControlStateNormal];
+            back.accessibilityLabel = previous;
+        }
+        back.frame = CGRectMake((self.wide ? detailX + 8 : left), 0, self.wide ? 80 : 44, headerH);
         back.titleLabel.adjustsFontSizeToFitWidth = YES;
         back.titleLabel.minimumScaleFactor = 0.7;
         [self.header addSubview:back];
@@ -6600,6 +6905,9 @@ static BOOL g_settings_hardware_loading = NO;
                  action:(ShowcaseAction)action {
     SettingsRow *row = [[SettingsRow alloc] initWithFrame:CGRectMake(0, 0, w, 52)];
     row.action = action;
+    row.accessibilityLabel = title;
+    row.accessibilityValue = value;
+    row.accessibilityTraits |= UIAccessibilityTraitButton;
     if (selected) {
         UIView *bg = [[UIView alloc] initWithFrame:row.bounds];
         bg.backgroundColor = [UIColor colorWithWhite:1 alpha:0.12];
@@ -6635,6 +6943,8 @@ static BOOL g_settings_hardware_loading = NO;
                     action:(ShowcaseAction)action {
     SettingsRow *row = [[SettingsRow alloc] initWithFrame:CGRectMake(0, 0, w, 52)];
     row.action = action;
+    row.accessibilityLabel = title;
+    row.accessibilityTraits |= UIAccessibilityTraitButton;
     row.enabled = enabled;
     UILabel *l = [self rowTitle:title frame:CGRectMake(16, 0, w - 32, 52)];
     l.textColor = enabled ? (color ?: [UIColor whiteColor])
@@ -6684,6 +6994,8 @@ static BOOL g_settings_hardware_loading = NO;
         [row addSubview:s];
     }
     SettingsSwitch *sw = [[SettingsSwitch alloc] init];
+    sw.accessibilityLabel = title;
+    sw.accessibilityHint = subtitle;
     sw.on = on;
     sw.changed = changed;
     CGSize ss = sw.intrinsicContentSize;
@@ -6698,7 +7010,13 @@ static BOOL g_settings_hardware_loading = NO;
                      width:(CGFloat)w action:(ShowcaseAction)action {
     SettingsRow *row = [[SettingsRow alloc] initWithFrame:CGRectMake(0, 0, w, 52)];
     row.action = action;
-    [row addSubview:[self rowTitle:title frame:CGRectMake(16, 0, w * 0.5, 52)]];
+    row.accessibilityLabel = title;
+    row.accessibilityValue = value;
+    row.accessibilityTraits |= UIAccessibilityTraitButton;
+    UILabel *choiceTitle = [self rowTitle:title frame:CGRectMake(16, 0, value.length ? w * 0.5 : w - 64, 52)];
+    choiceTitle.adjustsFontSizeToFitWidth = YES;
+    choiceTitle.minimumScaleFactor = 0.75;
+    [row addSubview:choiceTitle];
     UILabel *v = [[UILabel alloc] initWithFrame:CGRectMake(w * 0.5, 0, w * 0.5 - 52, 52)];
     v.text = value;
     v.textAlignment = NSTextAlignmentRight;
@@ -6754,6 +7072,7 @@ static BOOL g_settings_hardware_loading = NO;
     UITextField *field = [[UITextField alloc] initWithFrame:
         CGRectMake(fieldX, 0, w - fieldX - 16 - trailingW, 52)];
     field.text = text;
+    field.accessibilityLabel = title.length ? title : placeholder;
     field.textColor = [UIColor whiteColor];
     field.tintColor = [UIColor whiteColor];
     field.font = [UIFont systemFontOfSize:17 weight:UIFontWeightRegular];
@@ -6780,11 +7099,11 @@ static BOOL g_settings_hardware_loading = NO;
 - (UIButton *)pillButton:(NSString *)title action:(SEL)action width:(CGFloat)w {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
     b.frame = CGRectMake(0, 0, w, 50);
-    b.backgroundColor = [UIColor whiteColor];
+    b.backgroundColor = [UIColor colorWithRed:0.23 green:0.51 blue:0.96 alpha:1];
     b.layer.cornerRadius = 25;
     [b setTitle:title forState:UIControlStateNormal];
-    [b setTitleColor:[UIColor blackColor] forState:UIControlStateNormal];
-    [b setTitleColor:[UIColor colorWithWhite:0 alpha:0.4] forState:UIControlStateHighlighted];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor colorWithWhite:1 alpha:0.55] forState:UIControlStateHighlighted];
     b.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
     [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     return b;
@@ -6840,7 +7159,7 @@ static BOOL g_settings_hardware_loading = NO;
         [card addRow:[self navRow:L(@"Cars") value:app.cars.selected.name ?: @""
             width:w selected:[selected isEqualToString:@"cars"]
             action:^{ [weakSelf selectSection:@"cars"]; }] height:52];
-        [card addRow:[self navRow:L(@"Hotspot")
+        [card addRow:[self navRow:L(@"Wi-Fi Setup")
             value:app.cars.apSSID.length ? app.cars.apSSID : L(@"Not set")
             width:w selected:[selected isEqualToString:@"hotspot"]
             action:^{ [weakSelf selectSection:@"hotspot"]; }] height:52];
@@ -7006,9 +7325,46 @@ static BOOL g_settings_hardware_loading = NO;
     [self pop];
 }
 
+- (void)selectWiFiMode:(BOOL)shared {
+    if (self.sessionRunning || shared == showcase_use_existing_wifi()) return;
+    if (!self.wifiDrafts) self.wifiDrafts = [NSMutableDictionary dictionary];
+    NSString *oldKey = showcase_use_existing_wifi() ? @"shared" : @"hotspot";
+    self.wifiDrafts[oldKey] = @[(self.ssidField.text ?: @""), (self.passwordField.text ?: @"")];
+    [self.view endEditing:YES];
+    [self.appDelegate.cars selectExistingWiFi:shared];
+    NSArray *draft = self.wifiDrafts[shared ? @"shared" : @"hotspot"];
+    self.draftSSID = draft.count ? draft[0] : nil;
+    self.draftPassword = draft.count > 1 ? draft[1] : nil;
+    self.ssidField = nil;
+    self.passwordField = nil;
+    self.pageMessage = nil;
+    [self.appDelegate renderState];
+    [self render];
+}
+
 - (void)buildHotspot:(SettingsPageBuilder *)b {
     AppDelegate *app = self.appDelegate;
     CGFloat w = b.width;
+    BOOL shared = showcase_use_existing_wifi();
+    __weak SettingsViewController *weakSelf = self;
+    [b card:^(SettingsCard *card) {
+        SettingsRow *existing = [self choiceRow:L(@"Existing Wi-Fi network") value:@""
+            checked:shared width:w action:^{
+                [weakSelf selectWiFiMode:YES];
+            }];
+        SettingsRow *hotspot = [self choiceRow:L(@"Personal Hotspot") value:@""
+            checked:!shared width:w action:^{
+                [weakSelf selectWiFiMode:NO];
+            }];
+        existing.enabled = !self.sessionRunning;
+        hotspot.enabled = !self.sessionRunning;
+        existing.alpha = self.sessionRunning ? 0.5 : 1.0;
+        hotspot.alpha = self.sessionRunning ? 0.5 : 1.0;
+        [card addRow:existing height:52];
+        [card addRow:hotspot height:52];
+    }];
+    if (shared) [b message:L(@"Enter the portable router's Wi-Fi name and password. Connect both devices to that network.") color:nil];
+    if (self.sessionRunning) [b message:L(@"Stop CarPlay to change Wi-Fi settings.") color:nil];
     UIButton *show = [UIButton buttonWithType:UIButtonTypeSystem];
     [show setTitle:self.passwordVisible ? L(@"Hide") : L(@"Show") forState:UIControlStateNormal];
     show.tintColor = [UIColor colorWithWhite:1 alpha:0.6];
@@ -7016,27 +7372,39 @@ static BOOL g_settings_hardware_loading = NO;
     /* Wide enough for either word, so the field does not move on toggle. */
     NSDictionary *font = @{NSFontAttributeName: show.titleLabel.font};
     CGFloat showW = MAX([L(@"Hide") sizeWithAttributes:font].width, [L(@"Show") sizeWithAttributes:font].width);
-    show.frame = CGRectMake(0, 0, MAX(52, ceil(showW) + 12), 32);
+    show.frame = CGRectMake(0, 0, MAX(52, ceil(showW) + 12), 44);
     self.fieldTitleWidth = [self titleWidthFor:@[L(@"Name"), L(@"Password")]];
     [show addTarget:self action:@selector(togglePasswordVisible)
    forControlEvents:UIControlEventTouchUpInside];
     NSString *ssid = self.draftSSID ?: app.cars.apSSID;
     NSString *password = self.draftPassword ?: app.cars.apPassword;
+    NSString *connectedSSID = shared ? showcase_current_wifi_ssid() : nil;
+    if (shared && !ssid.length && !app.cars.apSSID.length &&
+        !self.sharedSSIDEdited && connectedSSID.length) ssid = connectedSSID;
+    if (connectedSSID.length && ![connectedSSID isEqualToString:ssid]) {
+        [b message:[NSString stringWithFormat:L(@"Connected to “%@”. To use this network, enter its name and password below, then tap Save."), connectedSSID] color:nil];
+    }
     [b card:^(SettingsCard *card) {
         self.ssidField = [self fieldRowInCard:card title:L(@"Name") text:ssid
-            placeholder:@"Carplay-Receiver" secure:NO trailing:nil];
+            placeholder:(connectedSSID.length ? connectedSSID : @"Carplay-Receiver") secure:NO trailing:nil];
+        [self.ssidField addTarget:self action:@selector(wifiNameEdited:) forControlEvents:UIControlEventEditingChanged];
         self.ssidField.autocapitalizationType = UITextAutocapitalizationTypeNone;
         self.ssidField.returnKeyType = UIReturnKeyNext;
+        self.ssidField.enabled = !self.sessionRunning;
         self.passwordField = [self fieldRowInCard:card title:L(@"Password") text:password
             placeholder:L(@"8 characters or more") secure:!self.passwordVisible trailing:show];
         self.passwordField.autocapitalizationType = UITextAutocapitalizationTypeNone;
         self.passwordField.returnKeyType = UIReturnKeyDone;
+        self.passwordField.enabled = !self.sessionRunning;
     }];
     [b gap:8];
     [self showPageMessage:b];
-    [self placePill:[self pillButton:L(@"Save") action:@selector(saveHotspot) width:w] builder:b];
+    UIButton *save = [self pillButton:L(@"Save") action:@selector(saveHotspot) width:w];
+    save.enabled = !self.sessionRunning;
+    save.alpha = self.sessionRunning ? 0.5 : 1.0;
+    [self placePill:save builder:b];
 
-    [b card:^(SettingsCard *card) {
+    if (!shared) [b card:^(SettingsCard *card) {
         [card addRow:[self actionRow:[NSString stringWithFormat:L(@"Rename This %@"), showcase_device_noun()]
             color:nil width:w enabled:YES action:^{
             NSURL *u = [NSURL URLWithString:@"App-Prefs:root=General&path=About"];
@@ -7053,18 +7421,18 @@ static BOOL g_settings_hardware_loading = NO;
 }
 
 - (void)saveHotspot {
+    if (self.sessionRunning) return;
     AppDelegate *app = self.appDelegate;
     NSString *ssid = [self.ssidField.text stringByTrimmingCharactersInSet:
         [NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
     NSString *pass = self.passwordField.text ?: @"";
-    NSString *error = validateSSID(ssid);
-    if (!error && pass.length < 8)
-        error = L(@"Hotspot passwords must be at least 8 characters.");
+    NSString *error = validateNetworkSSID(ssid);
+    if (!error) error = validateNetworkPassword(pass);
     [self.view endEditing:YES];
     if (error) { [self setMessage:error error:YES]; return; }
     [app.cars setAPSSID:ssid password:pass];
     [app renderState];
-    NSString *deviceName = hotspot_name();
+    NSString *deviceName = showcase_use_existing_wifi() ? nil : hotspot_name();
     if (deviceName && ![deviceName isEqualToString:ssid]) {
         [self setMessage:[NSString stringWithFormat:
             L(@"Saved, but this iPad's hotspot is called \u201c%@\u201d. Your iPhone can't join until the names match."),
@@ -7165,7 +7533,7 @@ static BOOL g_settings_hardware_loading = NO;
             }];
         [card addRow:rate height:52];
     }];
-    [b card:^(SettingsCard *card) {
+    if (!showcase_use_existing_wifi()) [b card:^(SettingsCard *card) {
         UIView *radio = [self switchRow:L(@"Dedicate Wi-Fi to CarPlay") subtitle:nil
             on:[d boolForKey:DEDICATED_RADIO_KEY] width:w
             changed:^(BOOL on) { setter(DEDICATED_RADIO_KEY, on); }];
@@ -7185,6 +7553,7 @@ static BOOL g_settings_hardware_loading = NO;
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     __weak SettingsViewController *weakSelf = self;
     BOOL enabled = [d boolForKey:USAGE_KEY];
+    [b message:L(@"Usage data goes to Kerem Cloud Services only when you enable sharing. Each item can be turned off.") color:nil];
     void (^set)(NSString *, BOOL) = ^(NSString *key, BOOL on) {
         [[NSUserDefaults standardUserDefaults] setBool:on forKey:key];
         [[NSUserDefaults standardUserDefaults] synchronize];
@@ -7311,7 +7680,7 @@ static BOOL g_settings_hardware_loading = NO;
         [card addRow:row height:row.bounds.size.height];
     }];
     [b card:^(SettingsCard *card) {
-        [card addRow:[self actionRow:self.preparingLogs ? L(@"Preparing Logs…") : L(@"Send Logs")
+        [card addRow:[self actionRow:self.preparingLogs ? L(@"Preparing Logs…") : L(@"Send Logs to KCS")
             color:nil width:w enabled:!self.preparingLogs action:^{
                 [weakSelf sendLogs];
             }] height:52];
@@ -7362,6 +7731,18 @@ static BOOL g_settings_hardware_loading = NO;
 }
 
 - (void)sendLogs {
+    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:L(@"Send Logs to KCS")
+        message:L(@"The diagnostics archive may contain Wi-Fi names, device details and Bluetooth captures. Send it to Kerem Cloud Services?")
+        preferredStyle:UIAlertControllerStyleAlert];
+    [confirm addAction:[UIAlertAction actionWithTitle:L(@"Cancel") style:UIAlertActionStyleCancel handler:nil]];
+    __weak SettingsViewController *weakSelf = self;
+    [confirm addAction:[UIAlertAction actionWithTitle:L(@"Send") style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [weakSelf uploadLogs];
+    }]];
+    [self presentViewController:confirm animated:YES completion:nil];
+}
+
+- (void)uploadLogs {
     AppDelegate *app = self.appDelegate;
     self.preparingLogs = YES;
     self.pageMessage = nil;
@@ -7370,13 +7751,24 @@ static BOOL g_settings_hardware_loading = NO;
     dispatch_async(app.bgQueue, ^{
         NSString *archive = [app createDiagnosticsArchive];
         dispatch_async(dispatch_get_main_queue(), ^{
-            weakSelf.preparingLogs = NO;
             if (!archive) {
+                weakSelf.preparingLogs = NO;
                 [weakSelf setMessage:L(@"Could not create the log archive") error:YES];
                 return;
             }
-            [weakSelf render];
-            [app presentShareForURL:[NSURL fileURLWithPath:archive]];
+            NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:LOGS_URL]];
+            request.HTTPMethod = @"POST";
+            request.timeoutInterval = 45;
+            [request setValue:@"application/x-tar" forHTTPHeaderField:@"Content-Type"];
+            [[[NSURLSession sharedSession] uploadTaskWithRequest:request
+                fromFile:[NSURL fileURLWithPath:archive]
+                completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        weakSelf.preparingLogs = NO;
+                        [weakSelf setMessage:(!error && [(NSHTTPURLResponse *)response statusCode] == 201)
+                            ? L(@"Logs sent to KCS") : L(@"Could not send logs") error:!!error || [(NSHTTPURLResponse *)response statusCode] != 201];
+                    });
+                }] resume];
         });
     });
 }
@@ -7417,6 +7809,7 @@ static BOOL g_settings_hardware_loading = NO;
     by.textColor = [UIColor colorWithWhite:1 alpha:0.5];
     by.font = [UIFont systemFontOfSize:14];
     [b place:by height:20 gapAfter:24];
+    [b message:L(@"KCS edition. Original Showcase by Amine Rostane. Licensed under GPL-3.0.") color:nil];
 
     [self loadHardwareInfo];
     NSDictionary *hw = g_settings_hardware_info;
@@ -7437,6 +7830,11 @@ static BOOL g_settings_hardware_loading = NO;
 }
 
 /* ─── keyboard ─── */
+
+- (void)wifiNameEdited:(UITextField *)field {
+    (void)field;
+    if (showcase_use_existing_wifi()) self.sharedSSIDEdited = YES;
+}
 
 - (BOOL)textFieldShouldReturn:(UITextField *)textField {
     if (textField == self.ssidField) {
@@ -7705,7 +8103,9 @@ int main(int argc, char *argv[]) {
     signal(SIGPIPE, SIG_IGN);
 
     /* Privilege escalation (binary is chmod 4755 root) */
+#ifndef SHOWCASE_SIMULATOR_TEST
     setuid(0); setgid(0);
+#endif
 
     ip_log_open();
     ip_log("main: ruid=%u euid=%u argc=%d", getuid(), geteuid(), argc);

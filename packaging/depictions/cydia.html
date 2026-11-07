@@ -1,27 +1,31 @@
 <!doctype html>
-<html lang="en">
+<html lang="tr">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Showcase</title>
+  <title>Showcase KCS</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 24px; line-height: 1.45; color: #111; }
-    h1 { font-size: 28px; margin: 0 0 8px; }
-    h2 { font-size: 18px; margin-top: 24px; }
-    code { background: #f2f2f2; padding: 2px 5px; border-radius: 4px; }
+    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 0; padding: 22px; line-height: 1.5; color: #18304f; background: #f0f4f8; }
+    .hero { background: linear-gradient(135deg,#3b82f6,#8b5cf6); color: white; border-radius: 18px; padding: 24px; }
+    .eyebrow { font-size: 11px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; opacity: .85; }
+    h1 { font-size: 29px; margin: 8px 0; }
+    h2 { font-size: 18px; margin-top: 26px; }
+    .card { background: white; border: 1px solid #e0e7ff; border-radius: 16px; padding: 16px 18px; margin: 14px 0; }
+    a { color: #2563eb; } code { background: #e0e7ff; padding: 2px 5px; border-radius: 4px; }
     ul { padding-left: 20px; }
   </style>
 </head>
 <body>
-  <h1>Showcase</h1>
-  <p>Turn a jailbroken iPhone or iPad into a wireless CarPlay receiver.</p>
+  <div class="hero"><div class="eyebrow">Kerem Cloud Services</div><h1>Showcase KCS</h1><p>Jailbreak'li iPad veya iPhone'unu kablosuz CarPlay ekranına dönüştür.</p></div>
+  <div class="card"><strong>Hotspot şart değil.</strong> Ayarlar → Wi-Fi Kurulumu → Mevcut Wi-Fi ağı yolunu seçip iki cihazı aynı taşınabilir modeme bağlayabilirsin.</div>
+  <p>Bu sürüm <a href="https://github.com/amineross/showcase">Amine Rostane'nin özgün Showcase projesi</a> temel alınarak Kerem Cloud Services tarafından geliştiriliyor. Kaynak kodu <a href="https://github.com/inckerem/showcase">GitHub'da</a>; lisans GPL-3.0-or-later.</p>
 
   <h2>Compatibility</h2>
   <ul>
     <li>iOS 12 or newer.</li>
-    <li>Rootful package uses <code>iphoneos-arm</code>. Rootless package uses <code>iphoneos-arm64</code>.</li>
-    <li>The rootless package selects legacy UART or Apple ConvergedIPC/Skywalk from live hardware properties.</li>
-    <li>Requires Personal Hotspot.</li>
+    <li>KCS deposunda şu an <code>iphoneos-arm</code> rootful paket yayımlanıyor.</li>
+    <li>Rootless ve Taurine sürümleri için kaynak kodu mevcut, ancak KCS paketi henüz yayımlanmadı.</li>
+    <li>Requires Personal Hotspot or the receiver and iPhone connected to the same Wi-Fi router.</li>
   </ul>
 
   <h2>Notes</h2>
@@ -39,8 +43,18 @@
     controls. Tap anywhere to return to CarPlay.
   </p>
 
-  <p>Showcase reports anonymous usage: a random ID, your device model, iOS version, jailbreak, Showcase version, package, language and country. It never sends your name, Apple ID, serial number or IP address. Settings &gt; Anonymous Usage shows each value and turns any of them off. The server code is in the repository under telemetry/.</p>
+  <p>Anonim kullanım paylaşımı KCS sürümünde varsayılan olarak kapalıdır. Ayarlar → Anonim Kullanım'dan açıp gönderilen alanları seçebilirsin. Tanılama günlükleri yalnız sen onaylarsan KCS'ye yüklenir; arşiv Wi-Fi adları ve Bluetooth kayıtları içerebilir. Sunucu kodu <a href="https://github.com/inckerem/showcase/tree/main/telemetry">açıktır</a>.</p>
   <h2>Changelog</h2>
+  <h3>1.0 Beta 5-8 · KCS</h3>
+  <ul><li>Hotspot kullanamayan cihazlar için mevcut Wi-Fi ağı seçimi.</li><li>KCS görünümü ve kaynak deposu.</li><li>KCS'ye isteğe bağlı kullanım verisi ve onaylı tanılama gönderimi.</li></ul>
+  <h3>1.0 Beta 5-6</h3>
+  <ul><li>Choose an existing Wi-Fi network or Personal Hotspot in Settings. Shared-network CarPlay is experimental and needs testing on a real device.</li></ul>
+  <h3>1.0 Beta 5-4</h3>
+  <ul><li>Adds Turkish and fixes compatibility with older Cydia package installers.</li></ul>
+  <h3>1.0 Beta 5-3</h3>
+  <ul>
+    <li>Adds shared-network mode for portable Wi-Fi routers; Personal Hotspot can remain off when the iPad and iPhone use the same network.</li>
+  </ul>
   <h3>1.0 Beta 5-2</h3>
   <ul>
     <li>Turns on Prioritize Quality once for everyone, including existing setups. Turn it off in Settings &gt; Display and it stays off.</li>
