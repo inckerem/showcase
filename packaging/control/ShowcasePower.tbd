@@ -1,0 +1,7 @@
+--- !tapi-tbd-v2
+archs:                 [ arm64 ]
+platform:              ios
+install-name:          /Library/MobileSubstrate/DynamicLibraries/ShowcasePower.dylib
+current-version:       0
+compatibility-version: 0
+...

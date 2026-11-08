@@ -39,6 +39,7 @@ clang -arch arm64 -fobjc-arc -miphoneos-version-min=12.0 -isysroot "$IOS12_SDK" 
   -DAPP_VERSION="\"$DISPLAY_VERSION\"" -DPACKAGE_VERSION="\"$PACKAGE_VERSION\"" \
   -o "$TASK_APP/Showcase" source/Showcase.m -framework UIKit -framework AVFoundation \
   -framework AudioToolbox -framework CoreMedia -framework Foundation -framework Security \
+  -Wl,-weak_library,packaging/control/ShowcasePower.tbd \
   -Wl,-undefined,dynamic_lookup
 clang -arch arm64 -fobjc-arc -miphoneos-version-min=12.0 -isysroot "$IOS12_SDK" \
   -o "$TASK_APP/carplay_bt" source/carplay_bt.m "$TASK_LIB" -framework Foundation \
@@ -62,6 +63,6 @@ chmod 0644 "$TASK_STAGE/control/control" "$TASK_STAGE/control/"*.xml
 printf '2.0\n' > "$TASK_STAGE/debian-binary"
 TASK_DEB="$TASK_STAGE/repo/debs/com.rostane.showcase_${PACKAGE_VERSION}_iphoneos-arm.deb"
 ( cd "$TASK_STAGE" && ar -qS "$TASK_DEB" debian-binary control.tar.gz data.tar.gz )
-python3 tests/test_deb_compatibility.py "$TASK_DEB"
+python3 tests/test_deb_compatibility.py "$TASK_DEB" --require-autopower
 python3 packaging/scripts/generate-apt-repo.py "$TASK_STAGE/repo"
 printf 'Repository ready: %s\n' "$TASK_STAGE/repo"

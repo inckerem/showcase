@@ -14,8 +14,9 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-if len(sys.argv) != 2:
-    raise SystemExit('usage: test_deb_compatibility.py package.deb')
+if len(sys.argv) < 2 or sys.argv[2:] not in ([], ['--require-autopower']):
+    raise SystemExit('usage: test_deb_compatibility.py package.deb [--require-autopower]')
+require_autopower = '--require-autopower' in sys.argv[2:]
 
 deb = Path(sys.argv[1]).read_bytes()
 if deb[:8] != b'!<arch>\n':
@@ -94,11 +95,14 @@ with tempfile.TemporaryDirectory(prefix='showcase-compat-') as tmp:
                 matching = [command for command in load_commands if f'name {optional_power} ' in command]
                 if len(matching) != 1 or not re.search(r'\bcmd LC_LOAD_WEAK_DYLIB\b', matching[0]):
                     raise SystemExit('Showcase: optional power dylib must be a weak dependency')
+                if not re.search(r'(?m)^compatibility version 0\.0\.0\s*$', matching[0]):
+                    raise SystemExit('Showcase: optional power dylib must accept compatibility version 0.0.0')
                 continue
             if not any(path.startswith(prefix) for prefix in allowed):
                 raise SystemExit(f'{name}: unexpected dependency {path}')
-        if name == 'Showcase' and re.search(r'(?m)^Version: 1\.0~beta5-7\s*$', metadata) and not found_power:
-            raise SystemExit('Showcase: version 5-7 is missing its optional power dependency')
+        expects_power = require_autopower or re.search(r'(?m)^Version: 1\.0~beta5-7\s*$', metadata)
+        if name == 'Showcase' and expects_power and not found_power:
+            raise SystemExit('Showcase: missing its optional power dependency')
         if 'LC_DYLD_CHAINED_FIXUPS' in commands:
             raise SystemExit(f'{name}: chained fixups can be incompatible with iOS 12')
         if not re.search(r'(?:minos|version) 12\.0\b', commands):

@@ -38,7 +38,9 @@ def member(name, body):
     header=f'{name + "/":<16}{int(time.time()):<12}{0:<6}{0:<6}{"100644":<8}{len(body):<10}`\n'.encode('ascii')
     assert len(header)==60
     return header+body+(b'\n' if len(body)%2 else b'')
-deb=out/'tr.net.kcs.showcase.autopower_0.1~beta4_iphoneos-arm.deb'
+fields = dict(line.split(': ', 1) for line in (here/'control').read_text().splitlines()
+              if line and not line[0].isspace())
+deb = out / f"{fields['Package']}_{fields['Version']}_{fields['Architecture']}.deb"
 deb.write_bytes(b'!<arch>\n'+member('debian-binary',b'2.0\n')+member('control.tar.gz',control)+member('data.tar.gz',data))
 print(deb)
 PY

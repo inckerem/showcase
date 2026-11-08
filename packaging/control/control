@@ -18,3 +18,5 @@ Description: Wireless CarPlay receiver for rootful jailbreaks.
  .
  Beta 5-6 adds an explicit choice between existing Wi-Fi and Personal
  Hotspot. Shared Wi-Fi support remains experimental pending device testing.
+ .
+ Beta 5-9 restores optional support for the separate Showcase Arac Modu package.

@@ -9,6 +9,7 @@ REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 VARIANT="${VARIANT:-}"
 CONTROL_DIR="$ROOT/control"
 APP_FLAGS=""
+APP_LINK_FLAGS=""
 if [ "$VARIANT" = taurine ]; then
   CONTROL_DIR="$ROOT/control-taurine"
   APP_FLAGS="-DSHOWCASE_TAURINE"
@@ -119,6 +120,10 @@ cp "$REPO_ROOT/source/Showcase.m" \
    "$REPO_ROOT/source/ent_svc.xml" \
    "$WORK/send/"
 cp "$BTSTACK_DYLIB" "$WORK/send/libBTstack.dylib"
+if [ -z "$VARIANT" ]; then
+  cp "$CONTROL_DIR/ShowcasePower.tbd" "$WORK/send/"
+  APP_LINK_FLAGS="-Wl,-weak_library,ShowcasePower.tbd"
+fi
 COPYFILE_DISABLE=1 tar --format ustar -C "$REPO_ROOT/source" \
   -cf "$WORK/send/crypto-vendor.tar" vendor
 
@@ -138,7 +143,7 @@ clang -fobjc-arc -miphoneos-version-min=12.0 -isysroot '$SDK_REMOTE' \
     -DAPP_VERSION='\"$DISPLAY_VERSION\"' -DPACKAGE_VERSION='\"$PACKAGE_VERSION\"' $APP_FLAGS -o Showcase Showcase.m \
     -framework UIKit -framework AVFoundation -framework AudioToolbox \
     -framework CoreMedia -framework Foundation -framework Security \
-    -Wl,-undefined,dynamic_lookup
+    $APP_LINK_FLAGS -Wl,-undefined,dynamic_lookup
 
 clang -fobjc-arc -miphoneos-version-min=12.0 -isysroot '$SDK_REMOTE' \
     -o carplay_bt carplay_bt.m \

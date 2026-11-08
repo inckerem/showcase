@@ -16,6 +16,6 @@ clang -fobjc-arc -fblocks -Wall -Wextra -Werror -Wno-unused-parameter -Wno-cast-
 "$TASK_TMP/app-test"
 sh -n autopower-v3/postinst autopower-v3/prerm autopower-v3/postrm
 python3 autopower-v3/test_maintainer_scripts.py
-bash autopower-v3/build.sh "$TASK_TMP/build"
-python3 autopower-v3/test_package.py "$TASK_TMP/build/tr.net.kcs.showcase.autopower_0.1~beta4_iphoneos-arm.deb"
-python3 tests/test_deb_compatibility.py "$1"
+deb="$(bash autopower-v3/build.sh "$TASK_TMP/build")"
+python3 autopower-v3/test_package.py "$deb"
+python3 tests/test_deb_compatibility.py "$1" --require-autopower

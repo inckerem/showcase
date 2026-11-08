@@ -37,8 +37,10 @@ for name in ('control.tar.gz', 'data.tar.gz'):
         assert all(e.uid == e.gid == 0 for e in entries)
         archives[name] = {e.name: (e, tar.extractfile(e).read() if e.isfile() else None) for e in entries}
 control, payload = archives['control.tar.gz'], archives['data.tar.gz']
-assert b'Version: 0.1~beta4\n' in control['./control'][1]
-assert b'com.rostane.showcase (= 1.0~beta5-7)' in control['./control'][1]
+metadata = control['./control'][1]
+assert b'Version: 0.1~beta4-1\n' in metadata
+assert (b'Depends: firmware (>= 12.0), firmware (<< 13.0), '
+        b'com.rostane.showcase (= 1.0~beta5-9) | com.rostane.showcase (= 1.0~beta5-7)\n') in metadata
 assert all(control['./'+name][0].mode == 0o755 for name in ('postinst', 'prerm', 'postrm'))
 prefix = './Library/MobileSubstrate/DynamicLibraries/ShowcasePower'
 assert prefix+'.dylib' in payload and prefix+'.plist' in payload
