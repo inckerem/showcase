@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+  <key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
+  <key>CFBundleDisplayName</key><string>Showcase Mirror</string>
+  <key>CFBundleName</key><string>Showcase Mirror</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleVersion</key><string>3</string>
+  <key>CFBundleShortVersionString</key><string>0.1.2</string>
+  <key>UILaunchScreen</key><dict/>
+  <key>UIApplicationSceneManifest</key>
+  <dict>
+    <key>UIApplicationSupportsMultipleScenes</key><false/>
+    <key>UISceneConfigurations</key>
+    <dict>
+      <key>UIWindowSceneSessionRoleApplication</key>
+      <array>
+        <dict>
+          <key>UISceneConfigurationName</key><string>Showcase Mirror</string>
+          <key>UISceneDelegateClassName</key><string>MirrorScene</string>
+        </dict>
+      </array>
+    </dict>
+  </dict>
+  <key>NSCameraUsageDescription</key>
+  <string>iPad’deki Showcase eşleştirme QR kodunu okumak için.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>iPhone ekranını yerel ağdaki Showcase alıcısına canlı yansıtmak için.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Aynı Wi-Fi ağındaki iPad’de Showcase’e bağlanmak için.</string>
+  <key>UIBackgroundModes</key>
+  <array><string>screen-capture</string></array>
+</dict>
+</plist>

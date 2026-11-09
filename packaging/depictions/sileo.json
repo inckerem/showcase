@@ -92,6 +92,14 @@
       "views": [
         {
           "class": "DepictionHeaderView",
+          "title": "1.0 Beta 5-10 · KCS"
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "CarPlay’deki Araç simgesi ekran yansıtma için QR kodunu açar. iPhone’da Showcase Mirror 0.1.2 ve iOS 27 gerekir."
+        },
+        {
+          "class": "DepictionHeaderView",
           "title": "1.0 Beta 5-9 · KCS"
         },
         {

@@ -69,6 +69,10 @@ int pair_derive_event_keys(pair_ctx_t *ctx, uint8_t readKey[32], uint8_t writeKe
  * Returns 0 on success, -1 on error. */
 int pair_derive_stream_key(pair_ctx_t *ctx, uint64_t streamConnectionID, uint8_t outKey[32]);
 
+/* The settings data stream uses its own seed and separate directional keys. */
+int pair_derive_data_stream_keys(pair_ctx_t *ctx, uint64_t seed,
+                                 uint8_t readKey[32], uint8_t writeKey[32]);
+
 /* Destroy pair context and free all resources */
 void pair_ctx_destroy(pair_ctx_t *ctx);
 

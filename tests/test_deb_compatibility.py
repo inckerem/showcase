@@ -63,6 +63,7 @@ def extract_member(archive, name):
 metadata = extract_member(control, 'control').decode()
 if 'Architecture: iphoneos-arm\n' not in metadata:
     raise SystemExit('wrong architecture for rootful iOS')
+expects_mirror = bool(re.search(r'(?m)^Version: [^\n]*\+(?:mirror|videobench2mirror[0-9]*)(?:\+[^\n]+)?$', metadata))
 tr = extract_member(data, 'Applications/Showcase.app/tr.lproj/Localizable.strings')
 if 'Türkçe'.encode() not in tr and 'Ayarlar'.encode() not in tr:
     raise SystemExit('Turkish localization appears empty')
@@ -87,8 +88,12 @@ with tempfile.TemporaryDirectory(prefix='showcase-compat-') as tmp:
         libraries = subprocess.check_output(['otool', '-L', str(binary)], text=True).splitlines()[1:]
         optional_power = '/Library/MobileSubstrate/DynamicLibraries/ShowcasePower.dylib'
         found_power = False
+        found_mirror_network = False
         for line in libraries:
             path = line.strip().split(' (compatibility version')[0]
+            if name == 'Showcase' and expects_mirror and path == '/usr/lib/libnetwork.dylib':
+                found_mirror_network = True
+                continue
             if name == 'Showcase' and path == optional_power:
                 found_power = True
                 load_commands = re.split(r'(?m)^Load command \d+\s*$', commands)
@@ -103,6 +108,8 @@ with tempfile.TemporaryDirectory(prefix='showcase-compat-') as tmp:
         expects_power = require_autopower or re.search(r'(?m)^Version: 1\.0~beta5-7\s*$', metadata)
         if name == 'Showcase' and expects_power and not found_power:
             raise SystemExit('Showcase: missing its optional power dependency')
+        if name == 'Showcase' and expects_mirror and not found_mirror_network:
+            raise SystemExit('Showcase: missing the iOS 12 network library for mirroring')
         if 'LC_DYLD_CHAINED_FIXUPS' in commands:
             raise SystemExit(f'{name}: chained fixups can be incompatible with iOS 12')
         if not re.search(r'(?:minos|version) 12\.0\b', commands):

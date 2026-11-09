@@ -120,5 +120,5 @@ assert 'if (dv.length == 32 && !pkData) pkData = dv;' in auth
 assert 'auth-setup: not a plist, hex' not in auth
 assert '[val UTF8String]' not in auth and '[[val description]' not in auth
 generic = source[source.index('static void handle_post_generic'):source.index('/* ═══════════════════════════════════════════════════════════════\n * Request Router')]
-assert 'handle_command_dictionary(obj)' in generic
+assert 'handle_command_dictionary(obj, control_is_encrypted(sock))' in generic
 assert '[[obj description]' not in generic and 'printf("[AP] hex' not in generic

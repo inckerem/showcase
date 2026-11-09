@@ -34,17 +34,31 @@ for task_part in Applications usr Library; do cp -R "$TASK_STAGE/unpack/$task_pa
 TASK_APP="$TASK_STAGE/rootfs/Applications/Showcase.app"
 TASK_LIB="$TASK_STAGE/rootfs/usr/lib/libBTstack.dylib"
 . "$TASK_ROOT/packaging/scripts/version.sh"
+video_in_car_flag=-DSHOWCASE_VIDEO_IN_CAR_BENCH=0
+mirror_flags=(-DSHOWCASE_MIRROR_BENCH=0)
+if [[ ${SHOWCASE_MIRROR_BENCH:-0} == 1 ]]; then
+  mirror_flags=(-DSHOWCASE_MIRROR_BENCH=1 -framework Network -framework CoreImage -framework QuartzCore)
+  PACKAGE_VERSION="$PACKAGE_VERSION+mirror"
+  DISPLAY_VERSION="$DISPLAY_VERSION (Mirror)"
+fi
+if [[ ${SHOWCASE_VIDEO_IN_CAR_BENCH:-0} == 1 ]]; then
+  video_in_car_flag=-DSHOWCASE_VIDEO_IN_CAR_BENCH=1
+  PACKAGE_VERSION="$PACKAGE_VERSION+videobench1"
+  DISPLAY_VERSION="$DISPLAY_VERSION (Video Bench)"
+fi
 cd "$TASK_ROOT"
 clang -arch arm64 -fobjc-arc -miphoneos-version-min=12.0 -isysroot "$IOS12_SDK" \
   -DAPP_VERSION="\"$DISPLAY_VERSION\"" -DPACKAGE_VERSION="\"$PACKAGE_VERSION\"" \
   -o "$TASK_APP/Showcase" source/Showcase.m -framework UIKit -framework AVFoundation \
   -framework AudioToolbox -framework CoreMedia -framework Foundation -framework Security \
+  "${mirror_flags[@]}" \
   -Wl,-weak_library,packaging/control/ShowcasePower.tbd \
   -Wl,-undefined,dynamic_lookup
 clang -arch arm64 -fobjc-arc -miphoneos-version-min=12.0 -isysroot "$IOS12_SDK" \
   -o "$TASK_APP/carplay_bt" source/carplay_bt.m "$TASK_LIB" -framework Foundation \
   -framework Security -Wl,-undefined,dynamic_lookup
-clang -arch arm64 -fobjc-arc -miphoneos-version-min=12.0 -isysroot "$IOS12_SDK" \
+clang -O1 -arch arm64 -fobjc-arc -miphoneos-version-min=12.0 -isysroot "$IOS12_SDK" \
+  "$video_in_car_flag" "${mirror_flags[0]}" \
   -o "$TASK_APP/carplay_services" source/carplay_services.m source/carplay_pair.c \
   source/vendor/monocypher/monocypher.c source/vendor/monocypher/monocypher-ed25519.c \
   source/vendor/libtommath/tommath.c -framework Foundation -framework Security \

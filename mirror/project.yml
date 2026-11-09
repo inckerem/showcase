@@ -1,0 +1,28 @@
+name: ShowcaseMirror
+options:
+  deploymentTarget:
+    iOS: "27.0"
+targets:
+  ShowcaseMirror:
+    type: application
+    platform: iOS
+    sources:
+      - main.m
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: tr.net.kcs.showcase.mirror
+        INFOPLIST_FILE: Info.plist
+        HEADER_SEARCH_PATHS: "$(PROJECT_DIR)/../source"
+        CLANG_ENABLE_OBJC_ARC: YES
+        ENABLE_DEBUG_DYLIB: NO
+        TARGETED_DEVICE_FAMILY: 1
+    dependencies:
+      - sdk: UIKit.framework
+      - sdk: AVFoundation.framework
+      - sdk: ScreenCaptureKit.framework
+      - sdk: VideoToolbox.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
+      - sdk: CoreGraphics.framework
+      - sdk: Network.framework
+      - sdk: Security.framework

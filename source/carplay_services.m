@@ -36,10 +36,13 @@
 #include <float.h>
 #include <stdarg.h>
 #include <pthread.h>
+#include <poll.h>
+#include <stdatomic.h>
 #include <limits.h>
 #include <mach/mach_time.h>
 #include "carplay_pair.h"
 #include "baa_broker.h"
+#include "video_in_car.h"
 #include "vendor/monocypher/monocypher.h"
 
 /*
@@ -106,7 +109,40 @@ int showcase_service_log_printf(const char *format, ...) {
 #define STATUS_PAIR_SETUP_STARTED   0x05   /* first pairing with this iPhone */
 #define STATUS_AUTH_COMPLETE        0x06   /* accessory certificate accepted */
 #define STATUS_SESSION_SETUP        0x07   /* control session negotiated     */
+#define STATUS_HOST_UI_REQUESTED    0x08   /* CarPlay OEM icon selected       */
 static void app_send_status(uint8_t code);
+
+/* Explicit test builds can negotiate playback without a vehicle-state source. */
+#ifndef SHOWCASE_VIDEO_IN_CAR_BENCH
+#define SHOWCASE_VIDEO_IN_CAR_BENCH 0
+#endif
+#ifndef SHOWCASE_MIRROR_BENCH
+#define SHOWCASE_MIRROR_BENCH 0
+#endif
+static atomic_bool g_car_video_negotiated;
+static void send_car_video_availability(void);
+
+static NSDictionary *car_video_capabilities(uint64_t legacyFeatures) {
+    uint8_t bits[9] = {0};
+    legacyFeatures |= 1;
+    for (size_t i = 0; i < 8; i++)
+        bits[i] = (uint8_t)(legacyFeatures >> (i * 8));
+    bits[8] = 1; /* Extended AirPlay feature 64. */
+    NSData *featureData = [NSData dataWithBytes:bits length:sizeof(bits)];
+    return @{
+        @"videoPlaybackAllowed": @YES,
+        @"featuresEx": [featureData base64EncodedStringWithOptions:0],
+        @"playbackCapabilities": @{
+            @"supportsOfflineHLS": @NO,
+            @"supportsAirPlayVideoWithSharePlay": @NO,
+            @"supportsInterstitials": @NO,
+            @"supportsIntegratedTimeline": @NO,
+            @"supportsAVMetrics": @NO,
+            @"supportsUIForAudioOnlyContent": @YES,
+            @"supportsFPSSecureStop": @NO
+        }
+    };
+}
 
 #define MSG_AUDIO_CONFIG 0x08
 #define MSG_AUDIO_PACKET 0x09
@@ -766,6 +802,7 @@ typedef struct {
     char xAppleHKP[32];
     char xApplePD[16];
     char xAppleAT[16];
+    uint32_t appleStreamID;
     bool invalid;
 } HTTPReq;
 
@@ -848,6 +885,17 @@ static bool parse_http(const uint8_t *buf, size_t len, HTTPReq *r) {
             } else if (nameLen == 10 && strncasecmp(hp, "X-Apple-AT", 10) == 0) {
                 if (valLen < sizeof(r->xAppleAT))
                     memcpy(r->xAppleAT, val, valLen);
+            } else if (nameLen == 16 && strncasecmp(hp, "X-Apple-StreamID", 16) == 0) {
+                uint32_t id = 0;
+                for (const char *p = val; p < le; p++) {
+                    if (*p < '0' || *p > '9' || id > (UINT32_MAX - (*p - '0')) / 10) {
+                        r->invalid = true;
+                        return false;
+                    }
+                    id = id * 10 + (*p - '0');
+                }
+                if (id == 0 || r->appleStreamID != 0) { r->invalid = true; return false; }
+                r->appleStreamID = id;
             } else if (nameLen == 4 && strncasecmp(hp, "CSeq", 4) == 0) {
                 int value = 0;
                 for (const char *p = val; p < le && *p >= '0' && *p <= '9'; p++) {
@@ -1011,6 +1059,8 @@ static void handle_info(int sock, const HTTPReq *r) {
         info[@"nightMode"] = @NO;
         info[@"rightHandDrive"] = @(g_right_hand_drive);
         info[@"extendedFeatures"] = @[@"vocoderInfo"];
+        if (SHOWCASE_VIDEO_IN_CAR_BENCH)
+            info[@"videoPlaybackInfo"] = car_video_capabilities(features);
         /*
          * Apple's receiver advertises this dictionary when buffered main
          * audio is enabled. The dictionary is intentionally empty: the
@@ -2332,7 +2382,7 @@ static uint16_t g_keepalive_port = 0;
 static bool  g_session_active = false;
 static bool  g_timing_thread_running = false;
 static bool  g_event_thread_running = false;
-static int   g_event_client_fd = -1;  /* accepted event connection */
+static atomic_int g_event_client_fd = -1;  /* accepted event connection */
 static volatile uint64_t g_last_touch_nanos = 0;
 
 /* Screen stream state */
@@ -2627,7 +2677,10 @@ static void event_thread_func(void *ctx) {
         if (g_event_enc.active) {
             printf("[EVENT] Encrypted event channel active\n");
             fflush(stdout);
+            if (SHOWCASE_VIDEO_IN_CAR_BENCH) send_car_video_availability();
             uint64_t normalResponseCount = 0;
+            uint8_t pending[HTTP_STREAM_LIMIT + ENCRYPTED_MAX_READ_SIZE];
+            size_t used = 0;
             while (1) {
                 int ptLen = enc_recv_frame(client, &g_event_enc, buf, sizeof(buf));
                 if (ptLen == -2) {
@@ -2639,20 +2692,23 @@ static void event_thread_func(void *ctx) {
                     printf("[EVENT] Encrypted recv error or disconnect\n");
                     break;
                 }
-                if (ptLen >= 12 &&
-                    memcmp(buf, "RTSP/1.0 200", 12) == 0) {
-                    normalResponseCount++;
-                    if (normalResponseCount % 250 == 0) {
-                        printf("[EVENT] %llu normal HID acknowledgements\n",
-                               normalResponseCount);
+                if (ptLen == 0 || (size_t)ptLen > sizeof(pending) - used) break;
+                memcpy(pending + used, buf, (size_t)ptLen);
+                used += (size_t)ptLen;
+                HTTPReq request;
+                while (parse_http(pending, used, &request)) {
+                    size_t length = (size_t)(request.body - pending) + request.bodyLen;
+                    if (length >= 12 && memcmp(pending, "RTSP/1.0 200", 12) == 0) {
+                        if (++normalResponseCount % 250 == 0)
+                            printf("[EVENT] %llu normal HID acknowledgements\n",
+                                   normalResponseCount);
+                    } else if (!process_event_command_frame(pending, length)) {
+                        printf("[EVENT] Unhandled event message (%zu bytes)\n", length);
                     }
-                    continue;
+                    used -= length;
+                    memmove(pending, pending + length, used);
                 }
-                if (process_event_command_frame(buf, (size_t)ptLen))
-                    continue;
-                printf("[EVENT] Decrypted %d bytes (nonce=%llu)\n",
-                       ptLen, g_event_enc.readNonce - 1);
-                fflush(stdout);
+                if (request.invalid) break;
             }
         } else {
             printf("[EVENT] WARNING: plaintext event channel (no encryption keys)\n");
@@ -2676,8 +2732,11 @@ static void event_thread_func(void *ctx) {
                 }
             }
         }
-        close(client);
+        if (g_event_send_lock)
+            dispatch_semaphore_wait(g_event_send_lock, DISPATCH_TIME_FOREVER);
         g_event_client_fd = -1;
+        close(client);
+        if (g_event_send_lock) dispatch_semaphore_signal(g_event_send_lock);
         printf("[EVENT] Client connection closed\n");
         fflush(stdout);
     }
@@ -3537,8 +3596,8 @@ done:
 static int g_event_cmd_cseq = 10;
 static dispatch_queue_t g_hid_send_queue = NULL;
 
-static void send_event_command(NSDictionary *cmd, const char *name,
-                               const char *reason) {
+static void send_event_command_on_stream(NSDictionary *cmd, const char *name,
+                                         const char *reason, uint32_t streamID) {
     if (g_event_client_fd < 0 || !g_event_enc.active) {
         printf("[EVENT-CMD] %s unavailable (%s): fd=%d enc=%d\n",
                name, reason ?: "unspecified", g_event_client_fd,
@@ -3561,6 +3620,8 @@ static void send_event_command(NSDictionary *cmd, const char *name,
         int commandSequence = __sync_fetch_and_add(&g_event_cmd_cseq, 1);
         [header appendFormat:@"CSeq: %d\r\n", commandSequence];
         [header appendFormat:@"User-Agent: AirPlay/%s\r\n", SOURCE_VERSION];
+        if (streamID != 0)
+            [header appendFormat:@"X-Apple-StreamID: %u\r\n", streamID];
         [header appendString:@"\r\n"];
         NSMutableData *message =
             [NSMutableData dataWithBytes:header.UTF8String
@@ -3569,14 +3630,27 @@ static void send_event_command(NSDictionary *cmd, const char *name,
 
         if (g_event_send_lock)
             dispatch_semaphore_wait(g_event_send_lock, DISPATCH_TIME_FOREVER);
-        int result = enc_send_frame(g_event_client_fd, &g_event_enc,
-                                    message.bytes, message.length);
+        int result = g_event_client_fd < 0 ? -1 :
+            enc_send_stream(g_event_client_fd, &g_event_enc,
+                            message.bytes, message.length);
         if (g_event_send_lock) dispatch_semaphore_signal(g_event_send_lock);
         printf("[EVENT-CMD] %s %s (%s, nonce=%llu)\n",
                name,
                result == 0 ? "sent" : "failed", reason ?: "unspecified",
                g_event_enc.writeNonce ? g_event_enc.writeNonce - 1 : 0);
     }
+}
+
+static void send_event_command(NSDictionary *cmd, const char *name,
+                               const char *reason) {
+    send_event_command_on_stream(cmd, name, reason, 0);
+}
+
+static void send_car_video_availability(void) {
+    if (!atomic_load(&g_car_video_negotiated)) return;
+    send_event_command(@{@"type": @"setVideoPlaybackAllowed",
+                         @"params": @{@"videoPlaybackAllowed": @YES}},
+                       "setVideoPlaybackAllowed", "bench");
 }
 
 static void send_request_ui_command(const char *reason) {
@@ -3741,6 +3815,194 @@ static bool queue_touch_report(uint8_t phase, uint16_t x, uint16_t y,
     return true;
 }
 
+/* ── Video in Car (stream 130) ── */
+static pthread_mutex_t g_car_video_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_car_video_streams[2];
+static uint32_t g_car_video_next_id = 3;
+static unsigned g_car_video_settings_generation;
+static int g_car_video_settings_client = -1;
+
+static bool car_video_stream_active_locked(uint32_t streamID) {
+    return streamID >= 3 && atomic_load(&g_car_video_negotiated) &&
+        (g_car_video_streams[0] == streamID || g_car_video_streams[1] == streamID);
+}
+
+static void car_video_close_stream(uint32_t streamID) {
+    pthread_mutex_lock(&g_car_video_lock);
+    bool notifyApp = streamID == 0 || car_video_stream_active_locked(streamID);
+    if (streamID == 0 || streamID == 2) {
+        ++g_car_video_settings_generation;
+        if (g_car_video_settings_client >= 0)
+            shutdown(g_car_video_settings_client, SHUT_RDWR);
+    }
+    for (size_t i = 0; i < 2; i++) {
+        if (streamID == 0 || g_car_video_streams[i] == streamID)
+            g_car_video_streams[i] = 0;
+    }
+    if (notifyApp) {
+        NSData *body = car_video_encode(@{@"streamID": @(streamID)});
+        if (body) app_send_msg(MSG_CAR_VIDEO_COMMAND, body.bytes, (uint32_t)body.length);
+    }
+    pthread_mutex_unlock(&g_car_video_lock);
+}
+
+static void car_video_read_settings(int fd, encrypted_ctx_t *keys) {
+    uint8_t data[ENCRYPTED_MAX_READ_SIZE];
+    uint8_t header[32];
+    size_t headerLength = 0, remaining = 0;
+    for (;;) {
+        int length = enc_recv_frame(fd, keys, data, sizeof(data));
+        if (length <= 0) return;
+        size_t offset = 0;
+        while (offset < (size_t)length) {
+            if (headerLength < sizeof(header)) {
+                size_t count = MIN(sizeof(header) - headerLength, (size_t)length - offset);
+                memcpy(header + headerLength, data + offset, count);
+                headerLength += count;
+                offset += count;
+                if (headerLength < sizeof(header)) continue;
+                uint32_t networkLength;
+                memcpy(&networkLength, header, sizeof(networkLength));
+                uint32_t packageLength = ntohl(networkLength);
+                if (packageLength < sizeof(header) || packageLength > 8 * 1024 * 1024)
+                    return;
+                remaining = packageLength - sizeof(header);
+            }
+            size_t count = MIN(remaining, (size_t)length - offset);
+            remaining -= count;
+            offset += count;
+            if (remaining != 0) continue;
+            if (memcmp(header + 4, "sync\0\0\0\0\0\0\0\0", 12) == 0) {
+                uint8_t reply[32] = {0, 0, 0, 32, 'r', 'p', 'l', 'y'};
+                memcpy(reply + 20, header + 20, 8);
+                if (enc_send_frame(fd, keys, reply, sizeof(reply)) < 0) return;
+            }
+            headerLength = 0;
+        }
+    }
+}
+
+static void car_video_start_settings(int listener, encrypted_ctx_t keys) {
+    car_video_close_stream(2);
+    pthread_mutex_lock(&g_car_video_lock);
+    unsigned generation = g_car_video_settings_generation;
+    pthread_mutex_unlock(&g_car_video_lock);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        int client = -1;
+        /* The worker owns both descriptors. Teardown invalidates the pending
+         * accept and wakes an active read without closing a reused fd. */
+        struct pollfd pending = { .fd = listener, .events = POLLIN };
+        for (unsigned attempt = 0; attempt < 120; attempt++) {
+            int result = poll(&pending, 1, 250);
+            pthread_mutex_lock(&g_car_video_lock);
+            bool current = generation == g_car_video_settings_generation;
+            pthread_mutex_unlock(&g_car_video_lock);
+            if (!current || result < 0) break;
+            if (result == 0) continue;
+            if (pending.revents & POLLIN) client = accept(listener, NULL, NULL);
+            break;
+        }
+        close(listener);
+        if (client >= 0) {
+            int yes = 1;
+            setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+            pthread_mutex_lock(&g_car_video_lock);
+            bool current = generation == g_car_video_settings_generation;
+            if (current) g_car_video_settings_client = client;
+            pthread_mutex_unlock(&g_car_video_lock);
+            encrypted_ctx_t context = keys;
+            if (current) car_video_read_settings(client, &context);
+            crypto_wipe(&context, sizeof(context));
+            pthread_mutex_lock(&g_car_video_lock);
+            if (g_car_video_settings_client == client) g_car_video_settings_client = -1;
+            close(client);
+            pthread_mutex_unlock(&g_car_video_lock);
+        }
+    });
+}
+
+/* Stream identifiers and plist fields follow the observed DiPlay receiver
+ * protocol: github.com/yashvardhan-techie/DiPlay-fixes (BYD_NAVIGATION.md). */
+static NSDictionary *car_video_setup_stream(NSDictionary *stream) {
+    NSString *uuid = stream[@"clientTypeUUID"];
+    if (![uuid isKindOfClass:[NSString class]]) return nil;
+    uuid = uuid.uppercaseString;
+    if ([uuid isEqualToString:@"BB493F61-A6B8-4769-8D74-80C23A9F71C4"]) {
+        NSNumber *seed = stream[@"seed"];
+        encrypted_ctx_t keys = {0};
+        if (![seed isKindOfClass:[NSNumber class]] ||
+            pair_derive_data_stream_keys(g_pair, seed.unsignedLongLongValue,
+                                        keys.readKey, keys.writeKey) != 0) return nil;
+        uint16_t port = 0;
+        int listener = bind_screen_tcp_port(&port, g_iphone_family);
+        if (listener < 0) {
+            crypto_wipe(&keys, sizeof(keys));
+            return nil;
+        }
+        car_video_start_settings(listener, keys);
+        crypto_wipe(&keys, sizeof(keys));
+        NSMutableDictionary *response = [@{@"type": @130, @"streamID": @2,
+                                           @"dataPort": @(port)} mutableCopy];
+        if ([stream[@"streamConnectionID"] isKindOfClass:[NSNumber class]])
+            response[@"streamConnectionID"] = stream[@"streamConnectionID"];
+        return response;
+    }
+
+    NSArray *uuids = @[@"A6B27562-B43A-4F2D-B75F-82391E250194",
+                       @"E3DC3EA6-E6C3-4B30-847C-B7ACFEBEA654"];
+    NSUInteger slot = [uuids indexOfObject:uuid];
+    NSNumber *controlType = stream[@"controlType"];
+    if (slot == NSNotFound || ![controlType isKindOfClass:[NSNumber class]] ||
+        controlType.intValue != 1) return nil;
+    pthread_mutex_lock(&g_car_video_lock);
+    if (!g_car_video_streams[slot]) g_car_video_streams[slot] = g_car_video_next_id++;
+    uint32_t streamID = g_car_video_streams[slot];
+    pthread_mutex_unlock(&g_car_video_lock);
+    return @{@"type": @130, @"streamID": @(streamID)};
+}
+
+static void car_video_forward_command(uint32_t streamID, NSDictionary *outer) {
+    NSDictionary *params = outer[@"params"];
+    if (![params isKindOfClass:[NSDictionary class]]) return;
+    NSData *data = params[@"data"];
+    if (![data isKindOfClass:[NSData class]]) return;
+    NSDictionary *command = car_video_decode(data);
+    if (!command) return;
+    NSData *body = car_video_encode(@{@"streamID": @(streamID), @"message": command});
+    pthread_mutex_lock(&g_car_video_lock);
+    if (body.length && body.length <= CAR_VIDEO_MAX_MESSAGE &&
+        car_video_stream_active_locked(streamID))
+        app_send_msg(MSG_CAR_VIDEO_COMMAND, body.bytes, (uint32_t)body.length);
+    pthread_mutex_unlock(&g_car_video_lock);
+}
+
+static void car_video_request_ui(void) {
+    pthread_mutex_lock(&g_car_video_lock);
+    uint32_t streamID = g_car_video_streams[0] ?: g_car_video_streams[1];
+    if (car_video_stream_active_locked(streamID)) {
+        NSData *body = car_video_encode(@{@"streamID": @(streamID),
+                                          @"message": @{@"type": @"requestUI"}});
+        if (body) app_send_msg(MSG_CAR_VIDEO_COMMAND, body.bytes, (uint32_t)body.length);
+    }
+    pthread_mutex_unlock(&g_car_video_lock);
+}
+
+static void car_video_send_reply(NSData *body) {
+    NSDictionary *packet = car_video_decode(body);
+    NSNumber *idNumber = packet[@"streamID"];
+    if (![idNumber isKindOfClass:[NSNumber class]]) return;
+    uint32_t streamID = idNumber.unsignedIntValue;
+    NSDictionary *reply = packet[@"message"];
+    if (![reply isKindOfClass:[NSDictionary class]]) return;
+    NSData *payload = car_video_encode(reply);
+    pthread_mutex_lock(&g_car_video_lock);
+    bool active = car_video_stream_active_locked(streamID);
+    pthread_mutex_unlock(&g_car_video_lock);
+    if (active && payload.length && payload.length <= CAR_VIDEO_MAX_MESSAGE)
+        send_event_command_on_stream(@{@"params": @{@"data": payload}},
+                                     "videoPlayback", "player response", streamID);
+}
+
 /* ── Touch reader thread — reads touch events from iPadPlay app via IPC ── */
 static bool g_touch_reader_running = false;
 
@@ -3854,6 +4116,13 @@ static void touch_reader_func(void *arg) {
             }
             free(payload);
             fflush(stdout);
+        } else if (SHOWCASE_VIDEO_IN_CAR_BENCH && type == MSG_CAR_VIDEO_REPLY &&
+                   len > 0 && len <= CAR_VIDEO_MAX_MESSAGE) {
+            @autoreleasepool {
+                NSMutableData *body = [NSMutableData dataWithLength:len];
+                if (!tcp_read_exact(fd, body.mutableBytes, len)) break;
+                car_video_send_reply(body);
+            }
         } else if (type == MSG_APP_VISIBILITY && len == 1) {
             uint8_t visible = 0;
             if (!tcp_read_exact(fd, &visible, 1)) break;
@@ -4448,7 +4717,12 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
 
     @autoreleasepool {
         NSMutableDictionary *respDict = [NSMutableDictionary dictionary];
+        bool enableCarVideo = false;
         NSArray *streams = reqDict[@"streams"];
+        if (streams && ![streams isKindOfClass:[NSArray class]]) {
+            send_response(sock, "RTSP/1.0", 400, "Bad Request", NULL, NULL, 0, r->cseq);
+            return;
+        }
 
         if (!streams) {
             /* ── Phase 1: Initial session control setup ── */
@@ -4507,18 +4781,21 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
             respDict[@"timingPort"] = @(g_timing_port);
             respDict[@"eventPort"]  = @(g_event_port);
 
-            /*
-             * Session features are negotiated, not enabled merely by listing
-             * their stream formats in /info. Enable only the buffered-audio
-             * feature that both peers advertised/support; do not mirror
-             * unknown sender features.
-             */
+            /* Enable only explicitly implemented features the sender proposed. */
             NSArray *requestedFeatures = reqDict[@"features"];
-            if (g_receiver_audio &&
-                [requestedFeatures isKindOfClass:[NSArray class]] &&
-                [requestedFeatures containsObject:@"mainBuffered"]) {
-                respDict[@"enabledFeatures"] = @[@"mainBuffered"];
-                printf("[AUDIO] enabled session feature: mainBuffered\n");
+            if ([requestedFeatures isKindOfClass:[NSArray class]]) {
+                NSMutableArray *enabled = [NSMutableArray array];
+                if (g_receiver_audio && [requestedFeatures containsObject:@"mainBuffered"]) {
+                    [enabled addObject:@"mainBuffered"];
+                    printf("[AUDIO] enabled session feature: mainBuffered\n");
+                }
+                if (SHOWCASE_VIDEO_IN_CAR_BENCH && control_is_encrypted(sock) &&
+                    [requestedFeatures containsObject:@"videoPlayback"]) {
+                    [enabled addObject:@"videoPlayback"];
+                    enableCarVideo = true;
+                    printf("[CAR-VIDEO] enabled session feature: videoPlayback\n");
+                }
+                if (enabled.count) respDict[@"enabledFeatures"] = enabled;
             }
 
             /* iPhone sent keepAliveLowPower=1 */
@@ -4537,9 +4814,19 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
             NSMutableArray *respStreams = [NSMutableArray array];
 
             for (NSDictionary *stream in streams) {
+                if (![stream isKindOfClass:[NSDictionary class]]) continue;
                 NSNumber *typeNum = stream[@"type"];
+                if (![typeNum isKindOfClass:[NSNumber class]]) continue;
                 int type = [typeNum intValue];
                 printf("[AP] SETUP stream type=%d\n", type);
+
+                if (type == 130 && atomic_load(&g_car_video_negotiated)) {
+                    NSDictionary *response = car_video_setup_stream(stream);
+                    if (response) {
+                        [respStreams addObject:response];
+                        continue;
+                    }
+                }
 
                 NSMutableDictionary *rs = [NSMutableDictionary dictionary];
                 rs[@"type"] = typeNum;
@@ -4764,6 +5051,10 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
             send_response(sock, "RTSP/1.0", 200, "OK",
                          "application/x-apple-binary-plist",
                          (const uint8_t *)plistData.bytes, plistData.length, r->cseq);
+            if (enableCarVideo) {
+                atomic_store(&g_car_video_negotiated, true);
+                send_car_video_availability();
+            }
         } else {
             printf("[AP] SETUP plist serialization error: %s\n",
                    [[err description] UTF8String]);
@@ -4845,6 +5136,14 @@ static void handle_teardown(int sock, const HTTPReq *r) {
                             if (![entry isKindOfClass:
                                     [NSDictionary class]]) continue;
                             NSNumber *type = entry[@"type"];
+                            if (![type isKindOfClass:[NSNumber class]]) continue;
+                            if (type.intValue == 130 && atomic_load(&g_car_video_negotiated)) {
+                                NSNumber *streamID = entry[@"streamID"];
+                                if ([streamID isKindOfClass:[NSNumber class]] &&
+                                    streamID.unsignedIntValue >= 2)
+                                    car_video_close_stream(streamID.unsignedIntValue);
+                                continue;
+                            }
                             carplay_audio_stream_t *audio =
                                 audio_stream_for_type(
                                     type.unsignedIntValue);
@@ -4859,6 +5158,9 @@ static void handle_teardown(int sock, const HTTPReq *r) {
     }
 
     if (!hadStreamTargets) {
+        if (atomic_exchange(&g_car_video_negotiated, false)) {
+            @autoreleasepool { car_video_close_stream(0); }
+        }
         g_recording = false;
         __sync_add_and_fetch(&g_timing_maintenance_generation, 1);
         for (size_t index = 0;
@@ -5039,7 +5341,7 @@ static void handle_rtsp_generic(int sock, const HTTPReq *r) {
 static NSDictionary *g_modes_state = nil;
 
 
-static void handle_command_dictionary(NSDictionary *command) {
+static void handle_command_dictionary(NSDictionary *command, bool authenticated) {
     NSString *type = command[@"type"];
     if (![type isKindOfClass:[NSString class]]) return;
 
@@ -5049,6 +5351,16 @@ static void handle_command_dictionary(NSDictionary *command) {
             g_modes_state = [params copy];
             printf("[CONTROL] modesChanged state updated: %s\n",
                    g_modes_state.description.UTF8String);
+        }
+    } else if ([type isEqualToString:@"requestUI"]) {
+        NSDictionary *params = command[@"params"];
+        if (params && ![params isKindOfClass:[NSDictionary class]]) return;
+        id url = params[@"url"];
+        if ([url isEqual:@"videoplayback:"]) {
+            if (atomic_load(&g_car_video_negotiated)) car_video_request_ui();
+        } else if (SHOWCASE_MIRROR_BENCH && authenticated &&
+                   (!url || [url isEqual:@""])) {
+            app_send_status(STATUS_HOST_UI_REQUESTED);
         }
     } else if ([type isEqualToString:@"disableBluetooth"]) {
         const uint8_t request = 1;
@@ -5078,8 +5390,12 @@ static bool process_event_command_frame(const uint8_t *bytes, size_t length) {
                                       freeWhenDone:NO];
         id object = [NSPropertyListSerialization
             propertyListWithData:data options:0 format:NULL error:NULL];
-        if ([object isKindOfClass:[NSDictionary class]])
-            handle_command_dictionary(object);
+        if ([object isKindOfClass:[NSDictionary class]]) {
+            if (request.appleStreamID)
+                car_video_forward_command(request.appleStreamID, object);
+            else
+                handle_command_dictionary(object, true);
+        }
     }
 
     char response[160];
@@ -5166,8 +5482,14 @@ static void handle_post_generic(int sock, const HTTPReq *r) {
                 propertyListWithData:d options:0 format:NULL error:NULL];
             if (obj) {
                 if (strstr(r->path, "/command") &&
-                    [obj isKindOfClass:[NSDictionary class]])
-                    handle_command_dictionary(obj);
+                    [obj isKindOfClass:[NSDictionary class]]) {
+                    if (r->appleStreamID) {
+                        if (control_is_encrypted(sock))
+                            car_video_forward_command(r->appleStreamID, obj);
+                    } else {
+                        handle_command_dictionary(obj, control_is_encrypted(sock));
+                    }
+                }
             }
         }
     }

@@ -18,6 +18,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 #import <Security/Security.h>
+#import "video_in_car.h"
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -282,6 +283,7 @@ static void ip_log_open(void) {
 #define STATUS_PAIR_SETUP_STARTED   0x05
 #define STATUS_AUTH_COMPLETE        0x06
 #define STATUS_SESSION_SETUP        0x07
+#define STATUS_HOST_UI_REQUESTED    0x08
 
 #define TOUCH_DOWN  0
 #define TOUCH_MOVE  1
@@ -2726,9 +2728,17 @@ static OSStatus carplay_aac_input_callback(
 
 /* Full-screen pause-menu scrim. It consumes ordinary touches so CarPlay
  * receives no input until another three-finger tap dismisses it. */
-@interface ControlsOverlayView : UIView
+@interface ControlsOverlayView : UIView <UIGestureRecognizerDelegate>
 @end
 @implementation ControlsOverlayView
+#if SHOWCASE_MIRROR_BENCH
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)recognizer shouldReceiveTouch:(UITouch *)touch {
+    for (UIView *view = touch.view; view && view != self; view = view.superview) {
+        if ([view isKindOfClass:UIControl.class]) return NO;
+    }
+    return YES;
+}
+#endif
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {}
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {}
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {}
@@ -3312,10 +3322,28 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
  * ═══════════════════════════════════════════════════════════════ */
 
 
+@interface CarVideoView : UIView
+@end
+
+@implementation CarVideoView
++ (Class)layerClass { return [AVPlayerLayer class]; }
+@end
+
+#if SHOWCASE_MIRROR_BENCH
+#import "screen_mirror_receiver.h"
+#endif
+
 @interface AppDelegate : UIResponder <UIApplicationDelegate>
 @property (nonatomic, strong) UIWindow *window;
 @property (nonatomic, strong) RootViewController *vc;
 @property (nonatomic, strong) VideoView *videoView;
+#if SHOWCASE_MIRROR_BENCH
+@property (nonatomic, weak) ShowcaseMirrorReceiver *screenMirror;
+#endif
+@property (nonatomic, strong) AVPlayer *carVideoPlayer;
+@property (nonatomic, strong) UIView *carVideoOverlay;
+@property (nonatomic, copy) NSString *carVideoItemID;
+@property (nonatomic) uint32_t carVideoStreamID;
 @property (nonatomic, strong)
     NSMutableDictionary<NSNumber *, CarPlayAudioPlayer *> *audioPlayers;
 
@@ -3677,7 +3705,230 @@ static pid_t reusable_baa_broker(void) {
     });
 }
 
+static void send_car_video_reply(uint32_t streamID, NSDictionary *message) {
+    if (!streamID) return;
+    NSData *body = car_video_encode(@{@"streamID": @(streamID), @"message": message});
+    if (body.length && body.length <= CAR_VIDEO_MAX_MESSAGE)
+        send_ipc_payload(MSG_CAR_VIDEO_REPLY, body.bytes, (uint32_t)body.length);
+}
+
+static NSDictionary *car_video_time(CMTime time) {
+    if (!CMTIME_IS_NUMERIC(time)) return nil;
+    return @{@"value": @(time.value), @"timescale": @(time.timescale),
+             @"flags": @(time.flags), @"epoch": @(time.epoch)};
+}
+
+static NSArray *car_video_ranges(NSArray<NSValue *> *ranges) {
+    NSMutableArray *result = [NSMutableArray arrayWithCapacity:ranges.count];
+    for (NSValue *value in ranges) {
+        CMTimeRange range = value.CMTimeRangeValue;
+        NSDictionary *start = car_video_time(range.start);
+        NSDictionary *duration = car_video_time(range.duration);
+        if (start && duration) [result addObject:@{@"start": start, @"duration": duration}];
+    }
+    return result;
+}
+
+static double car_video_seconds(id value) {
+    if (![value isKindOfClass:[NSDictionary class]]) return NAN;
+    NSNumber *ticks = value[@"value"];
+    NSNumber *scale = value[@"timescale"];
+    if (![ticks isKindOfClass:[NSNumber class]] ||
+        ![scale isKindOfClass:[NSNumber class]] || scale.doubleValue <= 0) return NAN;
+    return ticks.doubleValue / scale.doubleValue;
+}
+
+static void car_video_seek(AVPlayer *player, double seconds) {
+    if (!isfinite(seconds) || seconds < 0) return;
+    CMTime time = CMTimeMakeWithSeconds(seconds, 1000);
+    if (CMTIME_IS_NUMERIC(time)) [player seekToTime:time];
+}
+
+static char carVideoItemStatusContext;
+
+- (void)clearCarVideo {
+    AVPlayerItem *item = self.carVideoPlayer.currentItem;
+    if (item) {
+        [[NSNotificationCenter defaultCenter] removeObserver:self name:nil object:item];
+        [item removeObserver:self forKeyPath:@"status" context:&carVideoItemStatusContext];
+    }
+    [self.carVideoPlayer pause];
+    [self.carVideoPlayer replaceCurrentItemWithPlayerItem:nil];
+    [self.carVideoOverlay removeFromSuperview];
+    self.carVideoOverlay = nil;
+    self.carVideoPlayer = nil;
+    self.carVideoItemID = nil;
+    self.carVideoStreamID = 0;
+}
+
+- (void)dismissCarVideo {
+    if (self.carVideoStreamID) {
+        send_car_video_reply(self.carVideoStreamID,
+            @{@"type": @"playbackState", @"name": @"paused"});
+    }
+    [self clearCarVideo];
+}
+
+- (void)failCarVideoOnStream:(uint32_t)streamID item:(NSString *)itemID {
+    NSMutableDictionary *message = [@{@"type": @"error",
+        @"error": @{@"domain": @"", @"code": @(-12927)}} mutableCopy];
+    if (itemID) message[@"uuid"] = itemID;
+    send_car_video_reply(streamID, message);
+    [self clearCarVideo];
+}
+
+- (void)carVideoDidEnd:(NSNotification *)notification {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (notification.object != self.carVideoPlayer.currentItem) return;
+        if ([notification.name isEqualToString:AVPlayerItemFailedToPlayToEndTimeNotification])
+            [self failCarVideoOnStream:self.carVideoStreamID item:self.carVideoItemID];
+        else
+            [self dismissCarVideo];
+    });
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
+                        change:(NSDictionary *)change context:(void *)context {
+    if (context != &carVideoItemStatusContext) {
+        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+        return;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        AVPlayerItem *item = self.carVideoPlayer.currentItem;
+        if (item == object && item.status == AVPlayerItemStatusFailed)
+            [self failCarVideoOnStream:self.carVideoStreamID item:self.carVideoItemID];
+    });
+}
+
+- (void)showCarVideo {
+    UIView *content = [self rootContentView];
+    if (!self.carVideoPlayer || self.carVideoOverlay || !content) return;
+    UIView *overlay = [[CarVideoView alloc] initWithFrame:content.bounds];
+    overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    overlay.backgroundColor = UIColor.blackColor;
+    AVPlayerLayer *layer = (AVPlayerLayer *)overlay.layer;
+    layer.player = self.carVideoPlayer;
+    layer.videoGravity = AVLayerVideoGravityResizeAspect;
+    UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
+    close.frame = CGRectMake(overlay.bounds.size.width - 64, 12, 48, 48);
+    close.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    close.tintColor = UIColor.whiteColor;
+    close.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
+    close.layer.cornerRadius = 24;
+    close.titleLabel.font = [UIFont systemFontOfSize:28];
+    [close setTitle:@"×" forState:UIControlStateNormal];
+    close.accessibilityLabel = L(@"Close");
+    [close addTarget:self action:@selector(dismissCarVideo) forControlEvents:UIControlEventTouchUpInside];
+    [overlay addSubview:close];
+    [content addSubview:overlay];
+    self.carVideoOverlay = overlay;
+}
+
+- (void)handleCarVideoPacket:(NSDictionary *)packet {
+    NSNumber *number = packet[@"streamID"];
+    if (![number isKindOfClass:[NSNumber class]]) return;
+    uint32_t streamID = number.unsignedIntValue;
+    NSDictionary *message = packet[@"message"];
+    if (!message) {
+        if (streamID == 0 || streamID == self.carVideoStreamID) [self clearCarVideo];
+        return;
+    }
+    if (![message isKindOfClass:[NSDictionary class]] || streamID < 3) return;
+    if (self.state != StateActive ||
+        [UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
+    NSString *type = message[@"type"];
+    if (![type isKindOfClass:[NSString class]]) return;
+    if ([type isEqualToString:@"insertPlayQueueItem"]) {
+        NSDictionary *item = message[@"item"];
+        if (![item isKindOfClass:[NSDictionary class]]) return;
+        NSString *location = item[@"Content-Location"];
+        NSString *itemID = [item[@"uuid"] isKindOfClass:[NSString class]] ? item[@"uuid"] : nil;
+        NSURL *url = [location isKindOfClass:[NSString class]] ? [NSURL URLWithString:location] : nil;
+        NSString *scheme = url.scheme.lowercaseString;
+        if ((![scheme isEqualToString:@"https"] && ![scheme isEqualToString:@"http"]) ||
+            !url.host.length || url.user || url.password) {
+            [self failCarVideoOnStream:streamID item:itemID];
+            return;
+        }
+        [self clearCarVideo];
+        self.carVideoPlayer = [AVPlayer playerWithURL:url];
+        self.carVideoStreamID = streamID;
+        self.carVideoItemID = itemID;
+        AVPlayerItem *playerItem = self.carVideoPlayer.currentItem;
+        [playerItem addObserver:self forKeyPath:@"status"
+                       options:NSKeyValueObservingOptionInitial context:&carVideoItemStatusContext];
+        NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+        [center addObserver:self selector:@selector(carVideoDidEnd:)
+                       name:AVPlayerItemDidPlayToEndTimeNotification object:playerItem];
+        [center addObserver:self selector:@selector(carVideoDidEnd:)
+                       name:AVPlayerItemFailedToPlayToEndTimeNotification object:playerItem];
+        NSNumber *start = item[@"Start-Position-Seconds"];
+        double seconds = [start isKindOfClass:[NSNumber class]] ?
+            start.doubleValue : car_video_seconds(item[@"Start-Position"]);
+        if (seconds > 0) car_video_seek(self.carVideoPlayer, seconds);
+        return;
+    }
+    if ([type isEqualToString:@"requestUI"]) {
+        [self showCarVideo];
+        return;
+    }
+    if ([type isEqualToString:@"setRate"]) {
+        NSNumber *rate = message[@"rate"];
+        if (![rate isKindOfClass:[NSNumber class]] || !self.carVideoPlayer) return;
+        if (rate.doubleValue > 0) {
+            [self showCarVideo];
+            [self.carVideoPlayer play];
+        } else {
+            [self.carVideoPlayer pause];
+        }
+        return;
+    }
+    if ([type isEqualToString:@"stop"] || [type isEqualToString:@"removePlayQueueItem"]) {
+        [self clearCarVideo];
+        return;
+    }
+    BOOL seek = [type isEqualToString:@"seek"];
+    if (seek) car_video_seek(self.carVideoPlayer, car_video_seconds(message[@"time"]));
+    if (![message[@"kind"] isEqual:@"request"]) return;
+    NSMutableDictionary *reply = [@{@"kind": @"response", @"type": type} mutableCopy];
+    reply[@"messageID"] = message[@"messageID"];
+    AVPlayerItem *item = self.carVideoPlayer.currentItem;
+    if ([type isEqualToString:@"playbackInfo"]) {
+        BOOL ready = item.status == AVPlayerItemStatusReadyToPlay;
+        BOOL playing = self.carVideoPlayer.timeControlStatus == AVPlayerTimeControlStatusPlaying;
+        NSMutableDictionary *info = [@{
+            @"item": self.carVideoItemID ? @{@"uuid": self.carVideoItemID} : @{},
+            @"rate": @(self.carVideoPlayer.rate), @"readyToPlay": @(ready),
+            @"playbackLikelyToKeepUp": @(item.playbackLikelyToKeepUp),
+            @"playbackState": !ready ? @"loading" : (playing ? @"playing" : @"paused"),
+            @"interstitialInfo": @{}, @"droppedVideoFrames": @0,
+            @"totalVideoFrames": @0, @"decodedFrameCount": @0
+        } mutableCopy];
+        if (ready) {
+            info[@"position"] = car_video_time(item.currentTime);
+            info[@"duration"] = car_video_time(item.duration);
+            info[@"seekableTimeRanges"] = car_video_ranges(item.seekableTimeRanges);
+            info[@"loadedTimeRanges"] = car_video_ranges(item.loadedTimeRanges);
+        }
+        reply[@"info"] = info;
+    } else if ([type isEqualToString:@"property"]) {
+        id property = message[@"property"];
+        reply[@"key"] = property;
+        if ([property isEqual:@"hasEnabledAudio"]) reply[@"value"] = @YES;
+        if ([property isEqual:@"muted"]) reply[@"value"] = @(self.carVideoPlayer.muted);
+        if ([property isEqual:@"loadedTimeRanges"]) reply[@"value"] = car_video_ranges(item.loadedTimeRanges);
+        if ([property isEqual:@"seekableTimeRanges"]) reply[@"value"] = car_video_ranges(item.seekableTimeRanges);
+    } else if (!seek) {
+        return;
+    }
+    send_car_video_reply(streamID, reply);
+}
+
 - (void)handleBackground {
+#if SHOWCASE_MIRROR_BENCH
+    [self.screenMirror finish];
+#endif
+    [self dismissCarVideo];
     if (self.state != StateIdle && self.state != StateStopping) {
         ip_log("backgrounded — preserving CarPlay session");
         g_video_suspended = 1;
@@ -3858,9 +4109,31 @@ static pid_t reusable_baa_broker(void) {
     self.controlsOverlay.hidden = YES;
     [content addSubview:self.controlsOverlay];
 
+#if SHOWCASE_MIRROR_BENCH
+    UIButton *mirror = [UIButton buttonWithType:UIButtonTypeSystem];
+    [mirror setTitle:@"iPhone Ekranını Yansıt" forState:UIControlStateNormal];
+    mirror.titleLabel.font = [UIFont systemFontOfSize:20 weight:UIFontWeightSemibold];
+    mirror.tintColor = UIColor.whiteColor;
+    mirror.backgroundColor = [UIColor colorWithWhite:0 alpha:0.76];
+    mirror.layer.cornerRadius = 12;
+    mirror.translatesAutoresizingMaskIntoConstraints = NO;
+    [mirror addTarget:self action:@selector(openScreenMirror) forControlEvents:UIControlEventTouchUpInside];
+    [self.controlsOverlay addSubview:mirror];
+    [NSLayoutConstraint activateConstraints:@[
+        [mirror.centerXAnchor constraintEqualToAnchor:self.controlsOverlay.centerXAnchor],
+        [mirror.centerYAnchor constraintEqualToAnchor:self.controlsOverlay.centerYAnchor],
+        [mirror.widthAnchor constraintEqualToConstant:240],
+        [mirror.heightAnchor constraintEqualToConstant:54]
+    ]];
+#endif
+
     /* Any tap on the dimmed screen returns to CarPlay. */
-    [self.controlsOverlay addGestureRecognizer:[[UITapGestureRecognizer alloc]
-        initWithTarget:self action:@selector(hideChrome)]];
+    UITapGestureRecognizer *dismissChrome = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(hideChrome)];
+#if SHOWCASE_MIRROR_BENCH
+    dismissChrome.delegate = self.controlsOverlay;
+#endif
+    [self.controlsOverlay addGestureRecognizer:dismissChrome];
 
     /* Close button, top right, only while CarPlay runs */
     self.closeButton = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -4178,6 +4451,25 @@ static pid_t reusable_baa_broker(void) {
     }
     [self showChrome];
 }
+
+#if SHOWCASE_MIRROR_BENCH
+- (void)openScreenMirror {
+    if (self.state != StateActive || self.vc.presentedViewController ||
+        UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
+    [self hideChrome];
+    [self dismissCarVideo];
+    ShowcaseMirrorReceiver *receiver = [ShowcaseMirrorReceiver new];
+    receiver.modalPresentationStyle = UIModalPresentationFullScreen;
+    __weak typeof(self) weakSelf = self;
+    receiver.onReturnToCarPlay = ^{
+        if (weakSelf.state == StateActive &&
+            UIApplication.sharedApplication.applicationState == UIApplicationStateActive)
+            send_app_visibility(1);
+    };
+    self.screenMirror = receiver;
+    [self.vc presentViewController:receiver animated:YES completion:nil];
+}
+#endif
 
 - (void)showChrome {
     if (self.state != StateActive || self.chromeVisible) return;
@@ -4945,6 +5237,10 @@ static void wake_ipc_listener(void) {
         return;
     }
     if (self.state == StateStopping || self.state == StateIdle) return;
+#if SHOWCASE_MIRROR_BENCH
+    [self.screenMirror finish];
+#endif
+    [self clearCarVideo];
     @synchronized (self) {
         __atomic_store_n(&g_flow_cancelled, true, __ATOMIC_RELEASE);
         __atomic_add_fetch(&g_flow_epoch, 1, __ATOMIC_ACQ_REL);
@@ -6234,6 +6530,14 @@ static bool read_ipc_frame(int fd, uint8_t *type, uint32_t *length, uint8_t **bo
                 }
             }
             free(payload);
+        } else if (type == MSG_CAR_VIDEO_COMMAND) {
+            NSDictionary *packet = car_video_decode([NSData dataWithBytesNoCopy:payload
+                length:len freeWhenDone:YES]);
+            uint32_t epoch = flow_epoch();
+            if (packet) dispatch_async(dispatch_get_main_queue(), ^{
+                if (epoch == flow_epoch() && !flow_cancelled())
+                    [self handleCarVideoPacket:packet];
+            });
         } else if (type == MSG_BT_HANDOFF) {
             ip_log("[HANDOFF] services requested app-owned Bluetooth teardown");
             [self completeBluetoothHandoff];
@@ -6266,6 +6570,16 @@ static bool read_ipc_frame(int fd, uint8_t *type, uint32_t *length, uint8_t **bo
                     case STATUS_STREAM_SETUP:
                         [self completeConnectStep:ConnectStepSession];
                         break;
+#if SHOWCASE_MIRROR_BENCH
+                    case STATUS_HOST_UI_REQUESTED: {
+                        uint32_t epoch = flow_epoch();
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            if (epoch == flow_epoch() && !flow_cancelled())
+                                [self openScreenMirror];
+                        });
+                        break;
+                    }
+#endif
                 }
             }
             free(payload);
@@ -6273,6 +6587,10 @@ static bool read_ipc_frame(int fd, uint8_t *type, uint32_t *length, uint8_t **bo
             free(payload);
         }
     }
+    uint32_t epoch = flow_epoch();
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (epoch == flow_epoch()) [self clearCarVideo];
+    });
     if (fmtDesc) CFRelease(fmtDesc);
     for (CarPlayAudioPlayer *player in self.audioPlayers.allValues) {
         [player stop];

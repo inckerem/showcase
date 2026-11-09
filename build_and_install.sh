@@ -83,6 +83,7 @@ scp_cmd "$SRC/Showcase.m" \
         "$SRC/carplay_pair.c" \
         "$SRC/carplay_pair.h" \
         "$SRC/baa_broker.h" \
+        "$SRC/video_in_car.h" \
         "$STAGED/Info.plist" \
         "$SRC/ent_app.xml" \
         "$SRC/ent_bt.xml" \

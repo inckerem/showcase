@@ -1010,23 +1010,32 @@ int pair_derive_event_keys(pair_ctx_t *ctx, uint8_t readKey[32], uint8_t writeKe
     return 0;
 }
 
-int pair_derive_stream_key(pair_ctx_t *ctx, uint64_t streamConnectionID, uint8_t outKey[32]) {
+static int derive_data_stream_key(pair_ctx_t *ctx, uint64_t seed,
+                                  const char *label, uint8_t outKey[32]) {
     if (!ctx || ctx->verify_state != 4) {
         printf("[PAIR] ERROR: pair-verify not complete, cannot derive stream key\n");
         return -1;
     }
-    /* Salt = "DataStream-Salt" + decimal streamConnectionID
-     * Info = "DataStream-Output-Encryption-Key" (Output from iPhone = what we receive)
-     * Reference: _GetStreamSecurityKeys in AirPlayReceiverSession.c */
     char saltBuf[64];
     int saltLen = snprintf(saltBuf, sizeof(saltBuf), "DataStream-Salt%llu",
-                           (unsigned long long)streamConnectionID);
+                           (unsigned long long)seed);
     hkdf_sha512(ctx->verify_shared, 32,
                 (const unsigned char *)saltBuf, saltLen,
-                (const unsigned char *)"DataStream-Output-Encryption-Key", 32,
+                (const unsigned char *)label, strlen(label),
                 outKey, 32);
-    printf("[PAIR] Stream key derived (connID=%llu)\n", (unsigned long long)streamConnectionID);
     return 0;
+}
+
+int pair_derive_stream_key(pair_ctx_t *ctx, uint64_t streamConnectionID, uint8_t outKey[32]) {
+    return derive_data_stream_key(ctx, streamConnectionID,
+                                 "DataStream-Output-Encryption-Key", outKey);
+}
+
+int pair_derive_data_stream_keys(pair_ctx_t *ctx, uint64_t seed,
+                                 uint8_t readKey[32], uint8_t writeKey[32]) {
+    if (pair_derive_stream_key(ctx, seed, readKey) != 0) return -1;
+    return derive_data_stream_key(ctx, seed,
+                                 "DataStream-Input-Encryption-Key", writeKey);
 }
 
 void pair_ctx_destroy(pair_ctx_t *ctx) {
