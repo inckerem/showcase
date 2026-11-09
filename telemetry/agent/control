@@ -1,0 +1,14 @@
+Package: tr.net.kcs.showcase.diagnostics
+Name: Showcase Uzaktan Tanilama
+Version: 0.1-1
+Architecture: iphoneos-arm
+Section: Utilities
+Maintainer: KCS <info@kcs.net.tr>
+Depends: firmware (>= 12.0), firmware (<< 13.0)
+Icon: https://kcs.net.tr/repo/icons/showcase.png
+Description: KCS'ye otomatik Showcase hata raporu gonderir.
+ Kurulum otomatik gonderimi etkinlestirir. Showcase acilmasa da calisir.
+ Her 3 dakikada kontrol, yeni hata varsa aktarim; aksi halde 30 dakikada durum.
+ Yalniz teknik cokme ozeti, cihaz modeli, iOS, surum ve bos alan gonderilir.
+ Goruntu, ses, ekran kaydi ve ag sifresi toplanmaz. Kayitlar en fazla 14 gun saklanir.
+ Gonderimi durdurmak icin bu paketi kaldirin. Ana uygulamayi degistirmez.

@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+jobs=$(/bin/launchctl list)
+case "$jobs" in
+  *tr.net.kcs.showcase.diagnostics*) /bin/launchctl unload /Library/LaunchDaemons/tr.net.kcs.showcase.diagnostics.plist ;;
+esac
