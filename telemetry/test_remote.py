@@ -1,5 +1,6 @@
 """Run with Python and a PHP CLI: test_remote.py /path/to/php /path/to/api."""
 import json
+import io
 import os
 from pathlib import Path
 import shutil
@@ -7,6 +8,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import tarfile
 import time
 import urllib.request
 import urllib.error
@@ -17,16 +19,18 @@ with tempfile.TemporaryDirectory(prefix='showcase-api-test-') as temp:
     api.mkdir(parents=True)
     storage = root / 'private/showcase/remote'
     storage.mkdir(parents=True)
-    for name in ('common.php', 'diagnostics.php'):
+    logs = storage.parent / 'logs'
+    logs.mkdir()
+    for name in ('common.php', 'diagnostics.php', 'logs.php'):
         shutil.copy(Path(sys.argv[2]) / name, api / name)
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
     server = subprocess.Popen([sys.argv[1], '-S', f'127.0.0.1:{port}', '-t', str(root / 'www')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     url = f'http://127.0.0.1:{port}/repo/api/diagnostics.php'
-    def send(payload=None, method='POST', content_type='application/json'):
+    def send(payload=None, method='POST', content_type='application/json', endpoint=url):
         body = json.dumps(payload).encode() if isinstance(payload, dict) else payload
-        req = urllib.request.Request(url, data=body, method=method, headers={'Content-Type': content_type})
+        req = urllib.request.Request(endpoint, data=body, method=method, headers={'Content-Type': content_type})
         try:
             with urllib.request.urlopen(req, timeout=3) as response:
                 return response.status
@@ -62,6 +66,18 @@ with tempfile.TemporaryDirectory(prefix='showcase-api-test-') as temp:
         os.utime(latest, (time.time()-181, time.time()-181))
         assert send(payload) == 201
         assert not stale.exists()
+        upload = url.replace('diagnostics.php', 'logs.php')
+        assert send(b'x', content_type='application/x-tar', endpoint=upload) == 400
+        assert not list(logs.glob('*.tar'))
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode='w', format=tarfile.USTAR_FORMAT) as tar:
+            info = tarfile.TarInfo('smoke.txt')
+            info.size = 4
+            tar.addfile(info, io.BytesIO(b'test'))
+        assert send(archive.getvalue(), content_type='application/x-tar', endpoint=upload) == 201
+        stored, = logs.glob('*.tar')
+        assert stored.read_bytes() == archive.getvalue()
+        assert stored.stat().st_mode & 0o777 == 0o600
         print('PASS: HTTP ingestion, validation, size limit, rate limit, private storage, retention, heartbeat preserves crash')
     finally:
         server.terminate()
