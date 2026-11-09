@@ -13,8 +13,18 @@ int main(void) { @autoreleasepool {
     NSMutableString *large = [NSMutableString string];
     for (int i = 0; i < 240; i++) [large appendFormat:@"Reason: %@\n", [@"界" stringByPaddingToLength:500 withString:@"界" startingAtIndex:0]];
     assert([technicalExcerpt(large) lengthOfBytesUsingEncoding:NSUTF8StringEncoding] <= 32768);
+    NSString *prefix = [@"Reason: " stringByPaddingToLength:511 withString:@"x" startingAtIndex:0];
+    NSString *truncated = technicalExcerpt([prefix stringByAppendingString:@"🚗"]);
+    assert([truncated isEqual:prefix]);
+    assert([NSJSONSerialization dataWithJSONObject:@{@"excerpt": truncated} options:0 error:NULL]);
     NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
-    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    assert(prepareStateDirectory(dir));
+    struct stat info;
+    assert(lstat(dir.fileSystemRepresentation, &info) == 0 && (info.st_mode & 0777) == 0700);
+    assert(prepareStateDirectory(dir));
+    NSString *dirLink = [dir stringByAppendingPathComponent:@"dir-link"];
+    assert(symlink(dir.fileSystemRepresentation, dirLink.fileSystemRepresentation) == 0);
+    assert(!prepareStateDirectory(dirLink));
     for (int i = 0; i < 130; i++) {
         NSString *name = [NSString stringWithFormat:@"%@-%03d.crash", i == 129 ? @"Showcase" : @"showcase-powerd", i];
         NSString *path = [dir stringByAppendingPathComponent:name];
@@ -33,5 +43,5 @@ int main(void) { @autoreleasepool {
     assert(symlink(temp.fileSystemRepresentation, link.fileSystemRepresentation) == 0);
     assert(boundedRead(link) == nil);
     unlink(link.fileSystemRepresentation); unlink(temp.fileSystemRepresentation);
-    puts("PASS: newest crash priority across processes, bounded candidate cache, UTF-8 byte cap, technical filtering, symlink rejection");
+    puts("PASS: crash priority, bounded cache, Unicode truncation, private state and symlink rejection");
 } }

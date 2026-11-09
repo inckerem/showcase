@@ -1,11 +1,20 @@
 #import <Foundation/Foundation.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 
 // Runs as mobile, once every three minutes, then exits. No injected code.
 static NSString *const stateDir = @"/var/mobile/Library/ShowcaseRemoteDiagnostics";
+static BOOL prepareStateDirectory(NSString *path) {
+    // The mobile worker creates and validates its own state directory.
+    const char *directory = path.fileSystemRepresentation;
+    if (mkdir(directory, 0700) != 0 && errno != EEXIST) return NO;
+    struct stat st;
+    return lstat(directory, &st) == 0 && S_ISDIR(st.st_mode) &&
+           st.st_uid == geteuid() && !(st.st_mode & 0077);
+}
 static BOOL relevant(NSString *name) {
     for (NSString *prefix in @[@"Showcase-", @"Showcase_", @"carplay_bt-", @"carplay_services-", @"showcase-powerd-"])
         if ([name hasPrefix:prefix]) return YES;
@@ -39,7 +48,10 @@ static NSString *technicalExcerpt(NSString *text) {
         if ([line hasPrefix:@"Thread "] && [line containsString:@"Crashed:"]) keep = YES;
         if (!keep) continue;
         // No raw logs, user messages, network names, or crash identifiers.
-        if (line.length > 512) line = [line substringToIndex:512];
+        if (line.length > 512) {
+            NSRange boundary = [line rangeOfComposedCharacterSequenceAtIndex:512];
+            line = [line substringToIndex:boundary.location];
+        }
         NSUInteger lineBytes = [line lengthOfBytesUsingEncoding:NSUTF8StringEncoding] + 1;
         if (bytes + lineBytes > 32768) break;
         bytes += lineBytes;
@@ -63,6 +75,7 @@ static NSData *boundedRead(NSString *path) {
 #ifndef AGENT_TEST
 int main(void) { @autoreleasepool {
     NSFileManager *fm = NSFileManager.defaultManager;
+    if (!prepareStateDirectory(stateDir)) return 2;
     NSString *statePath = [stateDir stringByAppendingPathComponent:@"state.plist"];
     // An optional local disable marker also works when Showcase cannot launch.
     if ([fm fileExistsAtPath:[stateDir stringByAppendingPathComponent:@"disabled"]]) return 0;
@@ -105,7 +118,7 @@ int main(void) { @autoreleasepool {
     NSDictionary *disk = [fm attributesOfFileSystemForPath:@"/var/mobile" error:nil];
     NSDictionary *payload = @{@"schema": @1, @"installation": install,
         @"model": @(machine.machine), @"os": NSProcessInfo.processInfo.operatingSystemVersionString,
-        @"version": info[@"CFBundleShortVersionString"] ?: @"unknown",
+        @"version": info[@"ShowcasePackageVersion"] ?: info[@"CFBundleShortVersionString"] ?: @"unknown",
         @"freeMB": @([disk[NSFileSystemFreeSize] unsignedLongLongValue]/1048576), @"reports": reports};
     NSData *body = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
     if (!body || body.length > 262144) return 3;

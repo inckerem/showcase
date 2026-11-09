@@ -11,8 +11,9 @@ cp "$HERE/tr.net.kcs.showcase.diagnostics.plist" "$OUT/root/Library/LaunchDaemon
 cp "$HERE/"{control,postinst,prerm} "$OUT/control/"
 chmod 0755 "$OUT/control/"{postinst,prerm} "$OUT/root/usr/libexec/showcase-diagnostics"
 chmod 0644 "$OUT/control/control" "$OUT/root/Library/LaunchDaemons/"*.plist
-(cd "$OUT/control" && COPYFILE_DISABLE=1 tar --format ustar --no-xattrs -czf "$OUT/control.tar.gz" .)
-(cd "$OUT/root" && COPYFILE_DISABLE=1 tar --format ustar --no-xattrs -czf "$OUT/data.tar.gz" .)
+tar_flags=(--format ustar --no-xattrs --uid 0 --gid 0 --uname root --gname wheel)
+(cd "$OUT/control" && COPYFILE_DISABLE=1 tar "${tar_flags[@]}" -czf "$OUT/control.tar.gz" .)
+(cd "$OUT/root" && COPYFILE_DISABLE=1 tar "${tar_flags[@]}" -czf "$OUT/data.tar.gz" .)
 printf '2.0\n' > "$OUT/debian-binary"
 VERSION="$(awk '/^Version:/ {print $2}' "$HERE/control")"
 DEB="$OUT/tr.net.kcs.showcase.diagnostics_${VERSION}_iphoneos-arm.deb"

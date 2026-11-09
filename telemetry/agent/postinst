@@ -1,10 +1,8 @@
 #!/bin/sh
 set -e
-dir=/var/mobile/Library/ShowcaseRemoteDiagnostics
-if [ -L "$dir" ]; then echo 'Tanilama dizini sembolik bag olamaz.' >&2; exit 1; fi
-mkdir -p "$dir"
-chown mobile:mobile "$dir"
-chmod 0700 "$dir"
-/bin/launchctl unload /Library/LaunchDaemons/tr.net.kcs.showcase.diagnostics.plist 2>/dev/null || true
-/bin/launchctl load /Library/LaunchDaemons/tr.net.kcs.showcase.diagnostics.plist
+label=tr.net.kcs.showcase.diagnostics
+plist="/Library/LaunchDaemons/$label.plist"
+/bin/launchctl unload "$plist" 2>/dev/null || true
+/bin/launchctl load "$plist"
+/bin/launchctl list "$label" >/dev/null
 echo 'KCS uzaktan tanilama etkin. Kapatmak icin bu paketi kaldirin.'
