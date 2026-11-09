@@ -11,8 +11,25 @@ static BOOL relevant(NSString *name) {
         if ([name hasPrefix:prefix]) return YES;
     return NO;
 }
+static NSArray<NSString *> *recentCrashNames(NSString *directory) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSMutableDictionary<NSString *, NSDate *> *dates = [NSMutableDictionary dictionary];
+    for (NSString *name in [fm contentsOfDirectoryAtPath:directory error:nil]) {
+        if (!relevant(name) || (![@"ips" isEqual:name.pathExtension] && ![@"crash" isEqual:name.pathExtension])) continue;
+        NSDictionary *attrs = [fm attributesOfItemAtPath:[directory stringByAppendingPathComponent:name] error:nil];
+        NSDate *date = attrs[NSFileModificationDate];
+        if ([attrs[NSFileType] isEqual:NSFileTypeRegular] && date && -date.timeIntervalSinceNow <= 7*86400) dates[name] = date;
+    }
+    NSArray *names = [dates.allKeys sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        NSComparisonResult order = [dates[b] compare:dates[a]];
+        return order == NSOrderedSame ? [a compare:b] : order;
+    }];
+    // Bound the candidate set to the same size as the acknowledgement cache.
+    return names.count > 128 ? [names subarrayWithRange:NSMakeRange(0, 128)] : names;
+}
 static NSString *technicalExcerpt(NSString *text) {
     NSMutableArray *out = [NSMutableArray array];
+    NSUInteger bytes = 0;
     NSRegularExpression *frame = [NSRegularExpression regularExpressionWithPattern:@"^[0-9]+[ \\t]+[A-Za-z0-9_.+-]+[ \\t]+0x[0-9a-fA-F]+" options:0 error:nil];
     NSArray *headers = @[@"Process:", @"Identifier:", @"Version:", @"Code Type:", @"OS Version:", @"Exception Type:", @"Exception Codes:", @"Exception Subtype:", @"Termination Reason:", @"Termination Description:", @"Triggered by Thread:", @"Crashed Thread:", @"Library not loaded:", @"Referenced from:", @"Reason:", @"Dyld Error Message:", @"Application Specific Information:", @"Last Exception Backtrace:"];
     for (NSString *raw in [text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
@@ -23,6 +40,9 @@ static NSString *technicalExcerpt(NSString *text) {
         if (!keep) continue;
         // No raw logs, user messages, network names, or crash identifiers.
         if (line.length > 512) line = [line substringToIndex:512];
+        NSUInteger lineBytes = [line lengthOfBytesUsingEncoding:NSUTF8StringEncoding] + 1;
+        if (bytes + lineBytes > 32768) break;
+        bytes += lineBytes;
         [out addObject:line];
         if (out.count >= 240) break;
     }
@@ -55,9 +75,8 @@ int main(void) { @autoreleasepool {
     NSMutableDictionary *nextSeen = [NSMutableDictionary dictionary];
     NSMutableArray *reports = [NSMutableArray array];
     NSString *crashDir = @"/var/mobile/Library/Logs/CrashReporter";
-    NSArray *names = [[fm contentsOfDirectoryAtPath:crashDir error:nil] sortedArrayUsingSelector:@selector(compare:)];
-    // Reverse date-bearing filenames: send the newest failures first.
-    for (NSString *name in names.reverseObjectEnumerator) {
+    NSArray *names = recentCrashNames(crashDir);
+    for (NSString *name in names) {
         if (!relevant(name) || (![name.pathExtension isEqual:@"ips"] && ![name.pathExtension isEqual:@"crash"])) continue;
         NSString *path = [crashDir stringByAppendingPathComponent:name];
         NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];

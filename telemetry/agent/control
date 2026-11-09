@@ -1,6 +1,6 @@
 Package: tr.net.kcs.showcase.diagnostics
 Name: Showcase Uzaktan Tanilama
-Version: 0.1-1
+Version: 0.1-2
 Architecture: iphoneos-arm
 Section: Utilities
 Maintainer: KCS <info@kcs.net.tr>

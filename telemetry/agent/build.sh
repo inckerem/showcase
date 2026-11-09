@@ -14,7 +14,8 @@ chmod 0644 "$OUT/control/control" "$OUT/root/Library/LaunchDaemons/"*.plist
 (cd "$OUT/control" && COPYFILE_DISABLE=1 tar --format ustar --no-xattrs -czf "$OUT/control.tar.gz" .)
 (cd "$OUT/root" && COPYFILE_DISABLE=1 tar --format ustar --no-xattrs -czf "$OUT/data.tar.gz" .)
 printf '2.0\n' > "$OUT/debian-binary"
-DEB="$OUT/tr.net.kcs.showcase.diagnostics_0.1-1_iphoneos-arm.deb"
+VERSION="$(awk '/^Version:/ {print $2}' "$HERE/control")"
+DEB="$OUT/tr.net.kcs.showcase.diagnostics_${VERSION}_iphoneos-arm.deb"
 rm -f "$DEB"
 (cd "$OUT" && ar -qS "$DEB" debian-binary control.tar.gz data.tar.gz)
 printf '%s\n' "$DEB"

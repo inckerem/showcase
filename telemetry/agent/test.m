@@ -10,6 +10,22 @@ int main(void) { @autoreleasepool {
     assert(![clean containsString:@"private"]);
     assert([clean containsString:@"image not found"]);
     assert([clean containsString:@"main + 40"]);
+    NSMutableString *large = [NSMutableString string];
+    for (int i = 0; i < 240; i++) [large appendFormat:@"Reason: %@\n", [@"界" stringByPaddingToLength:500 withString:@"界" startingAtIndex:0]];
+    assert([technicalExcerpt(large) lengthOfBytesUsingEncoding:NSUTF8StringEncoding] <= 32768);
+    NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    for (int i = 0; i < 130; i++) {
+        NSString *name = [NSString stringWithFormat:@"%@-%03d.crash", i == 129 ? @"Showcase" : @"showcase-powerd", i];
+        NSString *path = [dir stringByAppendingPathComponent:name];
+        [@"test" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        [NSFileManager.defaultManager setAttributes:@{NSFileModificationDate:[NSDate dateWithTimeIntervalSinceNow:i-130]} ofItemAtPath:path error:nil];
+    }
+    NSArray *recent = recentCrashNames(dir);
+    assert(recent.count == 128);
+    assert([recent.firstObject isEqual:@"Showcase-129.crash"]);
+    assert(![recent containsObject:@"showcase-powerd-000.crash"]);
+    [NSFileManager.defaultManager removeItemAtPath:dir error:nil];
     NSString *temp = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
     [sample writeToFile:temp atomically:YES encoding:NSUTF8StringEncoding error:nil];
     assert(boundedRead(temp).length > 0);
@@ -17,5 +33,5 @@ int main(void) { @autoreleasepool {
     assert(symlink(temp.fileSystemRepresentation, link.fileSystemRepresentation) == 0);
     assert(boundedRead(link) == nil);
     unlink(link.fileSystemRepresentation); unlink(temp.fileSystemRepresentation);
-    puts("PASS: crash selection, technical-only filtering, bounded reads, symlink rejection");
+    puts("PASS: newest crash priority across processes, bounded candidate cache, UTF-8 byte cap, technical filtering, symlink rejection");
 } }
