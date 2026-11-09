@@ -100,6 +100,14 @@ def write_release(repo_root, packages_bytes):
 
 
 def write_index(repo_root):
+    share_source = "sources/share-v1.0-beta2-7.tar.gz"
+    share_deb = "debs/com.rostane.share_1.0~beta2-7_iphoneos-arm.deb"
+    share_note = ""
+    if (repo_root / share_deb).is_file() and (repo_root / share_source).is_file():
+        share_note = f"""<p><strong>Wi-Fi model iPad’de Kişisel Erişim Noktası</strong><br>
+        Cydia’dan <strong>Share</strong> paketini kur. Ardından iPad’de Ayarlar → Kişisel Erişim Noktası bölümünden açıp Showcase’de aynı bağlantı modunu seç.
+        Share, SIM olmadan CarPlay için yerel ağ açar. İnternet paylaşmaz.
+        <a href="https://github.com/amineross/share">Amine Rostane’nin Share projesi</a> · <a href="{share_source}">Bu paketin kaynak kodu</a></p>"""
     html = """<!doctype html>
 <html lang="tr">
 <head>
@@ -176,6 +184,7 @@ def write_index(repo_root):
       <section class="steps"><h2>Kurulum</h2><ol><li>Cydia, Sileo veya Zebra'ya yukarıdaki adresi kaynak olarak ekle.</li>
         <li><strong>Showcase (Rootful)</strong> paketini kur. KCS deposunda şu an rootless veya Taurine paketi yayımlanmıyor.</li>
         <li>Uygulamada Ayarlar → Wi-Fi Kurulumu bölümünden bağlantı şeklini seç.</li></ol>
+        <!-- share -->
         <p>Kullanım verisi paylaşımı varsayılan olarak kapalıdır. Tanılama arşivi yalnız onay verirsen KCS'ye gönderilir. <a href="https://github.com/inckerem/showcase#anonymous-usage">Veri ayrıntıları</a></p></section>
     </main>
     <footer>© Kerem Cloud Services · Özgün Showcase: <a href="https://github.com/amineross/showcase">Amine Rostane</a> · GPL-3.0-or-later · <a href="Release">APT Release</a></footer>
@@ -184,7 +193,7 @@ def write_index(repo_root):
 </body>
 </html>
 """
-    (repo_root / "index.html").write_text(html, encoding="utf-8")
+    (repo_root / "index.html").write_text(html.replace("<!-- share -->", share_note), encoding="utf-8")
 
 
 def main():

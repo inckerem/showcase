@@ -7,6 +7,7 @@
 @property (nonatomic, strong) nw_connection_t peer;
 @property (nonatomic, strong) AVSampleBufferDisplayLayer *display;
 @property (nonatomic, strong) UILabel *status;
+@property (nonatomic, strong) UILabel *staleStatus;
 @property (nonatomic, strong) UIImageView *pairingQR;
 @property (nonatomic, strong) NSTimer *watchdog;
 @property (nonatomic) CFTimeInterval lastPacket;
@@ -31,6 +32,15 @@
     self.status.textColor = UIColor.whiteColor;
     self.status.font = [UIFont systemFontOfSize:21];
     [self.view addSubview:self.status];
+
+    self.staleStatus = [UILabel new];
+    self.staleStatus.text = @"Yeni görüntü karesi bekleniyor…\nSon alınan kare gösteriliyor.";
+    self.staleStatus.textAlignment = NSTextAlignmentCenter;
+    self.staleStatus.numberOfLines = 0;
+    self.staleStatus.textColor = UIColor.whiteColor;
+    self.staleStatus.font = self.status.font;
+    self.staleStatus.hidden = YES;
+    [self.view addSubview:self.staleStatus];
 
     self.pairingQR = [UIImageView new];
     self.pairingQR.contentMode = UIViewContentModeScaleAspectFit;
@@ -63,6 +73,7 @@
     [super viewDidLayoutSubviews];
     self.display.frame = self.view.bounds;
     CGRect area = UIEdgeInsetsInsetRect(self.view.bounds, self.view.safeAreaInsets);
+    self.staleStatus.frame = CGRectInset(area, 20, 60);
     if (self.pairingQR.hidden) {
         self.status.frame = CGRectInset(area, 20, 60);
         return;
@@ -155,6 +166,12 @@
     nw_listener_start(self.listener);
 }
 
+- (void)setVideoStale:(BOOL)stale {
+    if (self.staleStatus.hidden == !stale) return;
+    self.staleStatus.hidden = !stale;
+    self.display.opacity = stale ? 0.25f : 1.0f;
+}
+
 - (void)acceptPeer:(nw_connection_t)peer {
     self.peer = peer;
     self.needsKeyframe = YES;
@@ -163,8 +180,14 @@
     __weak typeof(self) weakSelf = self;
     self.watchdog = [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *timer) {
         ShowcaseMirrorReceiver *receiver = weakSelf;
-        if (receiver && NSProcessInfo.processInfo.systemUptime - receiver.lastPacket > 8.0)
+        if (!receiver.peer) return;
+        CFTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+        if (now - receiver.lastPacket > 8.0) {
             [receiver disconnectPeer];
+        } else if (receiver.status.hidden && now - receiver.lastEnqueue > 8.0) {
+            // Once video has started, heartbeats keep the peer alive but do not refresh the image.
+            [receiver setVideoStale:YES];
+        }
     }];
     nw_connection_set_queue(peer, dispatch_get_main_queue());
     nw_connection_set_state_changed_handler(peer, ^(nw_connection_state_t state, nw_error_t error) {
@@ -190,6 +213,7 @@
         self.format = NULL;
     }
     [self.display flushAndRemoveImage];
+    [self setVideoStale:NO];
     self.status.hidden = NO;
     self.pairingQR.hidden = self.pairingQR.image == nil;
     [self.view setNeedsLayout];
@@ -284,6 +308,7 @@
     [self.display enqueueSampleBuffer:sample];
     self.lastEnqueue = now;
     CFRelease(sample);
+    [self setVideoStale:NO];
     self.status.hidden = YES;
     self.pairingQR.hidden = YES;
     self.needsKeyframe = NO;

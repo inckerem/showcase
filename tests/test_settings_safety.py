@@ -31,7 +31,7 @@ for width, left, right in [(320, 12, 12), (375, 12, 12), (320, 44, 12), (320, 12
     assert title_right <= width - right - 44
     assert title_right > title_left
 
-spawn = source[source.index('static pid_t spawn_daemon('):source.index('/* kill(pid, 0)')]
+spawn = source[source.index('static pid_t spawn_daemon('):source.index('static pid_t check_child(')]
 loop = spawn[spawn.index('    for (int i = 1;'):spawn.index('    ip_log("spawn_daemon: %s"')]
 program = r'''
 #import <Foundation/Foundation.h>

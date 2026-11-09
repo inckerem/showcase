@@ -21,3 +21,8 @@ build/
 
 # Local Wrangler state
 telemetry/.wrangler/
+
+
+# Local video assets and superseded power package draft
+youtube/
+autopower/

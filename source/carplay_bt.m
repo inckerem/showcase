@@ -61,6 +61,7 @@ static const uint8_t kWifiSecurityType = 2;   /* 0=None, 1=WEP, 2=WPA/WPA2 */
 #define BT_READY_PATH "/tmp/showcase_bt_ready"
 #define BT_DOWN_PATH  "/tmp/showcase_bt_down"
 #define BT_ID_PATH    "/tmp/showcase_bt_id"
+#define BT_ID_PERSIST_PATH "/var/mobile/Library/Showcase/bt-id"
 
 #ifndef SHOWCASE_SEND_WIFI_CHANNEL
 #define SHOWCASE_SEND_WIFI_CHANNEL 0
@@ -1415,17 +1416,25 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
                 "%02X:%02X:%02X:%02X:%02X:%02X",
                 local_bd_addr[0], local_bd_addr[1], local_bd_addr[2],
                 local_bd_addr[3], local_bd_addr[4], local_bd_addr[5]);
-            int addressFd = open(
-                BT_ID_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (addressFd >= 0) {
-                ssize_t written = write(
-                    addressFd, address, (size_t)addressLength);
-                close(addressFd);
-                printf("[BT] AirPlay Bluetooth ID %s (%s)\n", address,
-                       written == addressLength ? "published" : "short write");
-            } else {
-                printf("[BT] WARN: could not publish Bluetooth ID: %s\n",
-                       strerror(errno));
+            /* /tmp is emptied at boot, so also keep a persistent copy for
+             * the AirPlay info "bluetoothIDs" identity. Without it the
+             * iPhone treats the accessory as a different, first-time car. */
+            mkdir("/var/mobile/Library/Showcase", 0755);
+            const char *idPaths[] = { BT_ID_PATH, BT_ID_PERSIST_PATH, NULL };
+            for (int p = 0; idPaths[p]; p++) {
+                int addressFd = open(
+                    idPaths[p], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (addressFd >= 0) {
+                    ssize_t written = write(
+                        addressFd, address, (size_t)addressLength);
+                    close(addressFd);
+                    printf("[BT] AirPlay Bluetooth ID %s at %s (%s)\n", address,
+                        idPaths[p],
+                        written == addressLength ? "published" : "short write");
+                } else {
+                    printf("[BT] WARN: could not publish Bluetooth ID at %s: %s\n",
+                        idPaths[p], strerror(errno));
+                }
             }
         }
     }

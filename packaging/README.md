@@ -34,4 +34,10 @@ The rootful package depends on `uikittools`. The rootless package depends on `ui
 
 Rootful packages use `iphoneos-arm`; rootless packages use `iphoneos-arm64`. Both set iOS 12.0 as the deployment target.
 
+## Optional Share package
+
+For the KCS rootful feed, include the unchanged [Share 1.0-beta2-7 release](https://github.com/amineross/share/releases/tag/v1.0-beta2-7) by Amine Rostane. Put `com.rostane.share_1.0~beta2-7_iphoneos-arm.deb` in `repo/debs/` and the corresponding [source archive](https://github.com/amineross/share/archive/refs/tags/v1.0-beta2-7.tar.gz) at `repo/sources/share-v1.0-beta2-7.tar.gz` before generating the index. Compare the package SHA-256 to the upstream APT index.
+
+Share lets a Wi-Fi-only iPad create a local Personal Hotspot for Showcase. It is a separate package and does not share internet access.
+
 Do not commit `payload/`, `build/`, or `repo/` to the source branch. Publish the generated `repo/` directory to the web path that serves `https://kcs.net.tr/repo/`. See `telemetry/README.md` for the separate PHP API deployment.

@@ -85,6 +85,7 @@ need_file "$REPO_ROOT/source/carplay_services.m"
 need_file "$REPO_ROOT/source/carplay_pair.c"
 need_file "$REPO_ROOT/source/carplay_pair.h"
 need_file "$REPO_ROOT/source/baa_broker.h"
+need_file "$REPO_ROOT/source/video_in_car.h"
 need_file "$REPO_ROOT/source/vendor/monocypher/monocypher.c"
 need_file "$REPO_ROOT/source/vendor/monocypher/monocypher-ed25519.c"
 need_file "$REPO_ROOT/source/vendor/libtommath/tommath.c"
@@ -114,6 +115,7 @@ cp "$REPO_ROOT/source/Showcase.m" \
    "$REPO_ROOT/source/carplay_pair.c" \
    "$REPO_ROOT/source/carplay_pair.h" \
    "$REPO_ROOT/source/baa_broker.h" \
+   "$REPO_ROOT/source/video_in_car.h" \
    "$REPO_ROOT/source/Info.plist" \
    "$REPO_ROOT/source/ent_app.xml" \
    "$REPO_ROOT/source/ent_bt.xml" \

@@ -18,6 +18,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 
@@ -48,32 +51,60 @@ static inline void baa_write_le32(uint8_t *p, uint32_t value) {
     p[3] = (uint8_t)(value >> 24);
 }
 
-static inline bool baa_read_exact(int fd, void *buffer, size_t length) {
-    uint8_t *p = (uint8_t *)buffer;
-    size_t done = 0;
-    while (done < length) {
-        ssize_t n = read(fd, p + done, length - done);
-        if (n == 0) return false;
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        done += (size_t)n;
+static inline uint64_t baa_now_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+}
+
+static inline bool baa_wait(int fd, short events, uint64_t deadline) {
+    struct pollfd item = { .fd = fd, .events = events };
+    for (;;) {
+        uint64_t now = baa_now_ms();
+        if (now >= deadline) return false;
+        int result = poll(&item, 1, (int)(deadline - now));
+        if (result >= 0) return result > 0;
+        if (errno != EINTR) return false;
+    }
+}
+
+static inline bool baa_prepare_socket(int fd) {
+    int flags = fcntl(fd, F_GETFL);
+    int noSigPipe = 1;
+    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 &&
+           setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof(noSigPipe)) == 0;
+}
+
+static inline bool baa_peer_is_root(int fd) {
+    uid_t uid;
+    gid_t gid;
+    return getpeereid(fd, &uid, &gid) == 0 && uid == 0;
+}
+
+static inline bool baa_read_exact(int fd, void *buffer, size_t length,
+                                  uint64_t deadline) {
+    uint8_t *p = buffer;
+    while (length > 0) {
+        if (!baa_wait(fd, POLLIN, deadline)) return false;
+        ssize_t n = read(fd, p, length);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (n <= 0) return false;
+        p += n;
+        length -= (size_t)n;
     }
     return true;
 }
 
-static inline bool baa_write_exact(int fd, const void *buffer, size_t length) {
-    const uint8_t *p = (const uint8_t *)buffer;
-    size_t done = 0;
-    while (done < length) {
-        ssize_t n = write(fd, p + done, length - done);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        if (n == 0) return false;
-        done += (size_t)n;
+static inline bool baa_write_exact(int fd, const void *buffer, size_t length,
+                                   uint64_t deadline) {
+    const uint8_t *p = buffer;
+    while (length > 0) {
+        if (!baa_wait(fd, POLLOUT, deadline)) return false;
+        ssize_t n = write(fd, p, length);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (n <= 0) return false;
+        p += n;
+        length -= (size_t)n;
     }
     return true;
 }
@@ -89,9 +120,11 @@ static inline void baa_make_header(uint8_t header[BAA_BROKER_HEADER_SIZE],
     baa_write_le32(header + 8, payloadLength);
 }
 
-static inline int baa_broker_connect(void) {
+static inline int baa_broker_connect_until(uint64_t deadline) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+
+    if (!baa_prepare_socket(fd)) { close(fd); return -1; }
 
     struct sockaddr_un address;
     memset(&address, 0, sizeof(address));
@@ -99,10 +132,20 @@ static inline int baa_broker_connect(void) {
     strncpy(address.sun_path, BAA_BROKER_PATH,
             sizeof(address.sun_path) - 1);
     if (connect(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        close(fd);
-        return -1;
+        int error = 0;
+        socklen_t size = sizeof(error);
+        if (errno != EINPROGRESS || !baa_wait(fd, POLLOUT, deadline) ||
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) != 0 || error != 0) {
+            close(fd);
+            return -1;
+        }
     }
+    if (!baa_peer_is_root(fd)) { close(fd); return -1; }
     return fd;
+}
+
+static inline int baa_broker_connect(void) {
+    return baa_broker_connect_until(baa_now_ms() + 3000);
 }
 
 static inline int baa_broker_request(uint8_t opcode,
@@ -115,19 +158,20 @@ static inline int baa_broker_request(uint8_t opcode,
     *response = NULL;
     *responseLength = 0;
 
-    int fd = baa_broker_connect();
+    uint64_t deadline = baa_now_ms() + 3000;
+    int fd = baa_broker_connect_until(deadline);
     if (fd < 0) return -1;
 
     uint8_t header[BAA_BROKER_HEADER_SIZE];
     baa_make_header(header, opcode, 0, requestLength);
-    if (!baa_write_exact(fd, header, sizeof(header)) ||
+    if (!baa_write_exact(fd, header, sizeof(header), deadline) ||
         (requestLength > 0 &&
-         !baa_write_exact(fd, request, requestLength))) {
+         !baa_write_exact(fd, request, requestLength, deadline))) {
         close(fd);
         return -1;
     }
 
-    if (!baa_read_exact(fd, header, sizeof(header)) ||
+    if (!baa_read_exact(fd, header, sizeof(header), deadline) ||
         memcmp(header, BAA_BROKER_MAGIC, 4) != 0 ||
         header[4] != opcode) {
         close(fd);
@@ -143,7 +187,7 @@ static inline int baa_broker_request(uint8_t opcode,
     uint8_t *payload = NULL;
     if (length > 0) {
         payload = (uint8_t *)malloc(length);
-        if (!payload || !baa_read_exact(fd, payload, length)) {
+        if (!payload || !baa_read_exact(fd, payload, length, deadline)) {
             free(payload);
             close(fd);
             return -1;

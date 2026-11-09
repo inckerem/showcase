@@ -130,6 +130,7 @@ static NSString *L(NSString *english) {
 #define TCPDUMP_DIR  "/var/mobile/Library/Showcase/dumps"
 #define TCPDUMP_LOG  TCPDUMP_DIR "/tcpdump.log"
 #define TCPDUMP_MAX_SECONDS 300
+#define DIAGNOSTICS_ARCHIVE_MAX_BYTES (8 * 1024 * 1024)
 #define DIAGNOSTICS_ENABLED_KEY @"diagnosticsEnabled"
 #define RECEIVER_AUDIO_KEY      @"receiverAudioEnabled"
 #define RIGHT_HAND_DRIVE_KEY    @"rightHandDriveDock"
@@ -253,8 +254,8 @@ static void ip_log_open(void) {
 #define AP_INTERFACE      "bridge100"
 #define PHONE_CANVAS_W    1024.0
 #define PHONE_CANVAS_H    768.0
-#define BTSTACK_PREFS_DIR "/var/mobile/Library/Preferences"
-#define BTSTACK_PREFS     BTSTACK_PREFS_DIR "/ch.ringwald.btstack.plist"
+#define BTSTACK_PREFS_NAME "ch.ringwald.btstack.plist"
+#define BTSTACK_PREFS "/var/mobile/Library/Preferences/" BTSTACK_PREFS_NAME
 
 /* IPC message types */
 #define MSG_VIDEO_CONFIG  0x01
@@ -340,6 +341,9 @@ static int run_blocking(const char *path, char *const argv[]);
 #define BT_GUARD_DIR "/var/root/Library/ShowcaseBluetooth"
 #define BT_GUARD_PLIST BT_GUARD_DIR "/recovery.plist"
 #define BT_GUARD_READY BT_GUARD_DIR "/ready"
+#define BT_GUARD_RESTORE BT_GUARD_DIR "/restore"
+#define BLUETOOL_LABEL "com.apple.BlueTool"
+#define BLUETOOTHD_LABEL "com.apple.bluetoothd"
 /* Exists while BTstack owns the controller; the Taurine package's BTQuiet
  * throttles Bluetooth clients' reconnects only then. /tmp is emptied at boot. */
 #define BT_OWNED_FLAG "/tmp/showcase_bt_owned"
@@ -352,14 +356,21 @@ static int run_blocking(const char *path, char *const argv[]);
 #define BT_RETRY_READY_SECONDS 20
 #endif
 
-static void stop_bluetooth_guard(void) {
+static BOOL stop_bluetooth_guard(void) {
     const char *ctl = launchctl_path();
-    if (!ctl) return;
+    if (!ctl) return NO;
+    if (access(BT_GUARD_PLIST, F_OK) != 0) return errno == ENOENT;
     char *args[] = { (char *)"launchctl", (char *)"unload",
                      (char *)BT_GUARD_PLIST, NULL };
-    run_blocking(ctl, args);
+    if (run_blocking(ctl, args) != 0 &&
+        (access(BT_GUARD_READY, F_OK) == 0 ||
+         access(BT_GUARD_RESTORE, F_OK) == 0)) return NO;
     unlink(BT_GUARD_READY);
+    unlink(BT_GUARD_RESTORE);
+    return YES;
 }
+
+static BOOL restore_system_bluetooth(const char *reason);
 
 /* launchd owns this shell, so an app crash/force-quit cannot kill recovery.
  * Arm it before removing Apple's services; disarm only after returning them.
@@ -371,15 +382,20 @@ static BOOL start_bluetooth_guard(void) {
     struct stat st;
     if (lstat(BT_GUARD_DIR, &st) || !S_ISDIR(st.st_mode) ||
         st.st_uid != 0 || (st.st_mode & 077) != 0) return NO;
-    stop_bluetooth_guard();
+    if (access(BT_GUARD_READY, F_OK) == 0) {
+        if (!restore_system_bluetooth("previous recovery")) return NO;
+    } else if (!stop_bluetooth_guard()) return NO;
     NSString *script =
-        @"echo ready > \"$6\"; "
-         "while kill -0 \"$1\" 2>/dev/null; do sleep 1; done; "
-         "\"$7\" -TERM CarDisplaySim 2>/dev/null; "
+        @"echo ready > \"$6\" || exit 1; "
+         "while [ ! -f \"${11}\" ] && kill -0 \"$1\" 2>/dev/null; do sleep 1; done; "
+         "\"$7\" -TERM \"${10}\" 2>/dev/null; "
          "\"$2\" unload \"$3\"; "
          "rm -f \"$8\"; "
-         "\"$2\" load \"$4\"; \"$2\" load \"$5\"; "
+         "if [ -f \"$4\" ]; then "
+         "\"$2\" load \"$4\" || \"$2\" list \"${12}\" || exit 1; fi; "
+         "\"$2\" load \"$5\" || \"$2\" list \"${13}\" || exit 1; "
          "rm -f \"$9\"; "
+         "rm -f \"${11}\"; "
          "rm -f \"$6\"";
     NSDictionary *job = @{
         @"Label": @"com.reng.showcase.bluetooth-recovery",
@@ -387,8 +403,11 @@ static BOOL start_bluetooth_guard(void) {
             @"showcase-bluetooth-recovery", [NSString stringWithFormat:@"%d", getpid()],
             @(ctl), @BTSTACK_PLIST, @BLUETOOL_PLIST, @BLUETOOTHD_PLIST,
             @BT_GUARD_READY, @JB_PATH("/usr/bin/killall"), @BTSTACK_SOCKET,
-            @BT_OWNED_FLAG],
+            @BT_OWNED_FLAG, @BT_HELPER_NAME, @BT_GUARD_RESTORE,
+            @BLUETOOL_LABEL, @BLUETOOTHD_LABEL],
         @"RunAtLoad": @YES,
+        @"KeepAlive": @{@"SuccessfulExit": @NO},
+        @"ThrottleInterval": @10,
         @"EnvironmentVariables": @{@"PATH": @JB_PATH("/usr/bin") ":" JB_PATH("/bin") ":/usr/bin:/bin"},
         @"StandardOutPath": @LOG_DIR "/bluetooth-recovery.log",
         @"StandardErrorPath": @LOG_DIR "/bluetooth-recovery.log"
@@ -405,19 +424,31 @@ static BOOL start_bluetooth_guard(void) {
     return NO;
 }
 
-static void restore_system_bluetooth(const char *reason) {
+static BOOL load_bluetooth_job(const char *ctl, const char *plist, const char *label) {
+    char *load[] = { (char *)"launchctl", (char *)"load", (char *)plist, NULL };
+    if (run_blocking(ctl, load) == 0) return YES;
+    /* launchctl load can fail because launchd already knows about this job. */
+    char *list[] = { (char *)"launchctl", (char *)"list", (char *)label, NULL };
+    return run_blocking(ctl, list) == 0;
+}
+
+static BOOL restore_system_bluetooth(const char *reason) {
     const char *launchctl = launchctl_path();
-    if (!launchctl) return;
-    char *loadBlueTool[] = { (char *)"launchctl", (char *)"load",
-                             (char *)BLUETOOL_PLIST, NULL };
-    char *loadBluetoothd[] = { (char *)"launchctl", (char *)"load",
-                               (char *)BLUETOOTHD_PLIST, NULL };
-    int toolRc = run_blocking(launchctl, loadBlueTool);
-    int daemonRc = run_blocking(launchctl, loadBluetoothd);
+    BOOL restored = launchctl &&
+        ((access(BLUETOOL_PLIST, F_OK) != 0 && errno == ENOENT) ||
+         load_bluetooth_job(launchctl, BLUETOOL_PLIST, BLUETOOL_LABEL)) &&
+        load_bluetooth_job(launchctl, BLUETOOTHD_PLIST, BLUETOOTHD_LABEL);
+    if (!restored) {
+        if (access(BT_GUARD_READY, F_OK) == 0) {
+            int fd = open(BT_GUARD_RESTORE, O_WRONLY | O_CREAT | O_NOFOLLOW, 0600);
+            if (fd >= 0) close(fd);
+        }
+        ip_log("[BT] system Bluetooth restore failed (%s)", reason);
+        return NO;
+    }
     unlink(BT_OWNED_FLAG);
-    ip_log("[BT] system Bluetooth load requested (%s): BlueTool=%d bluetoothd=%d",
-           reason, toolRc, daemonRc);
-    stop_bluetooth_guard();
+    ip_log("[BT] system Bluetooth restored (%s)", reason);
+    return stop_bluetooth_guard();
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -1754,9 +1785,19 @@ static const char *tcpdump_tool_path(void) {
     return first_existing_tool(paths);
 }
 
+static int open_btstack_preferences_dir(void) {
+    int mobile = open("/var/mobile", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (mobile < 0) return -1;
+    int library = openat(mobile, "Library", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    close(mobile);
+    if (library < 0) return -1;
+    int preferences = openat(library, "Preferences",
+                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    close(library);
+    return preferences;
+}
+
 static void enable_btstack_hci_logging(void) {
-    mkdir("/var/mobile/Library", 0755);
-    mkdir(BTSTACK_PREFS_DIR, 0755);
     const char *plist =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
         "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
@@ -1767,21 +1808,34 @@ static void enable_btstack_hci_logging(void) {
         "    <true/>\n"
         "</dict>\n"
         "</plist>\n";
-    int fd = open(BTSTACK_PREFS, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int dir = open_btstack_preferences_dir();
+    if (dir < 0) {
+        ip_log("BTstack preferences directory unavailable");
+        return;
+    }
+    NSString *tempName = [@".showcase-btstack-" stringByAppendingString:[NSUUID UUID].UUIDString];
+    const char *temp = tempName.fileSystemRepresentation;
+    int fd = openat(dir, temp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
     if (fd < 0) {
         ip_log("BTstack logging prefs write failed: %s", strerror(errno));
+        close(dir);
         return;
     }
     ssize_t want = (ssize_t)strlen(plist);
-    ssize_t wrote = write(fd, plist, (size_t)want);
+    ssize_t wrote;
+    do { wrote = write(fd, plist, (size_t)want); } while (wrote < 0 && errno == EINTR);
     close(fd);
-    chmod(BTSTACK_PREFS, 0644);
-    ip_log("BTstack HCI logging %s at %s",
-           wrote == want ? "enabled" : "partially written", BTSTACK_PREFS);
+    BOOL installed = wrote == want && renameat(dir, temp, dir, BTSTACK_PREFS_NAME) == 0;
+    if (!installed) unlinkat(dir, temp, 0);
+    close(dir);
+    ip_log("BTstack HCI logging %s at %s", installed ? "enabled" : "write failed", BTSTACK_PREFS);
 }
 
 static void disable_btstack_hci_logging(void) {
-    unlink(BTSTACK_PREFS);
+    int dir = open_btstack_preferences_dir();
+    if (dir < 0) return;
+    unlinkat(dir, BTSTACK_PREFS_NAME, 0);
+    close(dir);
     ip_log("BTstack HCI logging disabled");
 }
 
@@ -1808,16 +1862,9 @@ static int run_blocking(const char *path, char *const argv[]) {
     int err = posix_spawn(&pid, path, &actions, NULL, argv, environ);
     posix_spawn_file_actions_destroy(&actions);
     if (err != 0) { ip_log("  posix_spawn FAIL: %s", strerror(err)); return -1; }
-    int rc;
-    if (!strcmp(argv[0], "launchctl")) {
-        rc = wait_for_command(pid, monotonic_nanos_now() + 8 * NSEC_PER_SEC);
-        if (rc < 0) ip_log("  launchctl failed or timed out: %s", argv[1] ?: "");
-    } else {
-        int status;
-        pid_t done;
-        do { done = waitpid(pid, &status, 0); } while (done < 0 && errno == EINTR);
-        rc = done == pid && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    }
+    uint64_t seconds = !strcmp(argv[0], "tar") ? 15 : 8;
+    int rc = wait_for_command(pid, monotonic_nanos_now() + seconds * NSEC_PER_SEC);
+    if (rc < 0) ip_log("  %s failed or timed out: %s", argv[0], argv[1] ?: "");
     ip_log("  exit=%d", rc);
     return rc;
 }
@@ -1825,7 +1872,6 @@ static int run_blocking(const char *path, char *const argv[]) {
 static int run_capture(const char *path, char *const argv[], const char *outfile) {
     if (!path || access(path, X_OK) != 0) return -1;
     pid_t pid;
-    int status;
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
@@ -1834,8 +1880,9 @@ static int run_capture(const char *path, char *const argv[], const char *outfile
     int err = posix_spawn(&pid, path, &actions, NULL, argv, environ);
     posix_spawn_file_actions_destroy(&actions);
     if (err != 0) return -1;
-    if (waitpid(pid, &status, 0) < 0) return -1;
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    int rc = wait_for_command(pid, monotonic_nanos_now() + 3 * NSEC_PER_SEC);
+    if (rc < 0) ip_log("diagnostics command failed or timed out: %s", argv[0]);
+    return rc;
 }
 
 static pid_t spawn_daemon(const char *path, char *const argv[], const char *logfile) {
@@ -1878,26 +1925,31 @@ static pid_t spawn_daemon(const char *path, char *const argv[], const char *logf
     return pid;
 }
 
-/* kill(pid, 0) succeeds for a zombie, so an exited helper looked alive until
- * kill_pid's two-second timeout and was never reaped: each session left a
- * zombie carplay_bt and carplay_services behind. Reap our own children here;
- * fall back to kill() only for processes that are not our children. */
-static BOOL pid_alive(pid_t pid) {
-    if (pid <= 0) return NO;
-    int status = 0;
-    pid_t reaped = waitpid(pid, &status, WNOHANG);
-    if (reaped == pid) return NO;
-    if (reaped < 0 && errno == ECHILD) return kill(pid, 0) == 0;
-    return YES;
+static pid_t check_child(pid_t pid, int *status) {
+    pid_t result;
+    do { result = waitpid(pid, status, WNOHANG); } while (result < 0 && errno == EINTR);
+    return result;
 }
 
-static BOOL wait_for_bt_ready_or_exit(pid_t pid, int seconds) {
+static BOOL child_alive(pid_t pid) {
+    int status = 0;
+    return pid > 0 && check_child(pid, &status) == 0;
+}
+
+/* Only a broker recovered from an earlier app instance can be a non-child. */
+static BOOL baa_broker_alive(pid_t pid, BOOL reused) {
+    return reused ? pid > 0 && kill(pid, 0) == 0 : child_alive(pid);
+}
+
+static BOOL wait_for_bt_ready_or_exit(pid_t *child, int seconds) {
+    pid_t pid = *child;
     int loops = seconds * 10;
     for (int i = 0; i < loops; i++) {
         if (flow_cancelled()) return NO;
         int status = 0;
-        pid_t done = waitpid(pid, &status, WNOHANG);
+        pid_t done = check_child(pid, &status);
         if (done == pid) {
+            *child = 0;
             if (WIFEXITED(status) && WEXITSTATUS(status) == 62) {
                 ip_log("[BT] helper exited with BTSTACK_EVENT_POWERON_FAILED (62)");
             } else if (WIFEXITED(status)) {
@@ -1909,12 +1961,10 @@ static BOOL wait_for_bt_ready_or_exit(pid_t pid, int seconds) {
             }
             return NO;
         }
-        if (done < 0 && errno != EINTR) {
-            if (errno == ECHILD && !pid_alive(pid)) {
-                ip_log("[BT] helper vanished before ready sentinel");
-                return NO;
-            }
+        if (done < 0) {
             ip_log("[BT] waitpid while waiting for ready sentinel failed: %s", strerror(errno));
+            if (errno == ECHILD) *child = 0;
+            return NO;
         }
         if (access(BT_READY_PATH, F_OK) == 0) {
             ip_log("[BT] ready sentinel observed at %s", BT_READY_PATH);
@@ -1928,14 +1978,15 @@ static BOOL wait_for_bt_ready_or_exit(pid_t pid, int seconds) {
     return NO;
 }
 
-static BOOL wait_for_pid_alive(pid_t pid, int seconds, const char *name) {
-    for (int i = 0; i < seconds; i++) {
+static BOOL wait_for_pid_alive(pid_t *child, int seconds, const char *name) {
+    for (int i = 0; i <= seconds; i++) {
         if (flow_cancelled()) return NO;
-        if (!pid_alive(pid)) {
+        if (!child_alive(*child)) {
+            *child = 0;
             ip_log("%s exited during startup wait at %d/%d sec", name, i, seconds);
             return NO;
         }
-        sleep(1);
+        if (i < seconds) sleep(1);
     }
     return YES;
 }
@@ -1953,12 +2004,12 @@ static BOOL wait_for_path(const char *path, int seconds, const char *name) {
     return NO;
 }
 
-static void kill_pid(pid_t pid) {
-    if (!pid_alive(pid)) return;
+static void kill_child(pid_t pid) {
+    if (!child_alive(pid)) return;
     kill(pid, SIGTERM);
     for (int i = 0; i < 20; i++) {
         usleep(100000);
-        if (!pid_alive(pid)) return;
+        if (!child_alive(pid)) return;
     }
     kill(pid, SIGKILL);
     int status;
@@ -3438,7 +3489,7 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 @property (nonatomic, strong) NSTimer *tcpdumpStopTimer;
 @property (nonatomic, assign) BOOL tcpdumpMissingPromptShown;
 @property (nonatomic, assign) BOOL diagnosticsEnabled;
-@property (nonatomic, assign) BOOL helpersLoggedThisRun;
+@property (atomic, assign) BOOL helpersLoggedThisRun;
 @property (nonatomic, assign) BOOL bluetoothHandedOff;
 @property (nonatomic, assign) BOOL bluetoothRetryAttempted;
 @property (nonatomic, copy) NSString *pendingBluetoothErrorTitle;
@@ -3451,10 +3502,14 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 @property (nonatomic, strong) dispatch_semaphore_t ipcDone;
 @property (nonatomic, strong) dispatch_queue_t bgQueue;
 @property (nonatomic, strong) dispatch_queue_t videoQueue;
+@property (nonatomic, strong) dispatch_source_t helperMonitor;
+@property (nonatomic, strong) dispatch_queue_t diagnosticsQueue;
+@property (nonatomic, assign) BOOL diagnosticsUploadInProgress;
 
 /* BAA preheater and local signing broker */
 @property (nonatomic, assign) BOOL baaReady;
 @property (nonatomic, assign) BOOL baaLoading;
+@property (nonatomic, assign) BOOL baaBrokerReused;
 @property (nonatomic, copy) NSString *baaError;
 
 /* AP polling */
@@ -3493,6 +3548,7 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     didFinishLaunchingWithOptions:(NSDictionary *)opts {
 
     self.bgQueue = dispatch_queue_create("com.reng.showcase.bg", DISPATCH_QUEUE_SERIAL);
+    self.diagnosticsQueue = dispatch_queue_create("com.reng.showcase.diagnostics", DISPATCH_QUEUE_SERIAL);
     self.videoQueue = dispatch_queue_create(
         "com.reng.showcase.video", DISPATCH_QUEUE_SERIAL);
     dispatch_set_target_queue(self.videoQueue,
@@ -3532,7 +3588,6 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     carplay_display_hardware();
     /* A session that ended without stopFlow may have left a network paused. */
     dispatch_async(self.bgQueue, ^{
-        stop_bluetooth_guard();
         showcase_release_other_wifi("launch recovery");
         /* A session that ended without stopFlow can leave BTstack holding the
          * controller and BlueTool unloaded. Release and hand it back. */
@@ -3671,9 +3726,11 @@ static pid_t reusable_baa_broker(void) {
     if (existing > 0) {
         reap_stale_helpers(existing);
         self.baaBrokerPid = existing;
+        self.baaBrokerReused = YES;
         ip_log("BAA broker pid=%d from an earlier launch reused", existing);
         return YES;
     }
+    self.baaBrokerReused = NO;
     reap_stale_helpers(0);
     NSString *helper = [[[NSBundle mainBundle] bundlePath]
         stringByAppendingPathComponent:@SVC_HELPER_NAME];
@@ -3700,8 +3757,10 @@ static pid_t reusable_baa_broker(void) {
         int rc = -1;
         uint8_t *leaf = NULL, *intermediate = NULL;
         int leafLength = 0, intermediateLength = 0;
-        for (int attempt = 0; attempt < 450; attempt++) {
-            if (!pid_alive(self.baaBrokerPid)) {
+        uint64_t deadline = monotonic_nanos_now() + 45 * NSEC_PER_SEC;
+        /* Each certificate request in baa_broker.h can use three seconds. */
+        while (monotonic_nanos_now() + 3 * NSEC_PER_SEC <= deadline) {
+            if (!baa_broker_alive(self.baaBrokerPid, self.baaBrokerReused)) {
                 rc = -1;
                 break;
             }
@@ -3727,7 +3786,7 @@ static pid_t reusable_baa_broker(void) {
         } else {
             ip_log("BAA preheat helper failed rc=%d", rc);
             /* The next attempt starts a fresh broker. */
-            kill_pid(self.baaBrokerPid);
+            kill_child(self.baaBrokerPid);
             self.baaBrokerPid = 0;
         }
 
@@ -4113,7 +4172,7 @@ static char carVideoItemStatusContext;
         connecting ? (shortScreen ? 18 : 28) : (phone ? 26 : 36));
     add(self.stepsView, colW, [self.stepsView preferredHeightForWidth:colW], shortScreen ? 14 : 28);
     add(self.primaryButton, btnW, btnH, phone ? 12 : 16);
-    add(self.secondaryButton, btnW, phone ? 30 : 34, 10);
+    add(self.secondaryButton, btnW, 44, 10);
 
     CGFloat total = 0;
     for (NSUInteger i = 0; i < items.count; i++) {
@@ -4236,6 +4295,7 @@ static char carVideoItemStatusContext;
     if (flow_cancelled() && s != StateIdle && s != StateStopping) return;
     uint32_t epoch = flow_epoch();
     ShowcaseState old = self.state;
+    if (s == StateAwaitingPhone && old != StatePreparingNet) return;
     self.state = s;
 
     if (s == StateAwaitingPhone && old != StateAwaitingPhone) {
@@ -4387,6 +4447,8 @@ static char carVideoItemStatusContext;
         case StatePreparingNet:
             self.headlineLabel.text = L(@"Getting Ready");
             [self updateConnectSteps];
+            [self.secondaryButton setTitle:L(@"Cancel") forState:UIControlStateNormal];
+            self.secondaryButton.hidden = NO;
             break;
 
         case StateAwaitingPhone:
@@ -4439,7 +4501,8 @@ static char carVideoItemStatusContext;
 }
 
 - (void)secondaryTapped {
-    if (self.state == StateAwaitingAP || self.state == StateAwaitingPhone) {
+    if (self.state == StateAwaitingAP || self.state == StatePreparingBT ||
+        self.state == StatePreparingNet || self.state == StateAwaitingPhone) {
         [self stopFlow];
     }
 }
@@ -4477,6 +4540,7 @@ static char carVideoItemStatusContext;
     if (self.state == StateActive && self.chromeVisible) [self hideChrome];
     [self renderState];
     [self presentPendingBluetoothCompatibilityError];
+    [self resumePendingRestart];
 }
 
 - (void)toggleChrome:(UITapGestureRecognizer *)gesture {
@@ -4502,6 +4566,7 @@ static char carVideoItemStatusContext;
         if (weakSelf.state == StateActive &&
             UIApplication.sharedApplication.applicationState == UIApplicationStateActive)
             send_app_visibility(1);
+        [weakSelf resumePendingRestart];
     };
     self.screenMirror = receiver;
     [self.vc presentViewController:receiver animated:YES completion:nil];
@@ -4611,7 +4676,7 @@ static char carVideoItemStatusContext;
     if (![self.cars apReady]) { [self showWifiSetup]; return; }
     if (self.cars.cars.count == 0) return;
     if (!self.baaReady) {
-        if (self.baaBrokerPid > 0 && pid_alive(self.baaBrokerPid)) [self preheatBAA];
+        if (baa_broker_alive(self.baaBrokerPid, self.baaBrokerReused)) [self preheatBAA];
         else [self startBAA];
         return;
     }
@@ -4620,6 +4685,7 @@ static char carVideoItemStatusContext;
 
 - (void)startFlow {
     if (self.state != StateIdle) return;
+    self.restartAfterStop = NO;
     ip_log("startFlow: car='%s' ssid='%s'",
            [self.cars.selected.name UTF8String],
            [self.cars.apSSID UTF8String]);
@@ -4927,18 +4993,20 @@ static char carVideoItemStatusContext;
 
     /* 2. Release the UART: bluetoothd holds it (EBUSY) even with Bluetooth
      * off, and BlueTool owns it on iOS 14 and newer. */
-    [self stopSystemBluetooth:launchctl];
+    if (![self stopSystemBluetooth:launchctl]) return;
 #else
     /* 1. Unload bluetoothd */
     char *unloadArgv[] = { (char*)"launchctl", (char*)"unload",
                            (char*)BLUETOOTHD_PLIST, NULL };
     int rc = run_blocking(launchctl, unloadArgv);
     if (rc != 0) ip_log("  WARNING: launchctl unload returned %d", rc);
+    if (flow_cancelled()) return;
 #ifdef SHOWCASE_ROOTLESS
     char *unloadBlueToolArgv[] = { (char*)"launchctl", (char*)"unload",
                                    (char*)BLUETOOL_PLIST, NULL };
     rc = run_blocking(launchctl, unloadBlueToolArgv);
     if (rc != 0) ip_log("  WARNING: BlueTool unload returned %d", rc);
+    if (flow_cancelled()) return;
 #endif
     sleep(2);
 
@@ -4949,6 +5017,7 @@ static char carVideoItemStatusContext;
                                   (char*)BTSTACK_PLIST, NULL };
     run_blocking(launchctl, unloadBTstackArgv);
     unlink(BTSTACK_SOCKET);
+    if (flow_cancelled()) return;
 
     char *loadBTstackArgv[] = { (char*)"launchctl", (char*)"load",
                                 (char*)BTSTACK_PLIST, NULL };
@@ -4990,7 +5059,10 @@ static char carVideoItemStatusContext;
                              unsupported:NO];
         return;
     }
-    if (!wait_for_bt_ready_or_exit(self.carplayBtPid, BT_READY_SECONDS)) {
+    pid_t btChild = self.carplayBtPid;
+    BOOL ready = wait_for_bt_ready_or_exit(&btChild, BT_READY_SECONDS);
+    self.carplayBtPid = btChild;
+    if (!ready) {
         if (flow_cancelled()) return;
         /* On some rootless boots BlueTool releases the controller after its
          * launchd job has already exited. BTstack then accepts a client and
@@ -4999,27 +5071,25 @@ static char carVideoItemStatusContext;
         ip_log("[BT] first controller takeover produced no events; "
                "performing one clean retry");
         self.bluetoothRetryAttempted = YES;
-        kill_pid(self.carplayBtPid);
+        kill_child(self.carplayBtPid);
         self.carplayBtPid = 0;
 #ifdef SHOWCASE_TAURINE
         /* Bring Apple's Bluetooth back first so launchd can spawn the
          * daemon again. */
-        char *loadBlueToolArgv[] = { (char*)"launchctl", (char*)"load",
-                                     (char*)BLUETOOL_PLIST, NULL };
-        char *loadArgv[] = { (char*)"launchctl", (char*)"load",
-                             (char*)BLUETOOTHD_PLIST, NULL };
-        run_blocking(launchctl, loadBlueToolArgv);
-        run_blocking(launchctl, loadArgv);
-        unlink(BT_OWNED_FLAG);
-        sleep(2);
-        if ([self startBTstackDaemon:launchctl]) {
-            if (flow_cancelled()) return;
-            [self stopSystemBluetooth:launchctl];
-            unlink(BT_READY_PATH);
-            self.carplayBtPid =
-                spawn_daemon([btPath UTF8String], btArgv,
-                             LOG_DIR "/carplay_bt-retry.log");
+        if (!load_bluetooth_job(launchctl, BLUETOOL_PLIST, BLUETOOL_LABEL) ||
+            !load_bluetooth_job(launchctl, BLUETOOTHD_PLIST, BLUETOOTHD_LABEL)) {
+            [self failBluetoothWithReason:@"Apple Bluetooth could not be restored for retry."
+                             unsupported:NO];
+            return;
         }
+        unlink(BT_OWNED_FLAG);
+        if (flow_cancelled()) return;
+        sleep(2);
+        if (flow_cancelled() || ![self startBTstackDaemon:launchctl] ||
+            ![self stopSystemBluetooth:launchctl] || flow_cancelled()) return;
+        unlink(BT_READY_PATH);
+        self.carplayBtPid = spawn_daemon([btPath UTF8String], btArgv,
+                                         LOG_DIR "/carplay_bt-retry.log");
 #else
         run_blocking(launchctl, unloadBTstackArgv);
         unlink(BTSTACK_SOCKET);
@@ -5034,8 +5104,10 @@ static char carVideoItemStatusContext;
                              LOG_DIR "/carplay_bt-retry.log");
         }
 #endif
-        if (self.carplayBtPid <= 0 ||
-            !wait_for_bt_ready_or_exit(self.carplayBtPid, BT_RETRY_READY_SECONDS)) {
+        btChild = self.carplayBtPid;
+        ready = btChild > 0 && wait_for_bt_ready_or_exit(&btChild, BT_RETRY_READY_SECONDS);
+        self.carplayBtPid = btChild;
+        if (!ready) {
             [self failBluetoothWithReason:
                 @"Bluetooth takeover failed after one clean retry; no HCI "
                  "controller-ready event was received."
@@ -5058,6 +5130,7 @@ static char carVideoItemStatusContext;
     char *startBTstackArgv[] = { (char*)"launchctl", (char*)"start",
                                  (char*)"ch.ringwald.BTstack", NULL };
     run_blocking(launchctl, unloadBTstackArgv);
+    if (flow_cancelled()) return NO;
     signal_processes_named("BTdaemon", SIGKILL, 0);
     unlink(BTSTACK_SOCKET);
     if (run_blocking(launchctl, loadBTstackArgv) != 0) {
@@ -5073,8 +5146,9 @@ static char carVideoItemStatusContext;
         return NO;
     }
     run_blocking(launchctl, startBTstackArgv);
-    for (int i = 0; i < 50 && !process_named_running("BTdaemon"); i++)
+    for (int i = 0; i < 50 && !flow_cancelled() && !process_named_running("BTdaemon"); i++)
         usleep(100000);
+    if (flow_cancelled()) return NO;
     if (!process_named_running("BTdaemon")) {
         [self failBluetoothWithReason:
             @"The BTstack daemon did not start."
@@ -5086,21 +5160,30 @@ static char carVideoItemStatusContext;
     return YES;
 }
 
-- (void)stopSystemBluetooth:(const char *)launchctl {
-    int flag = open(BT_OWNED_FLAG, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (flag >= 0) close(flag);
+- (BOOL)stopSystemBluetooth:(const char *)launchctl {
+    if (flow_cancelled()) return NO;
+    int flag = open(BT_OWNED_FLAG, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (flag < 0) {
+        [self failBluetoothWithReason:@"Bluetooth ownership marker could not be created."
+                         unsupported:NO];
+        return NO;
+    }
+    close(flag);
     char *unloadArgv[] = { (char*)"launchctl", (char*)"unload",
                            (char*)BLUETOOTHD_PLIST, NULL };
     int rc = run_blocking(launchctl, unloadArgv);
     if (rc != 0) ip_log("  WARNING: launchctl unload returned %d", rc);
+    if (flow_cancelled()) return NO;
     char *unloadBlueToolArgv[] = { (char*)"launchctl", (char*)"unload",
                                    (char*)BLUETOOL_PLIST, NULL };
     rc = run_blocking(launchctl, unloadBlueToolArgv);
     if (rc != 0) ip_log("  WARNING: BlueTool unload returned %d", rc);
+    if (flow_cancelled()) return NO;
     /* An unload can stay in progress; make sure the UART is free. */
     signal_processes_named("bluetoothd", SIGKILL, 0);
     signal_processes_named("BlueTool", SIGKILL, 0);
     sleep(2);
+    return !flow_cancelled();
 }
 #endif
 
@@ -5191,7 +5274,10 @@ static char carVideoItemStatusContext;
     self.carplayServicesPid = spawn_daemon(
         [svcPath UTF8String], svcArgv, LOG_DIR "/carplay_services.log");
     if (self.carplayServicesPid <= 0) { [self failWith:@"carplay_services failed to start"]; return; }
-    if (!wait_for_pid_alive(self.carplayServicesPid, 4, "carplay_services")) {
+    pid_t servicesChild = self.carplayServicesPid;
+    BOOL servicesAlive = wait_for_pid_alive(&servicesChild, 4, "carplay_services");
+    self.carplayServicesPid = servicesChild;
+    if (!servicesAlive) {
         [self failWith:@"carplay_services exited during setup"];
         return;
     }
@@ -5199,11 +5285,32 @@ static char carVideoItemStatusContext;
     /* A paired phone can resume quickly enough to deliver video while the
      * helper-alive check above is still running. Do not overwrite Active
      * with the older setup state when that happens. */
-    if (!flow_cancelled() && self.state != StateActive) {
-        [self transitionTo:StateAwaitingPhone];
-    } else {
-        ip_log("[HANDOFF] Existing paired session resumed during startup");
-    }
+    [self transitionTo:StateAwaitingPhone];
+    if (!flow_cancelled()) [self monitorFlowHelpers];
+}
+
+- (void)monitorFlowHelpers {
+    uint32_t epoch = flow_epoch();
+    dispatch_source_t monitor = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self.bgQueue);
+    if (!monitor) return;
+    self.helperMonitor = monitor;
+    dispatch_source_set_timer(monitor, DISPATCH_TIME_NOW, NSEC_PER_SEC, NSEC_PER_SEC / 10);
+    dispatch_source_set_event_handler(monitor, ^{
+        if (flow_cancelled() || epoch != flow_epoch()) return;
+        BOOL servicesExited = self.carplayServicesPid > 0 && !child_alive(self.carplayServicesPid);
+        BOOL bluetoothExited = self.carplayBtPid > 0 && !child_alive(self.carplayBtPid);
+        if (servicesExited) self.carplayServicesPid = 0;
+        if (bluetoothExited) self.carplayBtPid = 0;
+        if (!servicesExited && !bluetoothExited) return;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (flow_cancelled() || epoch != flow_epoch()) return;
+            if (!servicesExited && self.state == StateActive) return;
+            ip_log("[SESSION] %s helper exited", servicesExited ? "services" : "Bluetooth");
+            if (self.state == StateActive) self.restartAfterStop = YES;
+            [self stopFlow];
+        });
+    });
+    dispatch_resume(monitor);
 }
 
 - (void)completeBluetoothHandoff {
@@ -5222,7 +5329,7 @@ static char carVideoItemStatusContext;
          * head-of-line stalls.
          */
         ip_log("[HANDOFF] Wi-Fi session established; stopping Bluetooth helper");
-        kill_pid(self.carplayBtPid);
+        kill_child(self.carplayBtPid);
         self.carplayBtPid = 0;
 
         const char *launchctl = launchctl_path();
@@ -5276,8 +5383,6 @@ static void wake_ipc_listener(void) {
         __atomic_store_n(&g_flow_cancelled, true, __ATOMIC_RELEASE);
         __atomic_add_fetch(&g_flow_epoch, 1, __ATOMIC_ACQ_REL);
     }
-    BOOL restart = self.restartAfterStop;
-    self.restartAfterStop = NO;
     [self endAWDLSuppression];
     [self stopNetworkDumpCaptureWithReason:@"user cancelled / stopping flow"];
     [self endBackgroundTask];
@@ -5297,8 +5402,12 @@ static void wake_ipc_listener(void) {
         g_video_suspended = 0;
         g_video_needs_resync = 0;
 
-        kill_pid(self.carplayServicesPid); self.carplayServicesPid = 0;
-        kill_pid(self.carplayBtPid);       self.carplayBtPid = 0;
+        if (self.helperMonitor) {
+            dispatch_source_cancel(self.helperMonitor);
+            self.helperMonitor = nil;
+        }
+        kill_child(self.carplayServicesPid); self.carplayServicesPid = 0;
+        kill_child(self.carplayBtPid);       self.carplayBtPid = 0;
         if (self.ipcDone) {
             dispatch_semaphore_wait(self.ipcDone, DISPATCH_TIME_FOREVER);
             self.ipcDone = nil;
@@ -5334,14 +5443,19 @@ static void wake_ipc_listener(void) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self transitionTo:StateIdle];
             [self presentPendingBluetoothCompatibilityError];
-            if (restart && self.state == StateIdle && self.baaReady &&
-                !self.vc.presentedViewController) [self startFlow];
+            [self resumePendingRestart];
         });
     });
 }
 
+- (void)resumePendingRestart {
+    if (self.restartAfterStop && self.state == StateIdle && self.baaReady &&
+        !self.vc.presentedViewController) [self startFlow];
+}
+
 - (void)failBluetoothWithReason:(NSString *)reason
                     unsupported:(BOOL)unsupported {
+    uint32_t epoch = flow_epoch();
     if (flow_cancelled()) return;
     BluetoothRegistryProbeState registry = bluetooth_registry_probe();
     NSString *report = bluetooth_diagnostic_report(
@@ -5352,10 +5466,10 @@ static void wake_ipc_listener(void) {
            [failureClass UTF8String], [reason UTF8String],
            [report UTF8String]);
 
-    self.pendingBluetoothErrorTitle = unsupported
+    NSString *title = unsupported
         ? L(@"Bluetooth Hardware Not Supported")
         : L(@"Bluetooth Setup Failed");
-    self.pendingBluetoothErrorExplanation = unsupported
+    NSString *explanation = unsupported
         ? L(@"Showcase could not take over this device's Bluetooth controller. "
           "Tell the developer or community that this model is not yet supported "
           "and include the diagnostic below.")
@@ -5364,14 +5478,19 @@ static void wake_ipc_listener(void) {
 #if !defined(SHOWCASE_TAURINE) && !defined(SHOWCASE_ROOTLESS)
     /* Taurine on iOS 14 needs its own package's Bluetooth takeover. */
     if (showcase_on_taurine()) {
-        self.pendingBluetoothErrorTitle = L(@"Install Showcase for Taurine");
-        self.pendingBluetoothErrorExplanation =
+        title = L(@"Install Showcase for Taurine");
+        explanation =
             L(@"This device runs Taurine, which needs a different Bluetooth setup. "
              "Install Showcase for Taurine from the same repository; it replaces this package.");
     }
 #endif
-    self.pendingBluetoothDiagnostic = report;
-    [self stopFlow];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (flow_cancelled() || epoch != flow_epoch()) return;
+        self.pendingBluetoothErrorTitle = title;
+        self.pendingBluetoothErrorExplanation = explanation;
+        self.pendingBluetoothDiagnostic = report;
+        [self stopFlow];
+    });
 }
 
 - (void)presentPendingBluetoothCompatibilityError {
@@ -5786,7 +5905,7 @@ static NSString *hotspot_name(void) {
         ip_log("tcpdump not started; diagnostics disabled");
         return;
     }
-    if (self.tcpdumpPid > 0 && pid_alive(self.tcpdumpPid)) return;
+    if (child_alive(self.tcpdumpPid)) return;
 
     const char *tcpdump = tcpdump_tool_path();
     if (!tcpdump) {
@@ -5825,14 +5944,17 @@ static NSString *hotspot_name(void) {
 - (void)stopNetworkDumpCaptureWithReason:(NSString *)reason {
     [self.tcpdumpStopTimer invalidate]; self.tcpdumpStopTimer = nil;
     pid_t pid = self.tcpdumpPid;
-    if (pid <= 0) return;
+    if (!child_alive(pid)) {
+        self.tcpdumpPid = 0;
+        return;
+    }
 
     ip_log("stopping tcpdump pid=%d reason=%s", pid, [reason UTF8String]);
     kill(pid, SIGINT); /* lets tcpdump flush pcap footer/stats */
     for (int i = 0; i < 30; i++) {
         int status = 0;
-        pid_t done = waitpid(pid, &status, WNOHANG);
-        if (done == pid) {
+        pid_t done = check_child(pid, &status);
+        if (done != 0) {
             ip_log("tcpdump stopped status=%d", status);
             self.tcpdumpPid = 0;
             return;
@@ -5841,22 +5963,30 @@ static NSString *hotspot_name(void) {
     }
     kill(pid, SIGTERM);
     usleep(300000);
-    if (pid_alive(pid)) kill(pid, SIGKILL);
-    int status = 0; waitpid(pid, &status, WNOHANG);
+    kill_child(pid);
     self.tcpdumpPid = 0;
 }
 
 - (void)copyPath:(NSString *)src toDiagnosticsDir:(NSString *)dir name:(NSString *)name {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:src]) return;
-    NSString *dst = [dir stringByAppendingPathComponent:name ?: [src lastPathComponent]];
-    [fm removeItemAtPath:dst error:nil];
-    NSError *err = nil;
-    if (![fm copyItemAtPath:src toPath:dst error:&err]) {
-        ip_log("diagnostics copy failed: %s -> %s (%s)",
-               [src UTF8String], [dst UTF8String],
-               [[err localizedDescription] UTF8String]);
+    int fd = open(src.fileSystemRepresentation, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_size > DIAGNOSTICS_ARCHIVE_MAX_BYTES) {
+        close(fd);
+        return;
     }
+    NSFileHandle *file = [[NSFileHandle alloc] initWithFileDescriptor:fd closeOnDealloc:YES];
+    NSData *contents;
+    @try {
+        contents = [file readDataOfLength:DIAGNOSTICS_ARCHIVE_MAX_BYTES + 1];
+    } @catch (__unused NSException *exception) {
+        return;
+    }
+    if (contents.length > DIAGNOSTICS_ARCHIVE_MAX_BYTES) return;
+    NSString *dst = [dir stringByAppendingPathComponent:name ?: [src lastPathComponent]];
+    if (![contents writeToFile:dst atomically:YES])
+        ip_log("diagnostics copy failed: %s -> %s", [src UTF8String], [dst UTF8String]);
 }
 
 - (void)copyLogDirectoryToDiagnosticsDir:(NSString *)dir {
@@ -5872,28 +6002,28 @@ static NSString *hotspot_name(void) {
     }
 }
 
-- (NSString *)createDiagnosticsArchive {
-    if (self.diagnosticsEnabled) {
-        enable_btstack_hci_logging();
-    }
+- (NSString *)diagnosticsSessionSnapshotWithHelperLogs:(BOOL)helpersLogged {
+    return [NSString stringWithFormat:
+        @"state=%ld\nselected_car=%@\nhotspot_ssid=%@\nlatest_tcpdump=%@\n"
+         "diagnostics_enabled=%@\nhelpers_full_logging_this_run=%@\n",
+        (long)self.state, self.cars.selected.name ?: @"", self.cars.apSSID ?: @"",
+        [self latestNetworkDumpPath] ?: @"(none)", self.diagnosticsEnabled ? @"yes" : @"no",
+        helpersLogged ? @"yes" : @"no"];
+}
 
+- (NSString *)createDiagnosticsArchiveWithSnapshot:(NSString *)snapshot
+                                         helperLogs:(BOOL)helpersLogged {
+    char scratchPath[] = "/tmp/showcase-diagnostics.XXXXXX";
+    if (!mkdtemp(scratchPath)) return nil;
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *base = @"/var/mobile/Library/Showcase/diagnostics";
-    [fm createDirectoryAtPath:base withIntermediateDirectories:YES attributes:nil error:nil];
-
-    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-    fmt.dateFormat = @"yyyyMMdd-HHmmss";
-    NSString *stamp = [fmt stringFromDate:[NSDate date]];
-    NSString *work = [base stringByAppendingPathComponent:
-        [NSString stringWithFormat:@"ShowcaseDiagnostics-%@", stamp]];
-    NSString *archive = [base stringByAppendingPathComponent:
-        [NSString stringWithFormat:@"ShowcaseDiagnostics-%@.tar", stamp]];
-    [fm removeItemAtPath:work error:nil];
-    [fm removeItemAtPath:archive error:nil];
-    [fm createDirectoryAtPath:work withIntermediateDirectories:YES attributes:nil error:nil];
-
+    NSString *base = @(scratchPath);
+    NSString *work = [base stringByAppendingPathComponent:@"work"];
+    NSString *archive = [base stringByAppendingPathComponent:@"ShowcaseDiagnostics.tar"];
     NSString *commandsDir = [work stringByAppendingPathComponent:@"commands"];
-    [fm createDirectoryAtPath:commandsDir withIntermediateDirectories:YES attributes:nil error:nil];
+    if (![fm createDirectoryAtPath:commandsDir withIntermediateDirectories:YES attributes:nil error:nil]) {
+        [fm removeItemAtPath:base error:nil];
+        return nil;
+    }
 
     const char *tarPaths[] = {
         "/var/jb/usr/bin/tar", "/var/jb/bin/tar", "/usr/bin/tar", "/bin/tar", NULL
@@ -5911,9 +6041,6 @@ static NSString *hotspot_name(void) {
     const char *ifconfigPaths[] = {
         "/var/jb/sbin/ifconfig", "/sbin/ifconfig", "/usr/sbin/ifconfig", NULL
     };
-    const char *psPaths[] = {
-        "/var/jb/bin/ps", "/bin/ps", "/usr/bin/ps", NULL
-    };
     const char *lsPaths[] = {
         "/var/jb/bin/ls", "/bin/ls", "/usr/bin/ls", NULL
     };
@@ -5924,7 +6051,6 @@ static NSString *hotspot_name(void) {
     const char *dpkgQueryPath = first_existing_tool(dpkgQueryPaths);
     const char *unamePath = first_existing_tool(unamePaths);
     const char *ifconfigPath = first_existing_tool(ifconfigPaths);
-    const char *psPath = first_existing_tool(psPaths);
     const char *lsPath = first_existing_tool(lsPaths);
 
     NSMutableString *env = [NSMutableString string];
@@ -5938,9 +6064,7 @@ static NSString *hotspot_name(void) {
     [env appendFormat:@"uid=%u\n", getuid()];
     [env appendFormat:@"euid=%u\n", geteuid()];
     [env appendFormat:@"bundle=%@\n", [[NSBundle mainBundle] bundlePath]];
-    [env appendFormat:@"state=%ld\n", (long)self.state];
-    [env appendFormat:@"selected_car=%@\n", self.cars.selected.name ?: @""];
-    [env appendFormat:@"hotspot_ssid=%@\n", self.cars.apSSID ?: @""];
+    [env appendString:snapshot];
     [env appendFormat:@"launchctl=%s\n", launchctl ?: "(missing)"];
     [env appendFormat:@"tar=%s\n", tarPath ?: "(missing)"];
     [env appendFormat:@"dpkg=%s\n", dpkgPath ?: "(missing)"];
@@ -5952,15 +6076,12 @@ static NSString *hotspot_name(void) {
     [env appendFormat:@"hci_dump=/tmp/hci_dump.pklg exists=%s\n",
                       access("/tmp/hci_dump.pklg", F_OK) == 0 ? "yes" : "no"];
     [env appendFormat:@"tcpdump=%s\n", tcpdump_tool_path() ?: "(missing)"];
-    [env appendFormat:@"latest_tcpdump=%@\n", [self latestNetworkDumpPath] ?: @"(none)"];
-    [env appendFormat:@"diagnostics_enabled=%@\n", self.diagnosticsEnabled ? @"yes" : @"no"];
-    [env appendFormat:@"helpers_full_logging_this_run=%@\n", self.helpersLoggedThisRun ? @"yes" : @"no"];
     [env appendFormat:@"bt_ready_sentinel=%s exists=%s\n",
                       BT_READY_PATH, access(BT_READY_PATH, F_OK) == 0 ? "yes" : "no"];
     [env writeToFile:[work stringByAppendingPathComponent:@"environment.txt"]
           atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
-    if (!self.helpersLoggedThisRun) {
+    if (!helpersLogged) {
         NSString *warning = @"Diagnostics were enabled after this run or were disabled when helpers launched. Helper logs may be missing or limited. Reproduce once with diagnostics enabled before pressing Start.\n";
         [warning writeToFile:[work stringByAppendingPathComponent:@"WARNING.txt"]
                   atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -5985,10 +6106,6 @@ static NSString *hotspot_name(void) {
         char *argv[] = { (char*)"ifconfig", (char*)"-a", NULL };
         run_capture(ifconfigPath, argv, [[commandsDir stringByAppendingPathComponent:@"ifconfig-a.txt"] UTF8String]);
     }
-    if (psPath) {
-        char *argv[] = { (char*)"ps", (char*)"aux", NULL };
-        run_capture(psPath, argv, [[commandsDir stringByAppendingPathComponent:@"ps-aux.txt"] UTF8String]);
-    }
     if (dpkgPath) {
         char *argv2[] = { (char*)"dpkg", (char*)"-l", NULL };
         run_capture(dpkgPath, argv2, [[commandsDir stringByAppendingPathComponent:@"dpkg-l.txt"] UTF8String]);
@@ -5998,10 +6115,6 @@ static NSString *hotspot_name(void) {
         run_capture(dpkgQueryPath, argv1, [[commandsDir stringByAppendingPathComponent:@"dpkg-showcase.txt"] UTF8String]);
         char *argv2[] = { (char*)"dpkg-query", (char*)"-W", NULL };
         run_capture(dpkgQueryPath, argv2, [[commandsDir stringByAppendingPathComponent:@"dpkg-query-W.txt"] UTF8String]);
-    }
-    if (launchctl) {
-        char *argv[] = { (char*)"launchctl", (char*)"list", NULL };
-        run_capture(launchctl, argv, [[commandsDir stringByAppendingPathComponent:@"launchctl-list.txt"] UTF8String]);
     }
     if (lsPath) {
         char *argv1[] = { (char*)"ls", (char*)"-la", (char*)"/tmp", NULL };
@@ -6014,6 +6127,7 @@ static NSString *hotspot_name(void) {
 
     if (!tarPath) {
         ip_log("diagnostics export failed: tar not found");
+        [fm removeItemAtPath:base error:nil];
         return nil;
     }
 
@@ -6023,7 +6137,14 @@ static NSString *hotspot_name(void) {
     };
     int rc = run_blocking(tarPath, tarArgv);
     ip_log("diagnostics tar rc=%d path=%s", rc, [archive UTF8String]);
-    return rc == 0 ? archive : nil;
+    NSNumber *size = [fm attributesOfItemAtPath:archive error:nil][NSFileSize];
+    if (rc != 0 || !size || size.unsignedLongLongValue > DIAGNOSTICS_ARCHIVE_MAX_BYTES) {
+        if (rc == 0 && size) ip_log("diagnostics archive exceeds upload limit");
+        [fm removeItemAtPath:base error:nil];
+        return nil;
+    }
+    [fm removeItemAtPath:work error:nil];
+    return archive;
 }
 
 /* ─── IPC listener ─────────────────────────────────────────── */
@@ -6940,7 +7061,6 @@ static UIEdgeInsets showcase_safe_insets(UIView *view) {
 @property (nonatomic, copy) NSString *pageMessage;
 @property (nonatomic, assign) BOOL pageMessageIsError;
 @property (nonatomic, assign) BOOL confirmingDestructive;
-@property (nonatomic, assign) BOOL preparingLogs;
 @property (nonatomic, assign) BOOL passwordVisible;
 @property (nonatomic, weak) SoundRouteView *soundRoute;
 @property (nonatomic, copy) NSString *draftCarName;
@@ -8015,7 +8135,7 @@ static BOOL g_settings_hardware_loading = NO;
     CGFloat w = b.width;
     __weak SettingsViewController *weakSelf = self;
     BOOL logging = app.diagnosticsEnabled;
-    BOOL capturing = app.tcpdumpPid > 0 && pid_alive(app.tcpdumpPid);
+    BOOL capturing = child_alive(app.tcpdumpPid);
     BOOL haveTcpdump = tcpdump_tool_path() != NULL;
     NSString *lastCapture = capturing ? nil : [app latestNetworkDumpPath];
 
@@ -8029,8 +8149,8 @@ static BOOL g_settings_hardware_loading = NO;
         [card addRow:row height:row.bounds.size.height];
     }];
     [b card:^(SettingsCard *card) {
-        [card addRow:[self actionRow:self.preparingLogs ? L(@"Preparing Logs…") : L(@"Send Logs to KCS")
-            color:nil width:w enabled:!self.preparingLogs action:^{
+        [card addRow:[self actionRow:app.diagnosticsUploadInProgress ? L(@"Preparing Logs…") : L(@"Send Logs to KCS")
+            color:nil width:w enabled:!app.diagnosticsUploadInProgress action:^{
                 [weakSelf sendLogs];
             }] height:52];
         if (!haveTcpdump) {
@@ -8067,7 +8187,8 @@ static BOOL g_settings_hardware_loading = NO;
     [b card:^(SettingsCard *card) {
         [card addRow:[self actionRow:
             self.confirmingDestructive ? L(@"Tap Again to Clear") : L(@"Clear Logs and Captures")
-            color:[self destructiveColor] width:w enabled:YES action:^{
+            color:[self destructiveColor] width:w enabled:!app.diagnosticsUploadInProgress action:^{
+                if (app.diagnosticsUploadInProgress) return;
                 if (!weakSelf.confirmingDestructive) {
                     [weakSelf armDestructiveConfirmation];
                     return;
@@ -8093,16 +8214,20 @@ static BOOL g_settings_hardware_loading = NO;
 
 - (void)uploadLogs {
     AppDelegate *app = self.appDelegate;
-    self.preparingLogs = YES;
+    if (!app || app.diagnosticsUploadInProgress) return;
+    app.diagnosticsUploadInProgress = YES;
+    BOOL helpersLogged = app.helpersLoggedThisRun;
+    NSString *snapshot = [app diagnosticsSessionSnapshotWithHelperLogs:helpersLogged];
     self.pageMessage = nil;
     [self render];
     __weak SettingsViewController *weakSelf = self;
-    dispatch_async(app.bgQueue, ^{
-        NSString *archive = [app createDiagnosticsArchive];
+    dispatch_async(app.diagnosticsQueue, ^{
+        NSString *archive = [app createDiagnosticsArchiveWithSnapshot:snapshot helperLogs:helpersLogged];
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!archive) {
-                weakSelf.preparingLogs = NO;
+                app.diagnosticsUploadInProgress = NO;
                 [weakSelf setMessage:L(@"Could not create the log archive") error:YES];
+                [app refreshPresentedSettings];
                 return;
             }
             NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:LOGS_URL]];
@@ -8112,10 +8237,15 @@ static BOOL g_settings_hardware_loading = NO;
             [[[NSURLSession sharedSession] uploadTaskWithRequest:request
                 fromFile:[NSURL fileURLWithPath:archive]
                 completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+                    [[NSFileManager defaultManager] removeItemAtPath:archive.stringByDeletingLastPathComponent
+                                                               error:nil];
                     dispatch_async(dispatch_get_main_queue(), ^{
-                        weakSelf.preparingLogs = NO;
-                        [weakSelf setMessage:(!error && [(NSHTTPURLResponse *)response statusCode] == 201)
-                            ? L(@"Logs sent to KCS") : L(@"Could not send logs") error:!!error || [(NSHTTPURLResponse *)response statusCode] != 201];
+                        app.diagnosticsUploadInProgress = NO;
+                        BOOL sent = !error && [response isKindOfClass:[NSHTTPURLResponse class]] &&
+                            [(NSHTTPURLResponse *)response statusCode] == 201;
+                        [weakSelf setMessage:sent ? L(@"Logs sent to KCS") : L(@"Could not send logs")
+                                       error:!sent];
+                        [app refreshPresentedSettings];
                     });
                 }] resume];
         });

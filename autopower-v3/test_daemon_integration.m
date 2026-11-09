@@ -100,23 +100,23 @@ int main(void) {
         assert(notify_set_state(requestToken, proof) == NOTIFY_STATUS_OK);
         NSData *bytes = [NSData dataWithBytes:&proof length:sizeof(proof)];
         assert([[NSFileManager defaultManager] createFileAtPath:[testProofDir() stringByAppendingPathComponent:@"stopped"] contents:bytes attributes:@{NSFilePosixPermissions:@0644}]);
-        nonce = proof; stopAckPending = YES; fakePower = -1; power = (PowerState){ 0, 50 };
+        nonce = proof; fakePower = -1; power = (PowerState){ 0, 50 };
         onStopped(0);
-        assert(stopAckPending && lockCalls == 0);
+        assert(nonce == proof && lockCalls == 0);
         fakePower = 0; fakeFront = YES;
         pollPower();
-        assert(!stopAckPending && lockCalls == 1 && nonce == 0);
+        assert(lockCalls == 1 && nonce == 0);
         uint64_t cleared = 1;
         assert(notify_get_state(requestToken, &cleared) == NOTIFY_STATUS_OK && cleared == 0);
         uint64_t savedPhase = 0, savedRequest = 1;
         assert(loadRecovery(&savedPhase, &savedRequest) && savedPhase == 4 && savedRequest == 0);
-        nonce = proof; stopAckPending = YES;
+        nonce = proof;
         powerSequence[0] = 0; powerSequence[1] = -1; powerSequenceCount = 2; powerSequenceIndex = 0;
         onStopped(0);
-        assert(stopAckPending && tasks.count == 1 && lockCalls == 1);
+        assert(nonce == proof && tasks.count == 1 && lockCalls == 1);
         powerSequenceCount = 0; powerSequenceIndex = 0;
         runNext();
-        assert(!stopAckPending && lockCalls == 2);
+        assert(nonce == 0 && lockCalls == 2);
         assert(saveRecovery(1, 0));
         recoveredPhase = recoveredStopRequest = 0;
         assert(loadRecovery(&recoveredPhase, &recoveredStopRequest) && recoveredPhase == 1);
@@ -129,7 +129,13 @@ int main(void) {
         onDisconnected();
         assert(nonce == 0 && deadline == 405);
         fakeStopFail = NO; fakeTime = 405; pollPower();
-        assert(nonce != 0 && deadline == 0);
+        assert(nonce != 0 && deadline == 0 && lockCalls == 2);
+        NSData *lateProof = [NSData dataWithBytes:&nonce length:sizeof(nonce)];
+        assert([lateProof writeToFile:[testProofDir() stringByAppendingPathComponent:@"stopped"] atomically:YES]);
+        // No stopped notification is delivered. The next fallback poll must lock.
+        fakeTime++; pollPower();
+        assert(nonce == 0 && lockCalls == 3);
+        assert(notify_get_state(requestToken, &cleared) == NOTIFY_STATUS_OK && cleared == 0);
         assert([[NSFileManager defaultManager] removeItemAtPath:testProofDir() error:NULL]);
         puts("daemon launch retry and deferred stop acknowledgement passed");
     }

@@ -293,6 +293,9 @@ static pair_ctx_t *g_pair = NULL;
 #define PAIRING_STORE_DIR  "/var/mobile/Library/Showcase"
 #define PAIRING_STORE_PATH PAIRING_STORE_DIR "/paired-controllers.plist"
 #define BT_ID_PATH "/tmp/showcase_bt_id"
+/* /tmp is emptied at boot; the Bluetooth helper keeps a persistent copy so the
+ * iPhone keeps seeing the same car identity even before BT re-reads its MAC. */
+#define BT_ID_PERSIST_PATH "/var/mobile/Library/Showcase/bt-id"
 
 static bool ensure_pair_context(void) {
     if (g_pair) return true;
@@ -470,8 +473,10 @@ static bool issue_baa_for_broker(void) {
 }
 
 static void baa_broker_handle_client(int client) {
+    if (!baa_peer_is_root(client) || !baa_prepare_socket(client)) return;
+    uint64_t deadline = baa_now_ms() + 3000;
     uint8_t header[BAA_BROKER_HEADER_SIZE];
-    if (!baa_read_exact(client, header, sizeof(header)) ||
+    if (!baa_read_exact(client, header, sizeof(header), deadline) ||
         memcmp(header, BAA_BROKER_MAGIC, 4) != 0) return;
     uint8_t opcode = header[4];
     uint32_t requestLength = baa_read_le32(header + 8);
@@ -480,7 +485,7 @@ static void baa_broker_handle_client(int client) {
     uint8_t *request = NULL;
     if (requestLength > 0) {
         request = malloc(requestLength);
-        if (!request || !baa_read_exact(client, request, requestLength)) {
+        if (!request || !baa_read_exact(client, request, requestLength, deadline)) {
             free(request);
             return;
         }
@@ -530,9 +535,9 @@ static void baa_broker_handle_client(int client) {
     free(request);
 
     baa_make_header(header, opcode, status, responseLength);
-    baa_write_exact(client, header, sizeof(header));
+    baa_write_exact(client, header, sizeof(header), deadline);
     if (responseLength > 0)
-        baa_write_exact(client, response, responseLength);
+        baa_write_exact(client, response, responseLength, deadline);
     free(response);
 }
 
@@ -1038,6 +1043,10 @@ static void handle_info(int sock, const HTTPReq *r) {
         NSString *bluetoothID = [NSString stringWithContentsOfFile:@BT_ID_PATH
                                                           encoding:NSUTF8StringEncoding
                                                              error:NULL];
+        if (bluetoothID.length == 0)
+            bluetoothID = [NSString stringWithContentsOfFile:@BT_ID_PERSIST_PATH
+                                                    encoding:NSUTF8StringEncoding
+                                                       error:NULL];
         bluetoothID = [bluetoothID stringByTrimmingCharactersInSet:
             [NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (bluetoothID.length == 17) {

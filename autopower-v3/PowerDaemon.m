@@ -45,7 +45,7 @@ static double deadline;
 static uint64_t nonce;
 static uint64_t recoveredPowerState, recoveredStopRequest, recoveredPhase;
 static BOOL waitingForUnlock;
-static BOOL launchPending, stopAckPending, stopAckRetryScheduled;
+static BOOL launchPending, stopAckRetryScheduled;
 static dispatch_source_t pollTimer;
 static uint64_t pollInterval;
 static int lastLoggedPower = -2;
@@ -313,26 +313,22 @@ static BOOL proofMatches(void) {
     close(lock);
     return completed;
 }
+static BOOL completeStopIfProven(void) {
+    if (!proofMatches()) return NO;
+    nonce = 0;
+    if (requestToken >= 0) notify_set_state(requestToken, 0);
+    return YES;
+}
 static void onStopped(unsigned int tries) {
-    if (!serviceEnabled() || !nonce) { stopAckPending = NO; return; }
-    int now = readPower();
-    if (now == 1) { stopAckPending = NO; return; }
-    if (now < 0) return;
-    if (proofMatches()) {
-        stopAckPending = NO;
-        nonce = 0;
-        if (requestToken >= 0) notify_set_state(requestToken, 0);
-        return;
-    }
+    if (!serviceEnabled() || !nonce || readPower() != 0 || completeStopIfProven()) return;
     if (tries < 60 && !stopAckRetryScheduled) {
         stopAckRetryScheduled = YES;
+        uint64_t request = nonce;
         int64_t delay = tries < 20 ? NSEC_PER_SEC / 4 : 15 * NSEC_PER_SEC;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay), dispatch_get_main_queue(), ^{
             stopAckRetryScheduled = NO;
-            onStopped(tries + 1);
+            if (nonce == request) onStopped(tries + 1);
         });
-    } else if (tries >= 60) {
-        stopAckPending = NO;
     }
 }
 static void pollPower(void);
@@ -342,7 +338,7 @@ static void pollAfterDebounce(PowerEvent event, double seconds) {
     });
 }
 static void pollPower(void) {
-    if (!serviceEnabled()) { publishPower(-1); deadline = 0; nonce = 0; waitingForUnlock = NO; launchPending = NO; stopAckPending = NO; updatePollTimer(); return; }
+    if (!serviceEnabled()) { publishPower(-1); deadline = 0; nonce = 0; waitingForUnlock = NO; launchPending = NO; updatePollTimer(); return; }
     int now = readPower();
     if (now != lastLoggedPower) { NSLog(@"[ShowcasePower] power state=%d", now); lastLoggedPower = now; }
     int previous = power.last;
@@ -352,10 +348,8 @@ static void pollPower(void) {
         event.schedule = 0;
         if (now == 0 && recoveredStopRequest) {
             nonce = recoveredStopRequest;
-            if (requestToken >= 0 && notify_set_state(requestToken, nonce) == NOTIFY_STATUS_OK &&
-                notify_post(kStop) == NOTIFY_STATUS_OK) {
-                stopAckPending = YES;
-            } else {
+            if (requestToken < 0 || notify_set_state(requestToken, nonce) != NOTIFY_STATUS_OK ||
+                notify_post(kStop) != NOTIFY_STATUS_OK) {
                 nonce = 0;
                 event.schedule = 1;
             }
@@ -379,7 +373,6 @@ static void pollPower(void) {
         nonce = 0;
         saveRecovery(now ? 2 : 1, 0);
         if (phaseToken >= 0) notify_set_state(phaseToken, now ? 2 : 1);
-        stopAckPending = NO;
         if (requestToken >= 0) notify_set_state(requestToken, 0);
         if (!now) { waitingForUnlock = NO; launchPending = NO; }
         pollAfterDebounce(event, debounce + 0.01);
@@ -391,7 +384,8 @@ static void pollPower(void) {
         if (!now) saveRecovery(nonce ? 4 : 1, nonce);
         if (phaseToken >= 0) notify_set_state(phaseToken, now ? (launchPending ? 2 : 5) : (nonce ? 4 : 1));
     }
-    if (stopAckPending && !stopAckRetryScheduled && now == 0) onStopped(0);
+    // The app can write valid proof and exit before sending the notification.
+    if (nonce && now == 0) completeStopIfProven();
     updatePollTimer();
 }
 static void powerChanged(void *context) { (void)context; pollPower(); }
@@ -420,7 +414,7 @@ int main(int argc, char **argv) {
         notify_get_state(phaseToken, &recoveredPhase);
         loadRecovery(&recoveredPhase, &recoveredStopRequest);
         int stoppedToken = 0, refreshToken = 0, unlockedToken = 0;
-        if (notify_register_dispatch(kStopped, &stoppedToken, dispatch_get_main_queue(), ^(int token) { (void)token; stopAckPending = YES; onStopped(0); }) != NOTIFY_STATUS_OK ||
+        if (notify_register_dispatch(kStopped, &stoppedToken, dispatch_get_main_queue(), ^(int token) { (void)token; onStopped(0); }) != NOTIFY_STATUS_OK ||
             notify_register_dispatch(kRefresh, &refreshToken, dispatch_get_main_queue(), ^(int token) { (void)token; pollPower(); }) != NOTIFY_STATUS_OK ||
             notify_register_dispatch("com.apple.springboard.lockstate", &unlockedToken, dispatch_get_main_queue(), ^(int token) {
             (void)token;
