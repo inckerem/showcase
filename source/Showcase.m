@@ -35,6 +35,7 @@
 #include <pthread.h>
 #include <spawn.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <time.h>
 #include <stdlib.h>
@@ -714,6 +715,22 @@ typedef struct {
 
 static const char *first_existing_tool(const char *const paths[]);
 
+/* All callers own these spawned children. Reap on timeout so an
+ * unresponsive system command cannot pin the serial connection queue. */
+static int wait_for_command(pid_t pid, uint64_t deadline) {
+    int status;
+    for (;;) {
+        pid_t done = waitpid(pid, &status, WNOHANG);
+        if (done == pid) return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        if (done < 0 && errno != EINTR) return -1;
+        if (monotonic_nanos_now() >= deadline) break;
+        usleep(20000);
+    }
+    kill(pid, SIGKILL);
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    return -1;
+}
+
 static NSData *capture_process_output(const char *path, char *const argv[]) {
     int pipes[2];
     if (!path || pipe(pipes) != 0) return nil;
@@ -735,22 +752,27 @@ static NSData *capture_process_output(const char *path, char *const argv[]) {
         return nil;
     }
 
+    uint64_t deadline = monotonic_nanos_now() + 5 * NSEC_PER_SEC;
     NSMutableData *output = [NSMutableData data];
     uint8_t buffer[8192];
+    BOOL complete = NO;
     for (;;) {
+        uint64_t now = monotonic_nanos_now();
+        if (now >= deadline) break;
+        struct pollfd input = { .fd = pipes[0], .events = POLLIN };
+        int remainingMs = (int)((deadline - now + 999999) / 1000000);
+        int ready = poll(&input, 1, remainingMs);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) break;
         ssize_t count = read(pipes[0], buffer, sizeof(buffer));
-        if (count > 0) {
-            [output appendBytes:buffer length:(NSUInteger)count];
-        } else if (count < 0 && errno == EINTR) {
-            continue;
-        } else {
-            break;
-        }
+        if (count < 0 && errno == EINTR) continue;
+        if (count == 0) complete = YES;
+        if (count <= 0 || output.length + (NSUInteger)count > 4 * 1024 * 1024) break;
+        [output appendBytes:buffer length:(NSUInteger)count];
     }
     close(pipes[0]);
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-    return output;
+    int rc = wait_for_command(pid, complete ? deadline : monotonic_nanos_now());
+    return complete && rc == 0 ? output : nil;
 }
 
 static NSString *wlan_ioreg_snapshot(BOOL fullTree) {
@@ -1769,7 +1791,6 @@ static void disable_btstack_hci_logging(void) {
 
 static int run_blocking(const char *path, char *const argv[]) {
     pid_t pid;
-    int status;
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
@@ -1787,8 +1808,16 @@ static int run_blocking(const char *path, char *const argv[]) {
     int err = posix_spawn(&pid, path, &actions, NULL, argv, environ);
     posix_spawn_file_actions_destroy(&actions);
     if (err != 0) { ip_log("  posix_spawn FAIL: %s", strerror(err)); return -1; }
-    if (waitpid(pid, &status, 0) < 0) { ip_log("  waitpid FAIL: %s", strerror(errno)); return -1; }
-    int rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    int rc;
+    if (!strcmp(argv[0], "launchctl")) {
+        rc = wait_for_command(pid, monotonic_nanos_now() + 8 * NSEC_PER_SEC);
+        if (rc < 0) ip_log("  launchctl failed or timed out: %s", argv[1] ?: "");
+    } else {
+        int status;
+        pid_t done;
+        do { done = waitpid(pid, &status, 0); } while (done < 0 && errno == EINTR);
+        rc = done == pid && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
     ip_log("  exit=%d", rc);
     return rc;
 }
@@ -1866,11 +1895,6 @@ static BOOL wait_for_bt_ready_or_exit(pid_t pid, int seconds) {
     int loops = seconds * 10;
     for (int i = 0; i < loops; i++) {
         if (flow_cancelled()) return NO;
-        if (access(BT_READY_PATH, F_OK) == 0) {
-            ip_log("[BT] ready sentinel observed at %s", BT_READY_PATH);
-            return YES;
-        }
-
         int status = 0;
         pid_t done = waitpid(pid, &status, WNOHANG);
         if (done == pid) {
@@ -1892,6 +1916,11 @@ static BOOL wait_for_bt_ready_or_exit(pid_t pid, int seconds) {
             }
             ip_log("[BT] waitpid while waiting for ready sentinel failed: %s", strerror(errno));
         }
+        if (access(BT_READY_PATH, F_OK) == 0) {
+            ip_log("[BT] ready sentinel observed at %s", BT_READY_PATH);
+            return YES;
+        }
+
         usleep(100000);
     }
 
@@ -4959,12 +4988,6 @@ static char carVideoItemStatusContext;
         [self failBluetoothWithReason:
             @"The Bluetooth helper could not be started."
                              unsupported:NO];
-        return;
-    }
-    if (!wait_for_pid_alive(self.carplayBtPid, 8, "carplay_bt")) {
-        [self failBluetoothWithReason:
-            @"The Bluetooth helper exited during setup."
-                             unsupported:YES];
         return;
     }
     if (!wait_for_bt_ready_or_exit(self.carplayBtPid, BT_READY_SECONDS)) {

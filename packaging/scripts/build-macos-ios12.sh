@@ -54,7 +54,7 @@ clang -Os -arch arm64 -fobjc-arc -miphoneos-version-min=12.0 -isysroot "$IOS12_S
   "${mirror_flags[@]}" \
   -Wl,-weak_library,packaging/control/ShowcasePower.tbd \
   -Wl,-undefined,dynamic_lookup
-clang -Os -arch arm64 -fobjc-arc -miphoneos-version-min=12.0 -isysroot "$IOS12_SDK" \
+clang -arch arm64 -fobjc-arc -miphoneos-version-min=12.0 -isysroot "$IOS12_SDK" \
   -o "$TASK_APP/carplay_bt" source/carplay_bt.m "$TASK_LIB" -framework Foundation \
   -framework Security -Wl,-undefined,dynamic_lookup
 clang -O1 -arch arm64 -fobjc-arc -miphoneos-version-min=12.0 -isysroot "$IOS12_SDK" \
