@@ -47,14 +47,14 @@ if [[ ${SHOWCASE_VIDEO_IN_CAR_BENCH:-0} == 1 ]]; then
   DISPLAY_VERSION="$DISPLAY_VERSION (Video Bench)"
 fi
 cd "$TASK_ROOT"
-clang -arch arm64 -fobjc-arc -miphoneos-version-min=12.0 -isysroot "$IOS12_SDK" \
+clang -Os -arch arm64 -fobjc-arc -miphoneos-version-min=12.0 -isysroot "$IOS12_SDK" \
   -DAPP_VERSION="\"$DISPLAY_VERSION\"" -DPACKAGE_VERSION="\"$PACKAGE_VERSION\"" \
   -o "$TASK_APP/Showcase" source/Showcase.m -framework UIKit -framework AVFoundation \
   -framework AudioToolbox -framework CoreMedia -framework Foundation -framework Security \
   "${mirror_flags[@]}" \
   -Wl,-weak_library,packaging/control/ShowcasePower.tbd \
   -Wl,-undefined,dynamic_lookup
-clang -arch arm64 -fobjc-arc -miphoneos-version-min=12.0 -isysroot "$IOS12_SDK" \
+clang -Os -arch arm64 -fobjc-arc -miphoneos-version-min=12.0 -isysroot "$IOS12_SDK" \
   -o "$TASK_APP/carplay_bt" source/carplay_bt.m "$TASK_LIB" -framework Foundation \
   -framework Security -Wl,-undefined,dynamic_lookup
 clang -O1 -arch arm64 -fobjc-arc -miphoneos-version-min=12.0 -isysroot "$IOS12_SDK" \

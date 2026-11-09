@@ -1130,8 +1130,8 @@ static CarPlayVideoSize carplay_select_video(double nativeLong, double nativeSho
 }
 /* END display selector */
 
-/* The receiver's screen and capability. The Wi-Fi bus probe runs ioreg, so
- * the answer is kept for the life of the app. */
+/* Screen properties are initialized on the main thread at launch. The slow
+ * Wi-Fi bus probe runs independently: callers never wait for ioreg. */
 typedef struct {
     double nativeLong, nativeShort;
     uint64_t memory;
@@ -1143,6 +1143,8 @@ typedef struct {
 static CarPlayDisplayHardware carplay_display_hardware(void) {
     static CarPlayDisplayHardware hardware;
     static dispatch_once_t once;
+    static dispatch_once_t probeOnce;
+    static int attachment = CarPlayWLANAttachmentUnknown;
     dispatch_once(&once, ^{
         UIScreen *screen = [UIScreen mainScreen];
         CGSize nativeSize = [screen respondsToSelector:@selector(nativeBounds)]
@@ -1157,12 +1159,18 @@ static CarPlayDisplayHardware carplay_display_hardware(void) {
         NSInteger screenFPS = [screen respondsToSelector:@selector(maximumFramesPerSecond)]
             ? screen.maximumFramesPerSecond : 60;
         hardware.screenFPS = (uint16_t)MAX(30, MIN(screenFPS, 60));
-        hardware.wlanAttachment = wlan_attachment_class();
-        /* HSIC-attached Wi-Fi drops bursts; 30 fps halves them. */
-        hardware.defaultFPS = hardware.wlanAttachment == CarPlayWLANAttachmentHSIC
-            ? 30 : hardware.screenFPS;
     });
-    return hardware;
+    dispatch_once(&probeOnce, ^{
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            __atomic_store_n(&attachment, (int)wlan_attachment_class(), __ATOMIC_RELEASE);
+        });
+    });
+    CarPlayDisplayHardware result = hardware;
+    result.wlanAttachment = (CarPlayWLANAttachment)__atomic_load_n(&attachment, __ATOMIC_ACQUIRE);
+    /* Until the probe completes use the conservative HSIC-safe default. */
+    result.defaultFPS = result.wlanAttachment == CarPlayWLANAttachmentPCIe
+        ? result.screenFPS : 30;
+    return result;
 }
 
 static CarPlayVideoPriority carplay_video_priority(void) {
@@ -3491,8 +3499,8 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{ send_anonymous_usage(); });
     _diagnosticsEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:DIAGNOSTICS_ENABLED_KEY];
-    /* Settings reads the display hardware; probe the Wi-Fi bus off the main thread now. */
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ carplay_display_hardware(); });
+    /* Capture UIKit screen properties on main; ioreg is scheduled separately. */
+    carplay_display_hardware();
     /* A session that ended without stopFlow may have left a network paused. */
     dispatch_async(self.bgQueue, ^{
         stop_bluetooth_guard();
