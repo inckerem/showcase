@@ -144,6 +144,8 @@
 @property (nonatomic) BOOL needsKeyframe;
 @property (nonatomic) CFTimeInterval lastSend;
 @property (nonatomic) CFTimeInterval lastFrame;
+@property (nonatomic) CFTimeInterval encodeStarted;
+@property (nonatomic) NSUInteger encoderGeneration;
 @end
 
 @implementation MirrorController
@@ -243,8 +245,15 @@
     self.lastSend = NSProcessInfo.processInfo.systemUptime;
     self.timer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *timer) {
         MirrorController *controller = weakSelf;
-        if (controller && NSProcessInfo.processInfo.systemUptime - controller.lastSend > 2.0 &&
-            !controller.sending) {
+        if (!controller) return;
+        CFTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+        if (controller.encoding && now - controller.encodeStarted > 1.0) {
+            [controller closeEncoder];
+            controller.encoding = NO;
+            controller.needsKeyframe = YES;
+            NSLog(@"[Showcase Mirror] Encoder stalled; restarting on the next frame");
+        }
+        if (!controller.sending && !controller.encoding && now - controller.lastSend > 2.0) {
             uint32_t zero = 0;
             [controller send:[NSData dataWithBytes:&zero length:sizeof(zero)]];
         }
@@ -328,6 +337,7 @@
 }
 
 - (void)closeEncoder {
+    self.encoderGeneration++;
     if (!self.encoder) return;
     VTCompressionSessionInvalidate(self.encoder);
     CFRelease(self.encoder);
@@ -337,17 +347,27 @@
 - (BOOL)openEncoderWidth:(int)width height:(int)height {
     [self closeEncoder];
     VTCompressionSessionRef encoder = NULL;
-    if (VTCompressionSessionCreate(NULL, width, height, kCMVideoCodecType_H264,
-                                    NULL, NULL, NULL, NULL, NULL, &encoder)) return NO;
+    NSDictionary *specification = @{
+        (__bridge NSString *)kVTVideoEncoderSpecification_EnableLowLatencyRateControl: @YES
+    };
+    OSStatus status = VTCompressionSessionCreate(NULL, width, height, kCMVideoCodecType_H264,
+        (__bridge CFDictionaryRef)specification, NULL, NULL, NULL, NULL, &encoder);
+    if (status) {
+        status = VTCompressionSessionCreate(NULL, width, height, kCMVideoCodecType_H264,
+            NULL, NULL, NULL, NULL, NULL, &encoder);
+        if (status) return NO;
+    }
     self.encoder = encoder;
     self.frameWidth = width;
     self.frameHeight = height;
     self.needsKeyframe = YES;
     VTSessionSetProperty(encoder, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     VTSessionSetProperty(encoder, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+    VTSessionSetProperty(encoder, kVTCompressionPropertyKey_MaxFrameDelayCount, (__bridge CFNumberRef)@0);
     VTSessionSetProperty(encoder, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_Baseline_AutoLevel);
     VTSessionSetProperty(encoder, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFNumberRef)@1400000);
     VTSessionSetProperty(encoder, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, (__bridge CFNumberRef)@1);
+    VTSessionSetProperty(encoder, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFNumberRef)@20);
     return VTCompressionSessionPrepareToEncodeFrames(encoder) == noErr;
 }
 
@@ -355,10 +375,10 @@
         ofType:(SCStreamOutputType)type {
     if (stream != self.stream || !self.peer || self.encoding || self.sending) return;
     CFTimeInterval now = NSProcessInfo.processInfo.systemUptime;
-    if (now - self.lastFrame < 1.0 / 20.0) return;
-    self.lastFrame = now;
+    if (now - self.lastFrame < 0.045) return;
     CVImageBufferRef image = CMSampleBufferGetImageBuffer(sample);
     if (!image || !CMSampleBufferDataIsReady(sample)) return;
+    self.lastFrame = now;
     int width = (int)CVPixelBufferGetWidth(image), height = (int)CVPixelBufferGetHeight(image);
     if ((!self.encoder || width != self.frameWidth || height != self.frameHeight) &&
         ![self openEncoderWidth:width height:height]) {
@@ -367,14 +387,16 @@
     }
     NSDictionary *properties = self.needsKeyframe ? @{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES} : nil;
     self.encoding = YES;
+    self.encodeStarted = now;
+    NSUInteger generation = self.encoderGeneration;
     __weak typeof(self) weakSelf = self;
     OSStatus result = VTCompressionSessionEncodeFrameWithOutputHandler(self.encoder, image,
-        CMSampleBufferGetPresentationTimeStamp(sample), kCMTimeInvalid, (__bridge CFDictionaryRef)properties,
+        CMTimeMakeWithSeconds(now, 1000000), CMTimeMake(1, 20), (__bridge CFDictionaryRef)properties,
         NULL, ^(OSStatus error, VTEncodeInfoFlags flags, CMSampleBufferRef output) {
             if (output) CFRetain(output);
             dispatch_async(dispatch_get_main_queue(), ^{
                 MirrorController *controller = weakSelf;
-                if (controller.stream == stream) {
+                if (controller && controller.stream == stream && controller.encoderGeneration == generation) {
                     controller.encoding = NO;
                     if (!error && output && !controller.sending) [controller sendFrame:output];
                     else controller.needsKeyframe = YES;

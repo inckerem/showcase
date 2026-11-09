@@ -92,6 +92,14 @@
       "views": [
         {
           "class": "DepictionHeaderView",
+          "title": "1.0 Beta 5-11 · KCS"
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "Ekran yansıtma oynatıcısı takılırsa bir sonraki ana kareyle yeniden başlar. iPhone için Showcase Mirror 0.1.3 önerilir."
+        },
+        {
+          "class": "DepictionHeaderView",
           "title": "1.0 Beta 5-10 · KCS"
         },
         {

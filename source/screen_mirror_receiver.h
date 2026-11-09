@@ -10,6 +10,7 @@
 @property (nonatomic, strong) UIImageView *pairingQR;
 @property (nonatomic, strong) NSTimer *watchdog;
 @property (nonatomic) CFTimeInterval lastPacket;
+@property (nonatomic) CFTimeInterval lastEnqueue;
 @property (nonatomic) CMVideoFormatDescriptionRef format;
 @property (nonatomic) BOOL needsKeyframe;
 - (void)finish;
@@ -158,6 +159,7 @@
     self.peer = peer;
     self.needsKeyframe = YES;
     self.lastPacket = NSProcessInfo.processInfo.systemUptime;
+    self.lastEnqueue = self.lastPacket;
     __weak typeof(self) weakSelf = self;
     self.watchdog = [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *timer) {
         ShowcaseMirrorReceiver *receiver = weakSelf;
@@ -237,6 +239,7 @@
     if (offset >= data.length || (sizes[0] == 0) != (sizes[1] == 0)) return NO;
     BOOL keyframe = sizes[0] > 0;
     if (self.display.status == AVQueuedSampleBufferRenderingStatusFailed) {
+        ip_log("mirror decoder failed: %@", self.display.error.localizedDescription ?: @"unknown");
         [self.display flushAndRemoveImage];
         self.needsKeyframe = YES;
     }
@@ -253,6 +256,11 @@
             CFRelease(format);
         }
     }
+    CFTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    if (!self.display.readyForMoreMediaData && keyframe && now - self.lastEnqueue > 0.5) {
+        ip_log("mirror decoder stalled; resetting on keyframe");
+        [self.display flush];
+    }
     if (!self.display.readyForMoreMediaData) {
         self.needsKeyframe = YES;
         return YES;
@@ -265,7 +273,7 @@
                                           kCMBlockBufferAssureMemoryNowFlag, &block)) return NO;
     OSStatus result = CMBlockBufferReplaceDataBytes(bytes + offset, block, 0, size);
     CMSampleBufferRef sample = NULL;
-    CMSampleTimingInfo timing = { kCMTimeInvalid, CMClockGetTime(CMClockGetHostTimeClock()), kCMTimeInvalid };
+    CMSampleTimingInfo timing = { CMTimeMake(1, 20), kCMTimeInvalid, kCMTimeInvalid };
     if (!result) result = CMSampleBufferCreateReady(NULL, block, self.format, 1, 1, &timing, 1, &size, &sample);
     CFRelease(block);
     if (result) return NO;
@@ -274,6 +282,7 @@
     CFDictionarySetValue(flags, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
     if (!keyframe) CFDictionarySetValue(flags, kCMSampleAttachmentKey_NotSync, kCFBooleanTrue);
     [self.display enqueueSampleBuffer:sample];
+    self.lastEnqueue = now;
     CFRelease(sample);
     self.status.hidden = YES;
     self.pairingQR.hidden = YES;

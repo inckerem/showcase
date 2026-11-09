@@ -7,8 +7,8 @@
   <key>CFBundleDisplayName</key><string>Showcase Mirror</string>
   <key>CFBundleName</key><string>Showcase Mirror</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleVersion</key><string>3</string>
-  <key>CFBundleShortVersionString</key><string>0.1.2</string>
+  <key>CFBundleVersion</key><string>4</string>
+  <key>CFBundleShortVersionString</key><string>0.1.3</string>
   <key>UILaunchScreen</key><dict/>
   <key>UIApplicationSceneManifest</key>
   <dict>
@@ -30,6 +30,7 @@
   <string>iPhone ekranını yerel ağdaki Showcase alıcısına canlı yansıtmak için.</string>
   <key>NSLocalNetworkUsageDescription</key>
   <string>Aynı Wi-Fi ağındaki iPad’de Showcase’e bağlanmak için.</string>
+  <key>ITSAppUsesNonExemptEncryption</key><false/>
   <key>UIBackgroundModes</key>
   <array><string>screen-capture</string></array>
 </dict>

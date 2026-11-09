@@ -1,10 +1,10 @@
 Package: tr.net.kcs.showcase.autopower
 Name: Showcase Arac Modu
-Version: 0.1~beta4-2
+Version: 0.1~beta4-3
 Architecture: iphoneos-arm
 Section: Utilities
 Maintainer: KCS <info@kcs.net.tr>
-Depends: firmware (>= 12.0), firmware (<< 13.0), com.rostane.showcase (= 1.0~beta5-10+mirror) | com.rostane.showcase (= 1.0~beta5-9) | com.rostane.showcase (= 1.0~beta5-7)
+Depends: firmware (>= 12.0), firmware (<< 13.0), com.rostane.showcase (= 1.0~beta5-11+mirror) | com.rostane.showcase (= 1.0~beta5-10+mirror) | com.rostane.showcase (= 1.0~beta5-9) | com.rostane.showcase (= 1.0~beta5-7)
 Icon: https://kcs.net.tr/repo/icons/showcase.png
 Description: Hizlandirilmis sarjla acilma modu, iOS 12.
  SpringBoard yerine ayri bir guc servisi kullanir.
