@@ -12,6 +12,7 @@
 "Give us a star on GitHub!" = "Donnez-nous une étoile sur GitHub !";
 "Copy Link" = "Copier le lien";
 "Open GitHub" = "Ouvrir GitHub";
+"Safe travels" = "Bonne route";
 "Settings" = "Réglages";
 "CarPlay services" = "Services CarPlay";
 "Verification" = "Vérification";
@@ -35,6 +36,7 @@
 "Getting Ready" = "Préparation";
 "Connecting" = "Connexion";
 "Choose %@ in CarPlay on your iPhone" = "Choisissez %@ dans CarPlay sur votre iPhone";
+"See you soon" = "À bientôt";
 "Stopping" = "Arrêt";
 "Connect this device to the Wi-Fi network first." = "Connectez d’abord cet appareil au réseau Wi-Fi.";
 "Could not read the connected Wi-Fi name. Check Wi-Fi in Settings and try again." = "Impossible de lire le nom du réseau Wi-Fi connecté. Vérifiez le Wi-Fi dans Réglages et réessayez.";
@@ -121,6 +123,7 @@
 "View Source" = "Voir le code source";
 "Default" = "Par défaut";
 "Device Language" = "Langue de l’appareil";
+"Show Connection Steps" = "Afficher les étapes de connexion";
 "Detailed Logging" = "Journal détaillé";
 "Preparing Logs…" = "Préparation du journal…";
 "Send Logs to KCS" = "Envoyer les journaux à KCS";

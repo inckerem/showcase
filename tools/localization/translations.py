@@ -80,6 +80,9 @@ T = {
         'Elige %@ en CarPlay en tu iPhone',
         '在 iPhone 的 CarPlay 中选择“%@”',
         'iPhoneのCarPlayで「%@」を選択してください'),
+    'See you soon': ('À bientôt', 'Hasta pronto', '下次见', 'またお会いしましょう'),
+    'Safe travels': ('Bonne route', 'Buen viaje', '一路平安', 'お気をつけて'),
+    'Show Connection Steps': ('Afficher les étapes de connexion', 'Mostrar pasos de conexión', '显示连接步骤', '接続手順を表示'),
     'Stopping': ('Arrêt', 'Deteniendo', '正在停止', '停止中'),
     'Bluetooth Hardware Not Supported': (
         'Matériel Bluetooth non pris en charge',

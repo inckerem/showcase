@@ -221,6 +221,7 @@ cp "$REPO_ROOT/source/ent_app.xml" "$WORK/rootfs/var/jb/usr/share/showcase/ent_a
 cp "$REPO_ROOT/source/ent_bt.xml" "$WORK/rootfs/var/jb/usr/share/showcase/ent_bt.xml"
 cp "$REPO_ROOT/source/ent_svc.xml" "$WORK/rootfs/var/jb/usr/share/showcase/ent_svc.xml"
 cp "$REPO_ROOT/source/ent_btdaemon.xml" "$WORK/rootfs/var/jb/usr/share/showcase/ent_btdaemon.xml"
+cp "$REPO_ROOT/source/Icon-KCSMark.png" "$WORK/rootfs/var/jb/Applications/Showcase.app/"
 cp "$REPO_ROOT/icon/generated/"*.png "$WORK/rootfs/var/jb/Applications/Showcase.app/"
 rm -rf "$WORK/rootfs/var/jb/Applications/Showcase.app/"*.lproj
 cp -R "$REPO_ROOT/source/Localizations/"*.lproj "$WORK/rootfs/var/jb/Applications/Showcase.app/"

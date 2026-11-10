@@ -171,6 +171,7 @@ done
 fill_version "$REPO_ROOT/source/Info.plist" > "$WORK/rootfs/Applications/Showcase.app/Info.plist"
 rm -rf "$WORK/rootfs/Applications/Showcase.app/"*.lproj
 cp -R "$REPO_ROOT/source/Localizations/"*.lproj "$WORK/rootfs/Applications/Showcase.app/"
+cp "$REPO_ROOT/source/Icon-KCSMark.png" "$WORK/rootfs/Applications/Showcase.app/"
 cp "$REPO_ROOT/icon/generated/Icon-OEM-104.png" \
    "$WORK/rootfs/Applications/Showcase.app/Icon-OEM-104.png"
 cp "$REPO_ROOT/icon/generated/Icon-OEM-120.png" \

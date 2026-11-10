@@ -260,10 +260,13 @@
     }];
     self.awaitingPicker = YES;
     SCContentSharingPicker *picker = SCContentSharingPicker.sharedPicker;
+    SCContentSharingPickerConfiguration *configuration = [SCContentSharingPickerConfiguration new];
+    configuration.showsMicrophoneControl = NO;
+    picker.defaultConfiguration = configuration;
     [picker addObserver:self];
     picker.active = YES;
-    self.status.text = @"Sistem ekranında paylaşımı onayla.";
-    [picker presentPickerUsingContentStyle:SCShareableContentStyleDisplay];
+    self.status.text = @"Sistem ekranında tam ekran paylaşımını onayla.";
+    [picker present];
 }
 
 - (void)stop:(NSString *)status {
@@ -306,6 +309,11 @@
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!self.peer || !self.awaitingPicker) return;
         self.awaitingPicker = NO;
+        NSLog(@"[Showcase Mirror] Capture filter style: %ld", (long)filter.style);
+        if (filter.style == SCShareableContentStyleWindow) {
+            [self stop:@"Diğer uygulamaları yansıtmak için tam ekran paylaşımını seç."];
+            return;
+        }
         CGSize size = filter.contentRect.size;
         if (size.width <= 0 || size.height <= 0) size = self.view.bounds.size;
         double scale = 960.0 / MAX(size.width, size.height);
@@ -324,7 +332,7 @@
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (self.stream != stream) return;
                 if (error) [self stop:error.localizedDescription];
-                else self.status.text = @"Ekran iPad’e yansıtılıyor.";
+                else self.status.text = @"Ekran iPad’e yansıtılıyor. Ana ekrana veya başka bir uygulamaya geçebilirsin.";
             });
         }];
     });
@@ -332,7 +340,11 @@
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (self.stream == stream) [self stop:error.localizedDescription];
+        if (self.stream == stream) {
+            NSLog(@"[Showcase Mirror] Capture ended (%@:%ld, app state=%ld)",
+                  error.domain, (long)error.code, (long)UIApplication.sharedApplication.applicationState);
+            [self stop:error.localizedDescription ?: @"iOS ekran paylaşımını bitirdi."];
+        }
     });
 }
 

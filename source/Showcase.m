@@ -125,6 +125,7 @@ static NSString *L(NSString *english) {
  * Application logger
  * ═══════════════════════════════════════════════════════════════ */
 
+#define CONNECTION_STEPS_KEY @"kcsShowConnectionSteps"
 #define LOG_DIR     "/var/mobile/Library/Showcase/logs"
 #define APP_LOG     LOG_DIR "/app.log"
 #define TCPDUMP_DIR  "/var/mobile/Library/Showcase/dumps"
@@ -3421,6 +3422,92 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 #import "screen_mirror_receiver.h"
 #endif
 
+/* The orbit is a cached image; only its transform moves on the old iPad. */
+@interface ShowcaseConnectionBadge : UIView
+@property (nonatomic, strong) UIImageView *orbit;
+@property (nonatomic, strong) UIImageView *mark;
+@property (nonatomic) NSInteger motionMode;
+- (void)showMotionMode:(NSInteger)mode;
+@end
+
+@implementation ShowcaseConnectionBadge
+- (instancetype)initWithFrame:(CGRect)frame {
+    if (!(self = [super initWithFrame:frame])) return nil;
+    self.userInteractionEnabled = NO;
+    self.accessibilityElementsHidden = YES;
+
+    UIGraphicsBeginImageContextWithOptions(CGSizeMake(160, 160), NO, 0);
+    CGPoint center = CGPointMake(80, 80);
+    CGFloat radius = 70;
+    UIBezierPath *track = [UIBezierPath bezierPathWithArcCenter:center radius:radius
+        startAngle:0 endAngle:2 * M_PI clockwise:YES];
+    track.lineWidth = 2;
+    [[UIColor colorWithRed:0.35 green:0.57 blue:0.87 alpha:0.25] setStroke];
+    [track stroke];
+    UIBezierPath *arc = [UIBezierPath bezierPathWithArcCenter:center radius:radius
+        startAngle:-M_PI_2 endAngle:M_PI_4 clockwise:YES];
+    arc.lineWidth = 4;
+    arc.lineCapStyle = kCGLineCapRound;
+    [[UIColor colorWithRed:0.39 green:0.76 blue:1 alpha:1] setStroke];
+    [arc stroke];
+    CGPoint end = CGPointMake(80 + radius * cos(M_PI_4), 80 + radius * sin(M_PI_4));
+    [[UIColor colorWithRed:0.70 green:0.91 blue:1 alpha:1] setFill];
+    [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(end.x-4, end.y-4, 8, 8)] fill];
+    self.orbit = [[UIImageView alloc] initWithImage:UIGraphicsGetImageFromCurrentImageContext()];
+    UIGraphicsEndImageContext();
+    [self addSubview:self.orbit];
+
+    self.mark = [[UIImageView alloc] initWithImage:[UIImage imageNamed:@"Icon-KCSMark"]];
+    self.mark.layer.cornerRadius = 12;
+    self.mark.clipsToBounds = YES;
+    [self addSubview:self.mark];
+    self.hidden = YES;
+    return self;
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat size = MIN(self.bounds.size.width, self.bounds.size.height);
+    CGPoint center = CGPointMake(CGRectGetMidX(self.bounds), CGRectGetMidY(self.bounds));
+    self.orbit.bounds = CGRectMake(0, 0, size, size);
+    self.orbit.center = center;
+    self.mark.bounds = CGRectMake(0, 0, size * 0.48, size * 0.48);
+    self.mark.center = center;
+}
+
+- (void)showMotionMode:(NSInteger)mode {
+    if (self.motionMode == mode) return;
+    self.motionMode = mode;
+    self.hidden = mode == 0;
+    [self.orbit.layer removeAllAnimations];
+    [self.mark.layer removeAllAnimations];
+    self.orbit.transform = CGAffineTransformIdentity;
+    self.orbit.alpha = 1;
+    self.mark.transform = CGAffineTransformIdentity;
+    self.mark.alpha = 1;
+    if (!mode || UIAccessibilityIsReduceMotionEnabled()) return;
+
+    if (mode == 1) {
+        [UIView animateKeyframesWithDuration:2.8 delay:0
+            options:UIViewKeyframeAnimationOptionRepeat | UIViewKeyframeAnimationOptionCalculationModeLinear
+            animations:^{
+                for (NSUInteger i = 0; i < 4; i++) {
+                    [UIView addKeyframeWithRelativeStartTime:i * 0.25 relativeDuration:0.25 animations:^{
+                        self.orbit.transform = CGAffineTransformMakeRotation((i + 1) * M_PI_2);
+                    }];
+                }
+            } completion:nil];
+    } else {
+        self.mark.transform = CGAffineTransformMakeScale(0.88, 0.88);
+        [UIView animateWithDuration:0.58 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+            self.mark.transform = CGAffineTransformIdentity;
+            self.orbit.transform = CGAffineTransformMakeScale(1.12, 1.12);
+            self.orbit.alpha = 0.25;
+        } completion:nil];
+    }
+}
+@end
+
 @interface AppDelegate : UIResponder <UIApplicationDelegate>
 @property (nonatomic, strong) UIWindow *window;
 @property (nonatomic, strong) RootViewController *vc;
@@ -3443,6 +3530,9 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 @property (nonatomic, strong) UIButton *secondaryButton;   /* Cancel */
 @property (nonatomic, strong) UIActivityIndicatorView *spinner;
 @property (nonatomic, strong) ConnectStepsView *stepsView;
+@property (nonatomic, strong) ShowcaseConnectionBadge *connectionBadge;
+@property (nonatomic, strong) UILabel *farewellCaption;
+@property (nonatomic) BOOL showFarewell;
 
 /* Connection progress shown while the iPhone connects */
 @property (nonatomic, assign) NSInteger connectCompleted;
@@ -4104,6 +4194,16 @@ static char carVideoItemStatusContext;
     self.spinner.hidesWhenStopped = YES;
     [self.setupOverlay addSubview:self.spinner];
 
+    self.connectionBadge = [[ShowcaseConnectionBadge alloc] initWithFrame:CGRectZero];
+    [self.setupOverlay addSubview:self.connectionBadge];
+    self.farewellCaption = [UILabel new];
+    self.farewellCaption.text = L(@"Safe travels");
+    self.farewellCaption.textColor = [UIColor colorWithRed:0.65 green:0.75 blue:0.87 alpha:1];
+    self.farewellCaption.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
+    self.farewellCaption.textAlignment = NSTextAlignmentCenter;
+    self.farewellCaption.hidden = YES;
+    [self.setupOverlay addSubview:self.farewellCaption];
+
     /* Connection checklist */
     self.stepsView = [[ConnectStepsView alloc] init];
     self.stepsView.userInteractionEnabled = NO;
@@ -4155,9 +4255,17 @@ static char carVideoItemStatusContext;
     CGFloat btnW = MIN(240, W - 80);
     CGFloat btnH = phone ? 46 : 52;
 
-    /* The wordmark yields its space to the checklist on short screens. */
-    self.titleLabel.hidden = connecting && shortScreen;
-    self.stepsView.hidden = !connecting;
+    BOOL showSteps = [[NSUserDefaults standardUserDefaults] boolForKey:CONNECTION_STEPS_KEY];
+    BOOL farewell = self.state == StateStopping && self.showFarewell;
+    BOOL animatedConnection = (connecting || (self.state == StateAwaitingAP && !self.hotspotManual)) && !showSteps;
+    BOOL branded = animatedConnection || farewell;
+    self.setupOverlay.backgroundColor = branded
+        ? [UIColor colorWithRed:0.035 green:0.065 blue:0.12 alpha:1] : UIColor.blackColor;
+    self.titleLabel.hidden = branded || (connecting && shortScreen);
+    self.stepsView.hidden = !connecting || !showSteps;
+    self.farewellCaption.hidden = !farewell;
+    [self.connectionBadge showMotionMode:farewell ? 2 : (animatedConnection ? 1 : 0)];
+    if (branded) { self.spinner.hidden = YES; [self.spinner stopAnimating]; }
     self.stepsView.compact = shortScreen;
 
     NSMutableArray<NSArray *> *items = [NSMutableArray array];
@@ -4167,9 +4275,12 @@ static char carVideoItemStatusContext;
             [items addObject:@[view, @(width), @(height), @(gapAfter)]];
         };
     add(self.titleLabel, W, phone ? 54 : 78, shortScreen ? 18 : (phone ? 26 : 48));
+    CGFloat badgeSize = shortScreen ? 96 : 160;
+    add(self.connectionBadge, badgeSize, badgeSize, shortScreen ? 14 : 26);
     add(self.spinner, 36, 36, 20);
     add(self.headlineLabel, colW, phone ? 28 : 32,
         connecting ? (shortScreen ? 18 : 28) : (phone ? 26 : 36));
+    add(self.farewellCaption, colW, 22, 0);
     add(self.stepsView, colW, [self.stepsView preferredHeightForWidth:colW], shortScreen ? 14 : 28);
     add(self.primaryButton, btnW, btnH, phone ? 12 : 16);
     add(self.secondaryButton, btnW, 44, 10);
@@ -4475,7 +4586,7 @@ static char carVideoItemStatusContext;
             break;
 
         case StateStopping:
-            self.headlineLabel.text = L(@"Stopping");
+            self.headlineLabel.text = self.showFarewell ? L(@"See you soon") : L(@"Stopping");
             self.spinner.hidden = NO; [self.spinner startAnimating];
             break;
     }
@@ -5375,6 +5486,9 @@ static void wake_ipc_listener(void) {
         return;
     }
     if (self.state == StateStopping || self.state == StateIdle) return;
+    self.showFarewell = self.state == StateActive && !self.restartAfterStop &&
+        UIApplication.sharedApplication.applicationState == UIApplicationStateActive;
+    uint64_t farewellEnd = monotonic_nanos_now() + (self.showFarewell ? 650 * NSEC_PER_MSEC : 0);
 #if SHOWCASE_MIRROR_BENCH
     [self.screenMirror finish];
 #endif
@@ -5440,7 +5554,10 @@ static void wake_ipc_listener(void) {
             [layer flushAndRemoveImage];
         });
 
-        dispatch_async(dispatch_get_main_queue(), ^{
+        uint64_t now = monotonic_nanos_now();
+        int64_t remaining = farewellEnd > now ? (int64_t)(farewellEnd - now) : 0;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, remaining), dispatch_get_main_queue(), ^{
+            self.showFarewell = NO;
             [self transitionTo:StateIdle];
             [self presentPendingBluetoothCompatibilityError];
             [self resumePendingRestart];
@@ -8140,6 +8257,13 @@ static BOOL g_settings_hardware_loading = NO;
     NSString *lastCapture = capturing ? nil : [app latestNetworkDumpPath];
 
     [b card:^(SettingsCard *card) {
+        UIView *steps = [self switchRow:L(@"Show Connection Steps") subtitle:nil
+            on:[[NSUserDefaults standardUserDefaults] boolForKey:CONNECTION_STEPS_KEY]
+            width:w changed:^(BOOL on) {
+                [[NSUserDefaults standardUserDefaults] setBool:on forKey:CONNECTION_STEPS_KEY];
+                [app renderState];
+            }];
+        [card addRow:steps height:steps.bounds.size.height];
         UIView *row = [self switchRow:L(@"Detailed Logging") subtitle:nil
             on:logging width:w changed:^(BOOL on) {
                 [app applyDiagnosticsEnabled:on];

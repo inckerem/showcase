@@ -12,6 +12,7 @@
 "Give us a star on GitHub!" = "GitHubでスターをお願いします！";
 "Copy Link" = "リンクをコピー";
 "Open GitHub" = "GitHubを開く";
+"Safe travels" = "お気をつけて";
 "Settings" = "設定";
 "CarPlay services" = "CarPlayサービス";
 "Verification" = "認証";
@@ -35,6 +36,7 @@
 "Getting Ready" = "準備中";
 "Connecting" = "接続中";
 "Choose %@ in CarPlay on your iPhone" = "iPhoneのCarPlayで「%@」を選択してください";
+"See you soon" = "またお会いしましょう";
 "Stopping" = "停止中";
 "Connect this device to the Wi-Fi network first." = "まずこのデバイスをWi-Fiネットワークに接続してください。";
 "Could not read the connected Wi-Fi name. Check Wi-Fi in Settings and try again." = "接続中のWi-Fi名を読み取れません。設定でWi-Fiを確認し、もう一度お試しください。";
@@ -121,6 +123,7 @@
 "View Source" = "ソースコードを見る";
 "Default" = "デフォルト";
 "Device Language" = "デバイスの言語";
+"Show Connection Steps" = "接続手順を表示";
 "Detailed Logging" = "詳細なログ";
 "Preparing Logs…" = "ログを準備中…";
 "Send Logs to KCS" = "KCSにログを送信";

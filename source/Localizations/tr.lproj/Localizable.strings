@@ -12,6 +12,7 @@
 "Give us a star on GitHub!" = "GitHub’da bize yıldız verin!";
 "Copy Link" = "Bağlantıyı Kopyala";
 "Open GitHub" = "GitHub’ı Aç";
+"Safe travels" = "Güvenli yolculuklar";
 "Settings" = "Ayarlar";
 "CarPlay services" = "CarPlay servisleri";
 "Verification" = "Doğrulama";
@@ -35,6 +36,7 @@
 "Getting Ready" = "Hazırlanıyor";
 "Connecting" = "Bağlanıyor";
 "Choose %@ in CarPlay on your iPhone" = "iPhone’unuzda CarPlay bölümünden %@ seçeneğini seçin";
+"See you soon" = "Hoşça kal";
 "Stopping" = "Durduruluyor";
 "Connect this device to the Wi-Fi network first." = "Önce bu aygıtı Wi-Fi ağına bağlayın.";
 "Could not read the connected Wi-Fi name. Check Wi-Fi in Settings and try again." = "Bağlı olunan Wi-Fi ağının adı okunamadı. Ayarlar’dan Wi-Fi bağlantısını kontrol edip tekrar deneyin.";
@@ -121,6 +123,7 @@
 "View Source" = "Kaynak Kodunu Görüntüle";
 "Default" = "Varsayılan";
 "Device Language" = "Aygıt Dili";
+"Show Connection Steps" = "Bağlantı Aşamalarını Göster";
 "Detailed Logging" = "Ayrıntılı Günlük Kaydı";
 "Preparing Logs…" = "Günlükler hazırlanıyor…";
 "Send Logs to KCS" = "Günlükleri KCS’ye Gönder";
