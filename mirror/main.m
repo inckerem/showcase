@@ -144,6 +144,11 @@
 @property (nonatomic) BOOL needsKeyframe;
 @property (nonatomic) CFTimeInterval lastSend;
 @property (nonatomic) CFTimeInterval lastFrame;
+@property (nonatomic) CFTimeInterval lastCapturedFrame;
+@property (nonatomic) CFTimeInterval lastVideoSent;
+@property (nonatomic) CFTimeInterval encoderRetryAfter;
+@property (nonatomic) BOOL softwareEncoder;
+@property (nonatomic) BOOL videoStalled;
 @property (nonatomic) CFTimeInterval encodeStarted;
 @property (nonatomic) NSUInteger encoderGeneration;
 @end
@@ -153,6 +158,11 @@
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.systemBackgroundColor;
+    NSNotificationCenter *notifications = NSNotificationCenter.defaultCenter;
+    [notifications addObserver:self selector:@selector(captureApplicationStateChanged:)
+        name:UIApplicationDidEnterBackgroundNotification object:nil];
+    [notifications addObserver:self selector:@selector(captureApplicationStateChanged:)
+        name:UIApplicationWillEnterForegroundNotification object:nil];
     UILabel *title = [UILabel new];
     title.font = [UIFont preferredFontForTextStyle:UIFontTextStyleLargeTitle];
     title.text = @"Showcase Mirror";
@@ -181,6 +191,26 @@
         [stack.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:24],
         [stack.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-24]
     ]];
+}
+
+- (void)captureApplicationStateChanged:(NSNotification *)notification {
+    if (!self.stream) return;
+    // A suspended hardware session can keep returning errors after the app changes state.
+    [self closeEncoder];
+    self.encoding = NO;
+    self.needsKeyframe = YES;
+    self.softwareEncoder = NO;
+    self.encoderRetryAfter = 0;
+    NSLog(@"[Showcase Mirror] Capture app transition: %@", notification.name);
+}
+
+- (void)recoverEncoderFromError:(OSStatus)error {
+    NSLog(@"[Showcase Mirror] Encoder reset (%d, software=%d)", (int)error, self.softwareEncoder);
+    [self closeEncoder];
+    self.encoding = NO;
+    self.needsKeyframe = YES;
+    self.encoderRetryAfter = NSProcessInfo.processInfo.systemUptime + (self.softwareEncoder ? 1.0 : 0.25);
+    self.softwareEncoder = YES;
 }
 
 - (void)scanPairing {
@@ -248,10 +278,16 @@
         if (!controller) return;
         CFTimeInterval now = NSProcessInfo.processInfo.systemUptime;
         if (controller.encoding && now - controller.encodeStarted > 1.0) {
-            [controller closeEncoder];
-            controller.encoding = NO;
-            controller.needsKeyframe = YES;
-            NSLog(@"[Showcase Mirror] Encoder stalled; restarting on the next frame");
+            [controller recoverEncoderFromError:kVTVideoEncoderNotAvailableNowErr];
+        }
+        if (controller.stream && !controller.videoStalled && now - controller.lastVideoSent > 5.0) {
+            BOOL receiving = now - controller.lastCapturedFrame < 2.0;
+            controller.videoStalled = YES;
+            NSLog(@"[Showcase Mirror] Video stalled (capture age %.1fs, write pending=%d)",
+                  now - controller.lastCapturedFrame, controller.sending);
+            controller.status.text = receiving
+                ? @"Ekran yakalanıyor. Görüntü aktarımı yeniden başlatılıyor…"
+                : @"iOS’tan yeni ekran karesi bekleniyor…";
         }
         if (!controller.sending && !controller.encoding && now - controller.lastSend > 2.0) {
             uint32_t zero = 0;
@@ -287,6 +323,10 @@
     [self closeEncoder];
     self.encoding = NO;
     self.sending = NO;
+    self.softwareEncoder = NO;
+    self.videoStalled = NO;
+    self.encoderRetryAfter = 0;
+    self.lastFrame = 0;
     self.action.hidden = YES;
     self.scan.hidden = NO;
     self.status.text = status;
@@ -322,6 +362,8 @@
         config.height = MAX(2, ((NSInteger)(size.height * scale)) & ~1);
         SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:self];
         self.stream = stream;
+        self.lastVideoSent = NSProcessInfo.processInfo.systemUptime;
+        self.lastCapturedFrame = self.lastVideoSent;
         NSError *error;
         if (![stream addStreamOutput:self type:SCStreamOutputTypeScreen
                  sampleHandlerQueue:dispatch_get_main_queue() error:&error]) {
@@ -359,16 +401,18 @@
 - (BOOL)openEncoderWidth:(int)width height:(int)height {
     [self closeEncoder];
     VTCompressionSessionRef encoder = NULL;
-    NSDictionary *specification = @{
+    NSDictionary *specification = self.softwareEncoder ? @{
+        (__bridge NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @NO
+    } : @{
         (__bridge NSString *)kVTVideoEncoderSpecification_EnableLowLatencyRateControl: @YES
     };
     OSStatus status = VTCompressionSessionCreate(NULL, width, height, kCMVideoCodecType_H264,
         (__bridge CFDictionaryRef)specification, NULL, NULL, NULL, NULL, &encoder);
-    if (status) {
+    if (status && !self.softwareEncoder) {
         status = VTCompressionSessionCreate(NULL, width, height, kCMVideoCodecType_H264,
             NULL, NULL, NULL, NULL, NULL, &encoder);
-        if (status) return NO;
     }
+    if (status) return NO;
     self.encoder = encoder;
     self.frameWidth = width;
     self.frameHeight = height;
@@ -385,16 +429,17 @@
 
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sample
         ofType:(SCStreamOutputType)type {
-    if (stream != self.stream || !self.peer || self.encoding || self.sending) return;
-    CFTimeInterval now = NSProcessInfo.processInfo.systemUptime;
-    if (now - self.lastFrame < 0.045) return;
+    if (type != SCStreamOutputTypeScreen || stream != self.stream || !self.peer) return;
     CVImageBufferRef image = CMSampleBufferGetImageBuffer(sample);
     if (!image || !CMSampleBufferDataIsReady(sample)) return;
+    CFTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    self.lastCapturedFrame = now;
+    if (self.encoding || self.sending || now < self.encoderRetryAfter || now - self.lastFrame < 0.045) return;
     self.lastFrame = now;
     int width = (int)CVPixelBufferGetWidth(image), height = (int)CVPixelBufferGetHeight(image);
     if ((!self.encoder || width != self.frameWidth || height != self.frameHeight) &&
         ![self openEncoderWidth:width height:height]) {
-        [self stop:@"H.264 kodlayıcı başlatılamadı."];
+        [self recoverEncoderFromError:kVTVideoEncoderNotAvailableNowErr];
         return;
     }
     NSDictionary *properties = self.needsKeyframe ? @{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES} : nil;
@@ -410,16 +455,14 @@
                 MirrorController *controller = weakSelf;
                 if (controller && controller.stream == stream && controller.encoderGeneration == generation) {
                     controller.encoding = NO;
-                    if (!error && output && !controller.sending) [controller sendFrame:output];
+                    if (error) [controller recoverEncoderFromError:error];
+                    else if (output && !controller.sending) [controller sendFrame:output];
                     else controller.needsKeyframe = YES;
                 }
                 if (output) CFRelease(output);
             });
         });
-    if (result) {
-        self.encoding = NO;
-        self.needsKeyframe = YES;
-    }
+    if (result) [self recoverEncoderFromError:result];
 }
 
 - (void)sendFrame:(CMSampleBufferRef)sample {
@@ -470,6 +513,7 @@
 - (void)send:(NSData *)packet {
     nw_connection_t peer = self.peer;
     if (!peer) return;
+    BOOL video = packet.length > sizeof(uint32_t);
     self.sending = YES;
     self.lastSend = NSProcessInfo.processInfo.systemUptime;
     dispatch_data_t data = dispatch_data_create(packet.bytes, packet.length, NULL,
@@ -479,7 +523,15 @@
         MirrorController *controller = weakSelf;
         if (controller.peer != peer) return;
         controller.sending = NO;
-        if (error) [controller stop:@"Yansıtma bağlantısı kesildi."];
+        if (error) {
+            [controller stop:@"Yansıtma bağlantısı kesildi."];
+        } else if (video) {
+            controller.lastVideoSent = NSProcessInfo.processInfo.systemUptime;
+            if (controller.videoStalled) {
+                controller.videoStalled = NO;
+                controller.status.text = @"Ekran iPad’e yansıtılıyor.";
+            }
+        }
     });
 }
 
