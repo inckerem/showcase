@@ -2,6 +2,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <VideoToolbox/VideoToolbox.h>
+#import <ImageIO/CGImageProperties.h>
 #import "screen_mirror_pairing.h"
 
 @interface MirrorScanner : UIViewController <AVCaptureMetadataOutputObjectsDelegate>
@@ -143,7 +144,14 @@
 @property (nonatomic) BOOL sending;
 @property (nonatomic) BOOL needsKeyframe;
 @property (nonatomic) CFTimeInterval lastSend;
-@property (nonatomic) CFTimeInterval lastFrame;
+@property (nonatomic) CFTimeInterval nextFrameTime;
+@property (nonatomic, strong) NSData *pendingVideo;
+@property (nonatomic) VTPixelRotationSessionRef rotationSession;
+@property (nonatomic) CVPixelBufferPoolRef rotationPool;
+@property (nonatomic) size_t rotationWidth;
+@property (nonatomic) size_t rotationHeight;
+@property (nonatomic) OSType rotationFormat;
+@property (nonatomic) CGImagePropertyOrientation frameOrientation;
 @property (nonatomic) CFTimeInterval lastCapturedFrame;
 @property (nonatomic) CFTimeInterval lastVideoSent;
 @property (nonatomic) CFTimeInterval encoderRetryAfter;
@@ -201,6 +209,8 @@
     self.needsKeyframe = YES;
     self.softwareEncoder = NO;
     self.encoderRetryAfter = 0;
+    self.nextFrameTime = 0;
+    self.pendingVideo = nil;
     NSLog(@"[Showcase Mirror] Capture app transition: %@", notification.name);
 }
 
@@ -326,7 +336,17 @@
     self.softwareEncoder = NO;
     self.videoStalled = NO;
     self.encoderRetryAfter = 0;
-    self.lastFrame = 0;
+    self.nextFrameTime = 0;
+    self.pendingVideo = nil;
+    self.frameOrientation = kCGImagePropertyOrientationUp;
+    if (self.rotationPool) {
+        CVPixelBufferPoolRelease(self.rotationPool);
+        self.rotationPool = NULL;
+    }
+    if (self.rotationSession) {
+        CFRelease(self.rotationSession);
+        self.rotationSession = NULL;
+    }
     self.action.hidden = YES;
     self.scan.hidden = NO;
     self.status.text = status;
@@ -423,8 +443,69 @@
     VTSessionSetProperty(encoder, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_Baseline_AutoLevel);
     VTSessionSetProperty(encoder, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFNumberRef)@1400000);
     VTSessionSetProperty(encoder, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, (__bridge CFNumberRef)@1);
-    VTSessionSetProperty(encoder, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFNumberRef)@20);
+    VTSessionSetProperty(encoder, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@30);
+    VTSessionSetProperty(encoder, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFNumberRef)@30);
     return VTCompressionSessionPrepareToEncodeFrames(encoder) == noErr;
+}
+
+static CGImagePropertyOrientation mirrorFrameOrientation(CMSampleBufferRef sample) {
+    NSArray *attachments = (__bridge NSArray *)CMSampleBufferGetSampleAttachmentsArray(sample, false);
+    NSNumber *value = attachments.firstObject[SCStreamFrameInfoVideoOrientation];
+    if (!value) value = (__bridge NSNumber *)CMGetAttachment(sample,
+        (__bridge CFStringRef)SCStreamFrameInfoVideoOrientation, NULL);
+    NSInteger orientation = value.integerValue;
+    return orientation >= 1 && orientation <= 8 ? (CGImagePropertyOrientation)orientation
+                                                : kCGImagePropertyOrientationUp;
+}
+
+- (CVPixelBufferRef)copyOrientedImage:(CVPixelBufferRef)image
+                          orientation:(CGImagePropertyOrientation)orientation CF_RETURNS_RETAINED {
+    if (orientation == kCGImagePropertyOrientationUp) return CVPixelBufferRetain(image);
+
+    CFStringRef rotation = kVTRotation_0;
+    BOOL flip = NO;
+    switch (orientation) {
+        case kCGImagePropertyOrientationUpMirrored: flip = YES; break;
+        case kCGImagePropertyOrientationDown: rotation = kVTRotation_180; break;
+        case kCGImagePropertyOrientationDownMirrored: rotation = kVTRotation_180; flip = YES; break;
+        case kCGImagePropertyOrientationLeftMirrored: rotation = kVTRotation_CW90; flip = YES; break;
+        case kCGImagePropertyOrientationRight: rotation = kVTRotation_CW90; break;
+        case kCGImagePropertyOrientationRightMirrored: rotation = kVTRotation_CCW90; flip = YES; break;
+        case kCGImagePropertyOrientationLeft: rotation = kVTRotation_CCW90; break;
+        default: return CVPixelBufferRetain(image);
+    }
+    BOOL swap = orientation >= kCGImagePropertyOrientationLeftMirrored;
+    size_t width = swap ? CVPixelBufferGetHeight(image) : CVPixelBufferGetWidth(image);
+    size_t height = swap ? CVPixelBufferGetWidth(image) : CVPixelBufferGetHeight(image);
+    OSType format = CVPixelBufferGetPixelFormatType(image);
+    if (!self.rotationSession && VTPixelRotationSessionCreate(NULL, &_rotationSession) != noErr) return NULL;
+    if (!self.rotationPool || self.rotationWidth != width || self.rotationHeight != height ||
+        self.rotationFormat != format) {
+        if (self.rotationPool) CVPixelBufferPoolRelease(self.rotationPool);
+        self.rotationPool = NULL;
+        NSDictionary *attributes = @{
+            (__bridge NSString *)kCVPixelBufferWidthKey: @(width),
+            (__bridge NSString *)kCVPixelBufferHeightKey: @(height),
+            (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(format),
+            (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
+        };
+        if (CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)attributes, &_rotationPool) != kCVReturnSuccess)
+            return NULL;
+        self.rotationWidth = width;
+        self.rotationHeight = height;
+        self.rotationFormat = format;
+    }
+    if (VTSessionSetProperty(self.rotationSession, kVTPixelRotationPropertyKey_Rotation, rotation) != noErr ||
+        VTSessionSetProperty(self.rotationSession, kVTPixelRotationPropertyKey_FlipHorizontalOrientation,
+                             flip ? kCFBooleanTrue : kCFBooleanFalse) != noErr) return NULL;
+
+    CVPixelBufferRef output = NULL;
+    if (CVPixelBufferPoolCreatePixelBuffer(NULL, self.rotationPool, &output) != kCVReturnSuccess) return NULL;
+    if (VTPixelRotationSessionRotateImage(self.rotationSession, image, output) != noErr) {
+        CVPixelBufferRelease(output);
+        return NULL;
+    }
+    return output;
 }
 
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sample
@@ -434,11 +515,21 @@
     if (!image || !CMSampleBufferDataIsReady(sample)) return;
     CFTimeInterval now = NSProcessInfo.processInfo.systemUptime;
     self.lastCapturedFrame = now;
-    if (self.encoding || self.sending || now < self.encoderRetryAfter || now - self.lastFrame < 0.045) return;
-    self.lastFrame = now;
-    int width = (int)CVPixelBufferGetWidth(image), height = (int)CVPixelBufferGetHeight(image);
+    const CFTimeInterval interval = 1.0 / 30.0;
+    if (self.encoding || self.pendingVideo || now < self.encoderRetryAfter ||
+        now + 0.002 < self.nextFrameTime) return;
+    if (!self.nextFrameTime || now - self.nextFrameTime > interval) self.nextFrameTime = now;
+    self.nextFrameTime += interval;
+
+    CGImagePropertyOrientation orientation = mirrorFrameOrientation(sample);
+    CVPixelBufferRef oriented = [self copyOrientedImage:image orientation:orientation];
+    if (!oriented) return;
+    if (orientation != self.frameOrientation) self.needsKeyframe = YES;
+    self.frameOrientation = orientation;
+    int width = (int)CVPixelBufferGetWidth(oriented), height = (int)CVPixelBufferGetHeight(oriented);
     if ((!self.encoder || width != self.frameWidth || height != self.frameHeight) &&
         ![self openEncoderWidth:width height:height]) {
+        CVPixelBufferRelease(oriented);
         [self recoverEncoderFromError:kVTVideoEncoderNotAvailableNowErr];
         return;
     }
@@ -447,8 +538,8 @@
     self.encodeStarted = now;
     NSUInteger generation = self.encoderGeneration;
     __weak typeof(self) weakSelf = self;
-    OSStatus result = VTCompressionSessionEncodeFrameWithOutputHandler(self.encoder, image,
-        CMTimeMakeWithSeconds(now, 1000000), CMTimeMake(1, 20), (__bridge CFDictionaryRef)properties,
+    OSStatus result = VTCompressionSessionEncodeFrameWithOutputHandler(self.encoder, oriented,
+        CMTimeMakeWithSeconds(now, 1000000), CMTimeMake(1, 30), (__bridge CFDictionaryRef)properties,
         NULL, ^(OSStatus error, VTEncodeInfoFlags flags, CMSampleBufferRef output) {
             if (output) CFRetain(output);
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -456,12 +547,13 @@
                 if (controller && controller.stream == stream && controller.encoderGeneration == generation) {
                     controller.encoding = NO;
                     if (error) [controller recoverEncoderFromError:error];
-                    else if (output && !controller.sending) [controller sendFrame:output];
+                    else if (output) [controller sendFrame:output];
                     else controller.needsKeyframe = YES;
                 }
                 if (output) CFRelease(output);
             });
         });
+    CVPixelBufferRelease(oriented);
     if (result) [self recoverEncoderFromError:result];
 }
 
@@ -507,7 +599,8 @@
         return;
     }
     self.needsKeyframe = NO;
-    [self send:packet];
+    if (self.sending) self.pendingVideo = packet;
+    else [self send:packet];
 }
 
 - (void)send:(NSData *)packet {
@@ -525,13 +618,18 @@
         controller.sending = NO;
         if (error) {
             [controller stop:@"Yansıtma bağlantısı kesildi."];
-        } else if (video) {
+            return;
+        }
+        if (video) {
             controller.lastVideoSent = NSProcessInfo.processInfo.systemUptime;
             if (controller.videoStalled) {
                 controller.videoStalled = NO;
                 controller.status.text = @"Ekran iPad’e yansıtılıyor.";
             }
         }
+        NSData *pending = controller.pendingVideo;
+        controller.pendingVideo = nil;
+        if (pending) [controller send:pending];
     });
 }
 
