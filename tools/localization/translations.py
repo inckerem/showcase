@@ -9,6 +9,8 @@ Run generate.py after editing; tests/test_localization.py checks coverage.
 LANGUAGES = ('fr', 'es', 'zh-Hans', 'ja', 'tr')
 
 T = {
+    'Waiting for Wi-Fi': ('En attente du Wi-Fi', 'Esperando el Wi-Fi', '正在等待 Wi-Fi', 'Wi-Fiを待っています'),
+    'The connection starts by itself once the network is ready.': ('La connexion démarre d’elle-même dès que le réseau est prêt.', 'La conexión se inicia sola en cuanto la red está lista.', '网络就绪后，连接会自动开始。', 'ネットワークの準備ができると、接続は自動的に始まります。'),
     'Stop CarPlay to change Wi-Fi settings.': ('Arrêtez CarPlay pour modifier les réglages Wi-Fi.', 'Detén CarPlay para cambiar los ajustes Wi-Fi.', '请先停止 CarPlay，再更改 Wi-Fi 设置。', 'Wi-Fi設定を変更するにはCarPlayを停止してください。'),
     'Stop CarPlay to change these settings.': ('Arrêtez CarPlay pour modifier ces réglages.', 'Detén CarPlay para cambiar estos ajustes.', '请先停止 CarPlay，再更改这些设置。', 'これらの設定を変更するにはCarPlayを停止してください。'),
     'Connected to “%@”. To use this network, enter its name and password below, then tap Save.': ('Connecté à « %@ ». Pour utiliser ce réseau, saisissez son nom et son mot de passe ci-dessous, puis touchez Enregistrer.', 'Conectado a “%@”. Para usar esta red, introduce su nombre y contraseña abajo y pulsa Guardar.', '已连接到“%@”。要使用此网络，请在下方输入其名称和密码，然后轻点保存。', '「%@」に接続中です。このネットワークを使うには、下に名前とパスワードを入力して保存をタップしてください。'),

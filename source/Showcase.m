@@ -5565,6 +5565,128 @@ static void scene_dump_view(UIView *view, NSInteger depth, NSMutableString *out)
 
 @end
 
+/* Shown in place of a "no Wi-Fi" error while the shared network is not up yet:
+ * a calm "waiting for Wi-Fi" screen with its own searching animation that keeps
+ * looking and starts the connection by itself the moment the network appears. */
+@interface WifiWaitView : UIView
+@property (nonatomic, copy) void (^onCancel)(void);
+- (void)startAnimating;
+- (void)stopAnimating;
+@end
+
+@implementation WifiWaitView {
+    CALayer *_glyph;
+    NSArray<CAShapeLayer *> *_arcs;
+    CAShapeLayer *_dot;
+    UILabel *_title;
+    UILabel *_subtitle;
+    UIButton *_cancel;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        self.backgroundColor = scene_color(0.043, 0.063, 0.094, 1.0);
+
+        _glyph = [CALayer layer];
+        _glyph.masksToBounds = NO;
+        [self.layer addSublayer:_glyph];
+
+        NSMutableArray<CAShapeLayer *> *arcs = [NSMutableArray array];
+        const CGFloat radii[3] = {24.0, 42.0, 60.0};
+        for (int i = 0; i < 3; i++) {
+            CAShapeLayer *arc = [CAShapeLayer layer];
+            arc.fillColor = [UIColor clearColor].CGColor;
+            arc.strokeColor = scene_accent(1.0).CGColor;
+            arc.lineWidth = 5.0;
+            arc.lineCap = kCALineCapRound;
+            arc.opacity = 0.0;
+            arc.path = [UIBezierPath bezierPathWithArcCenter:CGPointZero radius:radii[i]
+                startAngle:-M_PI * 0.78 endAngle:-M_PI * 0.22 clockwise:YES].CGPath;
+            [_glyph addSublayer:arc];
+            [arcs addObject:arc];
+        }
+        _arcs = arcs;
+
+        _dot = [CAShapeLayer layer];
+        _dot.fillColor = scene_accent(1.0).CGColor;
+        _dot.path = [UIBezierPath bezierPathWithArcCenter:CGPointZero radius:7.0
+            startAngle:0 endAngle:2 * M_PI clockwise:YES].CGPath;
+        [_glyph addSublayer:_dot];
+
+        _title = [[UILabel alloc] init];
+        _title.textAlignment = NSTextAlignmentCenter;
+        _title.textColor = [UIColor whiteColor];
+        _title.font = [UIFont systemFontOfSize:23 weight:UIFontWeightSemibold];
+        _title.text = L(@"Waiting for Wi-Fi");
+        [self addSubview:_title];
+
+        _subtitle = [[UILabel alloc] init];
+        _subtitle.textAlignment = NSTextAlignmentCenter;
+        _subtitle.numberOfLines = 0;
+        _subtitle.textColor = scene_caption(1.0);
+        _subtitle.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
+        _subtitle.text = L(@"The connection starts by itself once the network is ready.");
+        [self addSubview:_subtitle];
+
+        _cancel = [UIButton buttonWithType:UIButtonTypeCustom];
+        [_cancel setTitle:L(@"Cancel") forState:UIControlStateNormal];
+        [_cancel setTitleColor:scene_color(0.839, 0.894, 0.969, 0.80) forState:UIControlStateNormal];
+        [_cancel setTitleColor:[UIColor colorWithWhite:1 alpha:0.95] forState:UIControlStateHighlighted];
+        _cancel.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightRegular];
+        _cancel.backgroundColor = [UIColor colorWithWhite:1 alpha:0.05];
+        _cancel.layer.borderWidth = 1.0;
+        _cancel.layer.borderColor = scene_caption(0.18).CGColor;
+        _cancel.layer.cornerRadius = 12.0;
+        [_cancel addTarget:self action:@selector(cancelTapped)
+          forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:_cancel];
+    }
+    return self;
+}
+
+- (void)cancelTapped { if (self.onCancel) self.onCancel(); }
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
+    CGFloat cx = w / 2.0;
+    CGFloat dotY = h * 0.42;            /* arcs rise above the dot */
+    _glyph.frame = CGRectMake(cx, dotY, 0, 0);
+    _title.frame = CGRectMake(20, dotY + 40, w - 40, 30);
+    _subtitle.frame = CGRectMake(36, dotY + 76, w - 72, 50);
+    CGFloat bw = 170, bh = 46;
+    _cancel.frame = CGRectMake(cx - bw / 2.0, dotY + 148, bw, bh);
+}
+
+- (void)startAnimating {
+    [self stopAnimating];
+    const NSTimeInterval dur = 2.0;
+    CFTimeInterval now = CACurrentMediaTime();
+    for (int i = 0; i < (int)_arcs.count; i++) {
+        CAKeyframeAnimation *op = [CAKeyframeAnimation animationWithKeyPath:@"opacity"];
+        op.values = @[@0.0, @0.95, @0.0, @0.0];
+        op.keyTimes = @[@0.0, @0.28, @0.62, @1.0];
+        op.duration = dur;
+        op.beginTime = now + i * 0.22;
+        op.repeatCount = HUGE_VALF;
+        op.removedOnCompletion = NO;
+        [_arcs[i] addAnimation:op forKey:@"pulse"];
+    }
+    CABasicAnimation *breathe = [CABasicAnimation animationWithKeyPath:@"opacity"];
+    breathe.fromValue = @0.55;
+    breathe.toValue = @1.0;
+    breathe.duration = 0.9;
+    breathe.autoreverses = YES;
+    breathe.repeatCount = HUGE_VALF;
+    [_dot addAnimation:breathe forKey:@"breathe"];
+}
+
+- (void)stopAnimating {
+    for (CAShapeLayer *arc in _arcs) [arc removeAllAnimations];
+    [_dot removeAllAnimations];
+}
+@end
+
 @interface AppDelegate : UIResponder <UIApplicationDelegate>
 @property (nonatomic, strong) UIWindow *window;
 @property (nonatomic, strong) RootViewController *vc;
@@ -5597,6 +5719,9 @@ static void scene_dump_view(UIView *view, NSInteger depth, NSMutableString *out)
 @property (nonatomic, strong) ConnectStepsView *stepsView;
 @property (nonatomic, strong) ShowcaseConnectionScene *connectionScene;
 @property (nonatomic, strong) CAGradientLayer *primaryGradient;
+/* "Waiting for Wi-Fi" overlay shown instead of a no-network error. */
+@property (nonatomic, strong) WifiWaitView *wifiWaitView;
+@property (nonatomic, assign) BOOL wifiWaitActive;
 @property (nonatomic, strong) UILabel *farewellCaption;
 @property (nonatomic) BOOL showFarewell;
 @property (nonatomic) BOOL sceneShowing;
@@ -5876,6 +6001,7 @@ static void scene_dump_view(UIView *view, NSInteger depth, NSMutableString *out)
 }
 
 - (void)networkChanged {
+    if (self.wifiWaitActive) [self pollWifiWaiting];
     [self retryAutomaticStartWaitingForNetwork];
     static CFAbsoluteTime lastRetry = 0;
     if (self.state != StateIdle || self.baaReady || self.baaLoading || !self.baaError ||
@@ -7784,6 +7910,10 @@ static char carVideoItemStatusContext;
                 self.connectCompleted = n - 1;
                 self.firstTimePairing = n >= 6;
                 [self renderState];
+            } else if ([spec isEqualToString:@"wifiwait"]) {
+                self.state = StateIdle;
+                [self renderState];
+                [self enterWifiWaiting];
             } else if ([spec isEqualToString:@"home"]) {
                 self.state = StateIdle;
                 [self renderState];
@@ -7854,6 +7984,67 @@ static char carVideoItemStatusContext;
 
 #define AUTO_START_NETWORK_WAIT_SECONDS 60
 #define AUTO_START_NETWORK_POLL_SECONDS 5
+#define WIFI_WAIT_POLL_SECONDS 2.5
+
+/* Show the animated "waiting for Wi-Fi" screen and keep looking for the shared
+ * network. Used for both manual and automatic starts when the network is not
+ * up yet, so the user never sees a hard "no Wi-Fi" error; the connection
+ * resumes by itself the moment the network appears. The user can cancel. */
+- (void)enterWifiWaiting {
+    if (self.wifiWaitActive) return;
+    self.wifiWaitActive = YES;
+    self.autoStartNetworkDeadline = 0;
+    ip_log("[WIFI] shared network not up yet; showing waiting-for-Wi-Fi screen");
+    UIView *content = [self rootContentView];
+    if (!self.wifiWaitView) {
+        self.wifiWaitView = [[WifiWaitView alloc] initWithFrame:content.bounds];
+        self.wifiWaitView.autoresizingMask =
+            UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        __weak typeof(self) weakSelf = self;
+        self.wifiWaitView.onCancel = ^{ [weakSelf cancelWifiWaiting]; };
+    }
+    self.wifiWaitView.frame = content.bounds;
+    [content addSubview:self.wifiWaitView];
+    [self.wifiWaitView startAnimating];
+    [NSObject cancelPreviousPerformRequestsWithTarget:self
+        selector:@selector(pollWifiWaiting) object:nil];
+    [self pollWifiWaiting];
+}
+
+- (void)exitWifiWaiting {
+    if (!self.wifiWaitActive && !self.wifiWaitView.superview) return;
+    self.wifiWaitActive = NO;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self
+        selector:@selector(pollWifiWaiting) object:nil];
+    [self.wifiWaitView stopAnimating];
+    [self.wifiWaitView removeFromSuperview];
+}
+
+- (void)cancelWifiWaiting {
+    ip_log("[WIFI] waiting-for-Wi-Fi cancelled by the user");
+    self.automaticStartRequested = NO;
+    [self exitWifiWaiting];
+    [self renderState];
+}
+
+- (void)pollWifiWaiting {
+    if (!self.wifiWaitActive) return;
+    /* A session already started, or Settings/Wi-Fi Setup is open: step aside. */
+    if (self.state != StateIdle) { [self exitWifiWaiting]; return; }
+    if (self.vc.presentedViewController) {
+        [self performSelector:@selector(pollWifiWaiting) withObject:nil
+                   afterDelay:WIFI_WAIT_POLL_SECONDS];
+        return;
+    }
+    if (shared_wifi_interface() != nil && showcase_current_wifi_ssid() != nil) {
+        ip_log("[WIFI] shared network is up; resuming from the waiting screen");
+        [self exitWifiWaiting];
+        [self startFlow];
+        return;
+    }
+    [self performSelector:@selector(pollWifiWaiting) withObject:nil
+               afterDelay:WIFI_WAIT_POLL_SECONDS];
+}
 
 /* A missing Wi-Fi interface or an unreadable network name is usually just the
  * iPad still joining the router. Keep an automatic start alive for a while
@@ -8213,10 +8404,16 @@ static char carVideoItemStatusContext;
         }
         if (error) {
             ip_log("[WIFI] shared network not ready: %s", error.UTF8String);
-            if (automatic && (!interface || !connectedSSID)) {
-                [self waitForNetworkBeforeAutomaticStart];
+            if (!interface || !connectedSSID) {
+                /* The shared network simply is not up yet (car just started,
+                 * iPad still joining). Wait on an animated "Wi-Fi bekleniyor"
+                 * screen that starts by itself once the network appears,
+                 * instead of stopping with an error. */
+                [self enterWifiWaiting];
                 return;
             }
+            /* interface + SSID exist but name differs: a real configuration
+             * mistake the user must fix, so keep reporting it. */
             self.autoStartNetworkDeadline = 0;
             [self showWifiSetupError:error];
             return;

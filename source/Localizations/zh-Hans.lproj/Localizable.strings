@@ -12,6 +12,9 @@
 "Give us a star on GitHub!" = "在 GitHub 上给我们点个 Star！";
 "Copy Link" = "拷贝链接";
 "Open GitHub" = "打开 GitHub";
+"Waiting for Wi-Fi" = "正在等待 Wi-Fi";
+"The connection starts by itself once the network is ready." = "网络就绪后，连接会自动开始。";
+"Cancel" = "取消";
 "CarPlay Could Not Start" = "无法启动 CarPlay";
 "Showcase's CarPlay services could not start. Try again; if it keeps happening, reinstall Showcase or send logs to KCS from Settings." = "Showcase 的 CarPlay 服务无法启动。请重试；如果问题持续出现，请重新安装 Showcase，或在设置中将日志发送给 KCS。";
 "OK" = "好";
@@ -37,7 +40,6 @@
 "Starting Personal Hotspot" = "正在打开个人热点";
 "Turn On Personal Hotspot" = "请打开个人热点";
 "Open Settings" = "打开设置";
-"Cancel" = "取消";
 "Getting Ready" = "正在准备";
 "Connecting" = "正在连接";
 "Choose %@ in CarPlay on your iPhone" = "在 iPhone 的 CarPlay 中选择“%@”";

@@ -12,6 +12,9 @@
 "Give us a star on GitHub!" = "¡Danos una estrella en GitHub!";
 "Copy Link" = "Copiar enlace";
 "Open GitHub" = "Abrir GitHub";
+"Waiting for Wi-Fi" = "Esperando el Wi-Fi";
+"The connection starts by itself once the network is ready." = "La conexión se inicia sola en cuanto la red está lista.";
+"Cancel" = "Cancelar";
 "CarPlay Could Not Start" = "No se pudo iniciar CarPlay";
 "Showcase's CarPlay services could not start. Try again; if it keeps happening, reinstall Showcase or send logs to KCS from Settings." = "No se pudieron iniciar los servicios de CarPlay de Showcase. Vuelve a intentarlo; si sigue ocurriendo, reinstala Showcase o envía los registros a KCS desde Ajustes.";
 "OK" = "OK";
@@ -37,7 +40,6 @@
 "Starting Personal Hotspot" = "Activando el punto de acceso personal";
 "Turn On Personal Hotspot" = "Activa el punto de acceso personal";
 "Open Settings" = "Abrir Ajustes";
-"Cancel" = "Cancelar";
 "Getting Ready" = "Preparando";
 "Connecting" = "Conectando";
 "Choose %@ in CarPlay on your iPhone" = "Elige %@ en CarPlay en tu iPhone";

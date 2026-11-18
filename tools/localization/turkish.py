@@ -1,6 +1,8 @@
 """Turkish translations for Showcase."""
 
 TURKISH = {
+    'Waiting for Wi-Fi': 'Wi-Fi bekleniyor',
+    'The connection starts by itself once the network is ready.': 'Ağ hazır olunca bağlantı kendiliğinden başlar.',
     'Stop CarPlay to change Wi-Fi settings.': 'Wi-Fi ayarlarını değiştirmek için CarPlay’i durdurun.',
     'Stop CarPlay to change these settings.': 'Bu ayarları değiştirmek için CarPlay’i durdurun.',
     'Connected to “%@”. To use this network, enter its name and password below, then tap Save.': '“%@” ağına bağlısınız. Bu ağı kullanmak için aşağıya ağ adını ve şifresini girip Kaydet’e dokunun.',

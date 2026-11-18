@@ -12,6 +12,9 @@
 "Give us a star on GitHub!" = "GitHubでスターをお願いします！";
 "Copy Link" = "リンクをコピー";
 "Open GitHub" = "GitHubを開く";
+"Waiting for Wi-Fi" = "Wi-Fiを待っています";
+"The connection starts by itself once the network is ready." = "ネットワークの準備ができると、接続は自動的に始まります。";
+"Cancel" = "キャンセル";
 "CarPlay Could Not Start" = "CarPlayを開始できませんでした";
 "Showcase's CarPlay services could not start. Try again; if it keeps happening, reinstall Showcase or send logs to KCS from Settings." = "ShowcaseのCarPlayサービスを開始できませんでした。もう一度お試しください。繰り返し発生する場合は、Showcaseを再インストールするか、設定からKCSにログを送信してください。";
 "OK" = "OK";
@@ -37,7 +40,6 @@
 "Starting Personal Hotspot" = "インターネット共有を開始中";
 "Turn On Personal Hotspot" = "インターネット共有をオンにしてください";
 "Open Settings" = "設定を開く";
-"Cancel" = "キャンセル";
 "Getting Ready" = "準備中";
 "Connecting" = "接続中";
 "Choose %@ in CarPlay on your iPhone" = "iPhoneのCarPlayで「%@」を選択してください";
