@@ -6,6 +6,18 @@ BTDAEMON="/usr/bin/BTdaemon"
 BTLIB="/usr/lib/libBTstack.dylib"
 BTSTACK_PLIST="/Library/LaunchDaemons/ch.ringwald.BTstack.plist"
 
+# Ask the package manager (Sileo, Cydia, Zebra) to finish with a respring so
+# the new home-screen icon appears without the user having to respring by hand.
+# $CYDIA is "<fd> <protocol-version>"; outside a package manager it is unset.
+request_respring() {
+    [ -n "${CYDIA:-}" ] || return 0
+    fd=${CYDIA%% *}
+    case "$fd" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    echo "finish:respring" >&"$fd" 2>/dev/null || true
+}
+
 if [ -d "$APP" ]; then
     chown -R root:wheel "$APP" 2>/dev/null || true
 
@@ -37,5 +49,7 @@ fi
 if [ -x /usr/bin/uicache ]; then
     /usr/bin/uicache --path "$APP" 2>/dev/null || true
 fi
+
+request_respring
 
 exit 0

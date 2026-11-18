@@ -9,6 +9,18 @@ BTLIB="/var/jb/usr/lib/libBTstack.dylib"
 BTSTACK_PLIST="/var/jb/Library/LaunchDaemons/ch.ringwald.BTstack.plist"
 ENT_DIR="/var/jb/usr/share/showcase"
 
+# Ask the package manager (Sileo, Cydia, Zebra) to finish with a respring so
+# the new home-screen icon appears without the user having to respring by hand.
+# $CYDIA is "<fd> <protocol-version>"; outside a package manager it is unset.
+request_respring() {
+    [ -n "${CYDIA:-}" ] || return 0
+    fd=${CYDIA%% *}
+    case "$fd" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    echo "finish:respring" >&"$fd" 2>/dev/null || true
+}
+
 launchctl_path() {
     for tool in /var/jb/usr/bin/launchctl /var/jb/bin/launchctl /bin/launchctl /usr/bin/launchctl; do
         if [ -x "$tool" ]; then
@@ -112,5 +124,7 @@ if [ -f "$BTSTACK_PLIST" ]; then
 fi
 
 run_uicache --path "$APP"
+
+request_respring
 
 exit 0
