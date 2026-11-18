@@ -1,0 +1,16 @@
+Package: com.kcs.showcase.remote
+Name: Showcase Remote Access
+Version: 0.1-1
+Architecture: iphoneos-arm
+Section: Networking
+Maintainer: KCS <info@kcs.net.tr>
+Author: KCS <info@kcs.net.tr>
+Depends: openssh, curl
+Conflicts: dropbear
+Homepage: https://github.com/inckerem/showcase
+Description: Secure reverse-SSH link to the KCS server for this device.
+ Opens an outbound-only SSH tunnel from this device to the KCS server so an
+ operator can reach its sshd through the server's loopback. The device never
+ exposes an inbound port. On install the device generates its own key, pins
+ the server host key and enrolls its public key; an operator authorizes it
+ server-side. Removing the package tears the tunnel down and unloads the job.

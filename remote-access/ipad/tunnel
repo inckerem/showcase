@@ -1,0 +1,23 @@
+#!/bin/sh
+# /usr/libexec/showcase-remote-tunnel
+# launchd (KeepAlive) bunu sürekli ayakta tutar. Tek iş: sunucuya giden,
+# iPad'in sshd'sini sunucunun loopback'ine bağlayan ters SSH oturumu.
+# Bağlantı düşerse ssh çıkar, launchd yeniden başlatır.
+set -u
+CONF=/var/root/Library/ShowcaseRemote
+. "$CONF/tunnel.conf"   # SERVER PORT RPORT USER
+
+for SSH in /usr/bin/ssh /var/jb/usr/bin/ssh; do [ -x "$SSH" ] && break; done
+
+exec "$SSH" -i "$CONF/id_tunnel" -N \
+    -o IdentitiesOnly=yes \
+    -o BatchMode=yes \
+    -o StrictHostKeyChecking=yes \
+    -o UserKnownHostsFile="$CONF/known_hosts" \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o TCPKeepAlive=yes \
+    -o ControlMaster=no \
+    -R "127.0.0.1:${RPORT}:127.0.0.1:22" \
+    -p "$PORT" "${USER}@${SERVER}"

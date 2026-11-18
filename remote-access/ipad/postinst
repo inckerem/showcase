@@ -1,0 +1,95 @@
+#!/bin/sh
+# Showcase Remote Access — kurulum.
+# Cihazda anahtar üretir, sunucu host anahtarını sabitler, açık anahtarı kaydeder,
+# operatör Mac anahtarını yetkilendirir ve ters tünel servisini yükler.
+# @...@ alanları paket DERLENİRKEN doldurulur (token repoda tutulmaz).
+set -e
+
+SERVER="@SERVER@"
+PORT="@PORT@"
+RPORT="@RPORT@"
+BASE="@BASE_URL@"
+ENROLL="@ENROLL_URL@"
+TOKEN="@ENROLL_TOKEN@"
+
+CONF=/var/root/Library/ShowcaseRemote
+KEY="$CONF/id_tunnel"
+KH="$CONF/known_hosts"
+LDAEMON=/Library/LaunchDaemons/com.kcs.showcase.remote.plist
+
+for CURL in /usr/bin/curl /var/jb/usr/bin/curl; do [ -x "$CURL" ] && break; done
+for KEYGEN in /usr/bin/ssh-keygen /var/jb/usr/bin/ssh-keygen; do [ -x "$KEYGEN" ] && break; done
+for LCTL in /bin/launchctl /var/jb/bin/launchctl /usr/bin/launchctl; do [ -x "$LCTL" ] && break; done
+
+umask 077
+mkdir -p "$CONF"
+chmod 700 "$CONF"
+
+# 1) Cihazın kendi tünel anahtarı (özel anahtar yalnız burada; asla dışarı çıkmaz).
+if [ ! -f "$KEY" ]; then
+    "$KEYGEN" -t ed25519 -N '' -C "showcase-remote" -f "$KEY" >/dev/null
+fi
+
+# 2) Sunucu host anahtarını sabitle (TOFU yok).
+SRVHK="$("$CURL" -fsS --max-time 20 "$BASE/server.hostkey" 2>/dev/null || true)"
+case "$SRVHK" in
+    ssh-*)
+        printf '[%s]:%s %s\n' "$SERVER" "$PORT" "$SRVHK" > "$KH"
+        chmod 600 "$KH"
+        ;;
+    *)
+        echo "Showcase Remote: sunucu host anahtari alinamadi; ag baglantisini kontrol edip paketi yeniden kurun." >&2
+        exit 1
+        ;;
+esac
+
+# 3) Tünel yapılandırması.
+cat > "$CONF/tunnel.conf" <<EOF
+SERVER=$SERVER
+PORT=$PORT
+RPORT=$RPORT
+USER=scssh
+EOF
+chmod 600 "$CONF/tunnel.conf"
+
+# 4) Operatörün Mac açık anahtarını cihazın root authorized_keys'ine ekle
+#    (Mac -> sunucu -> iPad bağlantısı parolasız olsun; parola auth'a dokunmayız).
+MACPUB="$("$CURL" -fsS --max-time 20 "$BASE/mac.pub" 2>/dev/null || true)"
+case "$MACPUB" in
+    ssh-*)
+        mkdir -p /var/root/.ssh
+        chmod 700 /var/root/.ssh
+        touch /var/root/.ssh/authorized_keys
+        chmod 600 /var/root/.ssh/authorized_keys
+        if ! grep -qF "$MACPUB" /var/root/.ssh/authorized_keys 2>/dev/null; then
+            printf '%s\n' "$MACPUB" >> /var/root/.ssh/authorized_keys
+        fi
+        ;;
+    *)
+        echo "Showcase Remote: Mac anahtari alinamadi; parolali SSH ile baglanmaniz gerekebilir." >&2
+        ;;
+esac
+
+# 5) Açık anahtarı + sshd host anahtarını kaydet (operatör sunucuda yetkilendirir).
+PUB="$(cat "$KEY.pub")"
+HOSTKEY=""
+for h in /etc/ssh/ssh_host_ed25519_key.pub /var/jb/etc/ssh/ssh_host_ed25519_key.pub; do
+    [ -f "$h" ] && { HOSTKEY="$(cat "$h")"; break; }
+done
+DEV="$(/usr/bin/uname -n 2>/dev/null || echo ipad)"
+RESP="$("$CURL" -fsS --max-time 20 -X POST "$ENROLL" \
+    --data-urlencode "token=$TOKEN" \
+    --data-urlencode "pubkey=$PUB" \
+    --data-urlencode "hostkey=$HOSTKEY" \
+    --data-urlencode "device=$DEV" 2>/dev/null || true)"
+echo "Showcase Remote: kayit sonucu -> ${RESP:-BASARISIZ}"
+
+# 6) Servisi kur ve başlat. Anahtar yetkilenene kadar tünel bağlanmayı dener.
+chmod 755 /usr/libexec/showcase-remote-tunnel 2>/dev/null || true
+chown root:wheel "$LDAEMON" 2>/dev/null || true
+chmod 644 "$LDAEMON" 2>/dev/null || true
+"$LCTL" unload "$LDAEMON" 2>/dev/null || true
+"$LCTL" load -w "$LDAEMON" 2>/dev/null || true
+
+echo "Showcase Remote: kuruldu. Operator anahtari yetkilendirince tunel acilir."
+exit 0

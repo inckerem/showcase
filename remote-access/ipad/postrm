@@ -1,0 +1,11 @@
+#!/bin/sh
+# Tam kaldırmada cihazdaki tünel anahtarını ve yapılandırmayı sil.
+# (Mac anahtarını root authorized_keys'ten çıkarmaz; oraya elle dokunulur.)
+set -e
+case "${1:-}" in
+    purge|remove)
+        rm -rf /var/root/Library/ShowcaseRemote
+        rm -f /usr/libexec/showcase-remote-tunnel
+        ;;
+esac
+exit 0

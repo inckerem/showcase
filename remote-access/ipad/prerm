@@ -1,0 +1,13 @@
+#!/bin/sh
+# Paket kaldırılırken / yükseltilirken tüneli durdur ve servisi kaldır.
+set -e
+LDAEMON=/Library/LaunchDaemons/com.kcs.showcase.remote.plist
+for LCTL in /bin/launchctl /var/jb/bin/launchctl /usr/bin/launchctl; do [ -x "$LCTL" ] && break; done
+
+case "$1" in
+    remove|deconfigure|upgrade)
+        "$LCTL" unload -w "$LDAEMON" 2>/dev/null || true
+        killall showcase-remote-tunnel 2>/dev/null || true
+        ;;
+esac
+exit 0

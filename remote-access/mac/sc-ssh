@@ -1,0 +1,26 @@
+#!/bin/bash
+# iPad'e KCS sunucusu üzerinden (jump host) bağlan.
+#   sc-ssh                 -> iPad'de root kabuğu
+#   sc-ssh <komut...>      -> iPad'de komut çalıştır
+#   sc-ssh --put A B        -> A dosyasını iPad:B'ye kopyala (scp)
+#   sc-ssh --get A B        -> iPad:A dosyasını yerel B'ye kopyala
+#
+# Değişkenler (gerekirse override): JUMP, RPORT, MACKEY, KNOWN
+set -euo pipefail
+JUMP="${JUMP:-root@100.92.133.61}"     # KCS sunucusu (Tailscale)
+RPORT="${RPORT:-2322}"                  # iPad'in ters tünel portu (sunucu loopback)
+DIR=~/.kcs-pbx/showcase-remote
+MACKEY="${MACKEY:-$DIR/id_mac}"
+KNOWN="${KNOWN:-$DIR/known_hosts}"
+
+common=(-J "$JUMP"
+        -i "$MACKEY"
+        -o IdentitiesOnly=yes
+        -o StrictHostKeyChecking=accept-new
+        -o UserKnownHostsFile="$KNOWN")
+
+case "${1:-}" in
+    --put) shift; exec scp "${common[@]}" -P "$RPORT" "$1" "root@127.0.0.1:$2" ;;
+    --get) shift; exec scp "${common[@]}" -P "$RPORT" "root@127.0.0.1:$1" "$2" ;;
+    *)     exec ssh "${common[@]}" -p "$RPORT" root@127.0.0.1 "$@" ;;
+esac

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.kcs.showcase.remote</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/libexec/showcase-remote-tunnel</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>20</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardErrorPath</key>
+	<string>/var/root/Library/ShowcaseRemote/tunnel.log</string>
+	<key>StandardOutPath</key>
+	<string>/var/root/Library/ShowcaseRemote/tunnel.log</string>
+</dict>
+</plist>
