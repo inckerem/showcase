@@ -34,7 +34,11 @@ fi
 SRVHK="$("$CURL" -fsS --max-time 20 "$BASE/server.hostkey" 2>/dev/null || true)"
 case "$SRVHK" in
     ssh-*)
-        printf '[%s]:%s %s\n' "$SERVER" "$PORT" "$SRVHK" > "$KH"
+        # known_hosts anahtar biçimi porta bağlı: 22 (varsayılan) için düz ad,
+        # başka port için [ad]:port. Yanlış biçim StrictHostKeyChecking ile
+        # bağlantıyı reddeder.
+        if [ "$PORT" = 22 ]; then host_entry="$SERVER"; else host_entry="[$SERVER]:$PORT"; fi
+        printf '%s %s\n' "$host_entry" "$SRVHK" > "$KH"
         chmod 600 "$KH"
         ;;
     *)
