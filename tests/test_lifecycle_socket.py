@@ -27,10 +27,14 @@ static uint32_t flow_epoch(void) { return generation; }
 #define ip_log(...) ((void)0)
 #define dispatch_async(q, block) (block)()
 #define UIApplicationStateActive 0
+#define UIApplicationStateInactive 1
+#define UIApplicationStateBackground 2
 #define StateIdle 0
 #define StateStopping 1
 #define StateActive 2
 static void send_app_visibility(int x) { (void)x; }
+static volatile int32_t g_video_needs_resync;
+static BOOL child_alive(pid_t pid) { (void)pid; return NO; }
 ''' + wake + r'''
 @interface UIApplication : NSObject
 @property (assign) int applicationState;
@@ -41,6 +45,7 @@ static void send_app_visibility(int x) { (void)x; }
 @end
 @interface Subject : NSObject
 @property (assign) int listenFd, clientFd, state;
+@property (assign) pid_t carplayServicesPid;
 @property (assign) BOOL restartAfterStop;
 @property (nonatomic, strong) dispatch_semaphore_t ipcDone;
 - (void)ipcAcceptLoop;
@@ -51,6 +56,7 @@ static void send_app_visibility(int x) { (void)x; }
 @implementation Subject
 - (void)ipcHandleConnection:(int)fd { char b; (void)read(fd, &b, 1); }
 - (void)endAWDLSuppression {}
+- (void)stopAllAudioPlayers {}
 - (void)stopFlow { assert(0); }
 ''' + loop + r'''
 @end

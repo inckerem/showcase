@@ -1,6 +1,19 @@
 #!/bin/sh
 set -e
-if [ "${1:-}" = configure ]; then
+# dpkg calls the old postinst with abort-* after a failed upgrade/removal; prerm
+# has already removed the marker and unloaded the job, so restore the service
+# only when prerm recorded that it was enabled before.
+activate=0
+case "${1:-}" in
+  configure) activate=1 ;;
+  abort-upgrade|abort-deconfigure|abort-remove)
+    if [ -L /var/lib/showcase-power ] || [ -L /var/lib/showcase-power/was-enabled ]; then
+      echo 'Gecersiz guc dizini' >&2; exit 1
+    fi
+    if [ -f /var/lib/showcase-power/was-enabled ]; then activate=1; fi
+    ;;
+esac
+if [ "$activate" -eq 1 ]; then
   if [ -L /var/lib/showcase-power ]; then echo 'Gecersiz guc dizini' >&2; exit 1; fi
   mkdir -p /var/lib/showcase-power
   chown 0:0 /var/lib/showcase-power
@@ -44,6 +57,7 @@ if [ "${1:-}" = configure ]; then
     echo 'Guc servisi calisir durumda dogrulanamadi.' >&2
     exit 1
   fi
+  rm -f /var/lib/showcase-power/was-enabled
   echo 'Showcase uygulamasini tamamen kapatin; sonra sarj kablosunu cikarip yeniden takin.'
 fi
 exit 0

@@ -2,7 +2,12 @@
 set -e
 
 BTSTACK_PLIST="/var/jb/Library/LaunchDaemons/ch.ringwald.BTstack.plist"
+BLUETOOL_PLIST="/System/Library/LaunchDaemons/com.apple.BlueTool.plist"
 BLUETOOTHD_PLIST="/System/Library/LaunchDaemons/com.apple.bluetoothd.plist"
+# Exists while Showcase's launchd recovery guard is armed; once Showcase is
+# gone the guard hands the controller back itself, in the right order.
+# Showcase.m uses this path unprefixed in every build variant.
+BT_GUARD_READY="/var/root/Library/ShowcaseBluetooth/ready"
 
 launchctl_path() {
     for tool in /var/jb/usr/bin/launchctl /var/jb/bin/launchctl /bin/launchctl /usr/bin/launchctl; do
@@ -27,10 +32,30 @@ case "$1" in
                 "$LAUNCHCTL" unload "$BTSTACK_PLIST" 2>/dev/null || true
             fi
         fi
-        killall BTdaemon 2>/dev/null || true
+        # A BTdaemon wedged in its BlueTool hand-off ignores SIGTERM and keeps
+        # the UART; Apple's stack cannot come up on top of it.
+        killall -KILL BTdaemon 2>/dev/null || true
+        n=0
+        while killall -0 BTdaemon 2>/dev/null; do
+            n=$((n + 1))
+            [ "$n" -ge 10 ] && break
+            sleep 1
+        done
 
-        if [ -f "$BLUETOOTHD_PLIST" ]; then
-            if LAUNCHCTL="$(launchctl_path)"; then
+        # A marker left by an ldrestart, crash or power loss outlives the
+        # ad-hoc guard job; if launchd no longer knows the guard, it is stale.
+        if [ -f "$BT_GUARD_READY" ] &&
+           ! "$(launchctl_path)" list com.reng.showcase.bluetooth-recovery >/dev/null 2>&1; then
+            rm -f "$BT_GUARD_READY" /var/root/Library/ShowcaseBluetooth/restore
+        fi
+
+        # Same order as the guard: BlueTool initialises the chip for
+        # bluetoothd; without it bluetoothd retries until reboot.
+        if [ ! -f "$BT_GUARD_READY" ] && LAUNCHCTL="$(launchctl_path)"; then
+            if [ -f "$BLUETOOL_PLIST" ]; then
+                "$LAUNCHCTL" load "$BLUETOOL_PLIST" 2>/dev/null || true
+            fi
+            if [ -f "$BLUETOOTHD_PLIST" ]; then
                 "$LAUNCHCTL" load "$BLUETOOTHD_PLIST" 2>/dev/null || true
             fi
         fi

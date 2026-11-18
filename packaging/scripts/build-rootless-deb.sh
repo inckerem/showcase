@@ -107,6 +107,13 @@ need_file "$REPO_ROOT/source/ent_svc.xml"
 need_file "$REPO_ROOT/icon/generated/Icon-OEM-104.png"
 need_file "$REPO_ROOT/icon/generated/Icon-OEM-120.png"
 
+# REMOTE_BASE is a pathname prefix for a fresh mktemp directory, never a
+# directory to remove. Restrict it before embedding it in remote shell commands.
+if [[ ! "$REMOTE_BASE" =~ ^/([a-zA-Z0-9_-][a-zA-Z0-9._-]*/)*[a-zA-Z0-9_-][a-zA-Z0-9._-]*$ ]]; then
+  echo "REMOTE_BASE must be an absolute path prefix containing only letters, digits, '.', '_' or '-'." >&2
+  exit 1
+fi
+
 command -v install_name_tool >/dev/null || {
   echo "Missing install_name_tool. Run this script on macOS."
   exit 1
@@ -125,7 +132,17 @@ command -v dpkg-deb >/dev/null
 "
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/showcase-rootless.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+REMOTE_DIR=""
+cleanup() {
+  rm -rf "$WORK"
+  if [ -n "$REMOTE_DIR" ]; then
+    # The package tree inside REMOTE_DIR is root-owned, so removal needs root.
+    sshpass -p "$IPAD_PASS" ssh "${SSH_OPTS[@]}" "$IPAD_USER@$IPAD_HOST" \
+      "if [ \"\$(id -u)\" != 0 ]; then printf '%s\n' '$IPAD_PASS' | sudo -S rm -rf '$REMOTE_DIR'; else rm -rf '$REMOTE_DIR'; fi" ||
+      echo "Could not remove remote directory: $REMOTE_DIR" >&2
+  fi
+}
+trap cleanup EXIT
 
 mkdir -p \
   "$WORK/send" \
@@ -159,16 +176,22 @@ if [ -x "$BTSTACK_SOURCE_BUILD" ]; then
     -cf "$WORK/send/btstack-rootless.tar" .
 fi
 
-sshpass -p "$IPAD_PASS" ssh "${SSH_OPTS[@]}" "$IPAD_USER@$IPAD_HOST" \
-  "if [ \"\$(id -u)\" != 0 ]; then printf '%s\n' '$IPAD_PASS' | sudo -S rm -rf '$REMOTE_BASE'; else rm -rf '$REMOTE_BASE'; fi && mkdir -p '$REMOTE_BASE'"
+NEW_REMOTE_DIR="$(sshpass -p "$IPAD_PASS" ssh "${SSH_OPTS[@]}" "$IPAD_USER@$IPAD_HOST" \
+  "umask 077; mktemp -d '${REMOTE_BASE}.XXXXXX'")"
+REMOTE_SUFFIX="${NEW_REMOTE_DIR#"$REMOTE_BASE".}"
+if [[ "$REMOTE_SUFFIX" == "$NEW_REMOTE_DIR" || ! "$REMOTE_SUFFIX" =~ ^[a-zA-Z0-9]{6}$ ]]; then
+  echo "Remote mktemp returned an unexpected path; refusing to use it." >&2
+  exit 1
+fi
+REMOTE_DIR="$NEW_REMOTE_DIR"
 
 sshpass -p "$IPAD_PASS" scp "${SCP_OPTS[@]}" \
   "$WORK/send/"* \
-  "$IPAD_USER@$IPAD_HOST:$REMOTE_BASE/"
+  "$IPAD_USER@$IPAD_HOST:$REMOTE_DIR/"
 
 sshpass -p "$IPAD_PASS" ssh "${SSH_OPTS[@]}" "$IPAD_USER@$IPAD_HOST" "
 set -e
-cd '$REMOTE_BASE'
+cd '$REMOTE_DIR'
 tar -xf crypto-vendor.tar
 
 if [ -f btstack-rootless.tar ]; then
@@ -176,7 +199,7 @@ if [ -f btstack-rootless.tar ]; then
     mkdir -p btstack-rootless
     tar -C btstack-rootless -xf btstack-rootless.tar
     chmod +x btstack-rootless/build_btdaemon.sh
-    SDK='$SDK_REMOTE' ENT='$REMOTE_BASE/ent_btdaemon.xml' OUT='$REMOTE_BASE/BTdaemon' \
+    SDK='$SDK_REMOTE' ENT='$REMOTE_DIR/ent_btdaemon.xml' OUT='$REMOTE_DIR/BTdaemon' \
         btstack-rootless/build_btdaemon.sh
 fi
 
@@ -203,12 +226,12 @@ clang -fobjc-arc -DSHOWCASE_ROOTLESS=1 -miphoneos-version-min=12.0 -isysroot '$S
 
 for bin in Showcase carplay_bt carplay_services; do
   sshpass -p "$IPAD_PASS" scp "${SCP_OPTS[@]}" \
-    "$IPAD_USER@$IPAD_HOST:$REMOTE_BASE/$bin" \
+    "$IPAD_USER@$IPAD_HOST:$REMOTE_DIR/$bin" \
     "$WORK/rootfs/var/jb/Applications/Showcase.app/$bin"
 done
 if [ -x "$BTSTACK_SOURCE_BUILD" ]; then
   sshpass -p "$IPAD_PASS" scp "${SCP_OPTS[@]}" \
-    "$IPAD_USER@$IPAD_HOST:$REMOTE_BASE/BTdaemon" \
+    "$IPAD_USER@$IPAD_HOST:$REMOTE_DIR/BTdaemon" \
     "$WORK/rootfs/var/jb/usr/bin/BTdaemon"
 fi
 mv "$WORK/rootfs/var/jb/Applications/Showcase.app/carplay_bt" \
@@ -251,7 +274,7 @@ COPYFILE_DISABLE=1 tar --format ustar -C "$WORK" -cf "$WORK/rootfs.tar" rootfs
 
 sshpass -p "$IPAD_PASS" scp "${SCP_OPTS[@]}" \
   "$WORK/rootfs.tar" \
-  "$IPAD_USER@$IPAD_HOST:$REMOTE_BASE/rootfs.tar"
+  "$IPAD_USER@$IPAD_HOST:$REMOTE_DIR/rootfs.tar"
 
 sshpass -p "$IPAD_PASS" ssh "${SSH_OPTS[@]}" "$IPAD_USER@$IPAD_HOST" "
 set -e
@@ -265,7 +288,7 @@ as_root() {
     sudo -n \"\$@\"
   fi
 }
-cd '$REMOTE_BASE'
+cd '$REMOTE_DIR'
 rm -rf rootfs
 tar xf rootfs.tar
 cd rootfs
@@ -285,10 +308,10 @@ as_root chmod 0644 var/jb/Library/LaunchDaemons/ch.ringwald.BTstack.plist
 as_root chmod 0755 DEBIAN/postinst DEBIAN/prerm DEBIAN/postrm
 as_root chmod 0644 DEBIAN/control
 
-as_root ldid -S'$REMOTE_BASE/ent_app.xml' var/jb/Applications/Showcase.app/Showcase
-as_root ldid -S'$REMOTE_BASE/ent_bt.xml'  var/jb/Applications/Showcase.app/CarDisplaySim
-as_root ldid -S'$REMOTE_BASE/ent_svc.xml' 'var/jb/Applications/Showcase.app/CarPlay Simulator'
-as_root ldid -S'$REMOTE_BASE/ent_btdaemon.xml' var/jb/usr/bin/BTdaemon
+as_root ldid -S'$REMOTE_DIR/ent_app.xml' var/jb/Applications/Showcase.app/Showcase
+as_root ldid -S'$REMOTE_DIR/ent_bt.xml'  var/jb/Applications/Showcase.app/CarDisplaySim
+as_root ldid -S'$REMOTE_DIR/ent_svc.xml' 'var/jb/Applications/Showcase.app/CarPlay Simulator'
+as_root ldid -S'$REMOTE_DIR/ent_btdaemon.xml' var/jb/usr/bin/BTdaemon
 as_root ldid -S var/jb/usr/lib/libBTstack.dylib
 
 find . -path ./DEBIAN -prune -o -type f -exec md5sum {} \; |
@@ -301,7 +324,7 @@ dpkg-deb -c '../$DEB_NAME' | sed -n '1,90p'
 "
 
 sshpass -p "$IPAD_PASS" scp "${SCP_OPTS[@]}" \
-  "$IPAD_USER@$IPAD_HOST:$REMOTE_BASE/$DEB_NAME" \
+  "$IPAD_USER@$IPAD_HOST:$REMOTE_DIR/$DEB_NAME" \
   "$BUILD/$DEB_NAME"
 
 cp "$BUILD/$DEB_NAME" "$ROOT/repo/debs/$DEB_NAME"

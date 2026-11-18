@@ -46,10 +46,40 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <assert.h>
+#include <stdbool.h>
 
 /* carplay_services owns the process-wide, monotonic line logger. */
 extern int showcase_service_log_printf(const char *format, ...);
 #define printf showcase_service_log_printf
+
+/* Set by carplay_services while a connection is still unauthenticated and its
+ * pre-auth log budget is spent, so a peer flooding pair-setup/pair-verify M1
+ * cannot fill the log with per-request diagnostics. Success and completion
+ * lines stay unconditional. */
+extern __thread bool showcase_preauth_quiet;
+#define PAIR_DIAG(...) do { if (!showcase_preauth_quiet) printf(__VA_ARGS__); } while (0)
+
+/* Peer identifiers come from attacker-controlled TLV data (up to the HTTP
+ * body limit). Log at most PAIR_LOG_IDENTIFIER_MAX bytes, escaping anything
+ * outside printable ASCII so a peer cannot forge log lines or flood the log. */
+#define PAIR_LOG_IDENTIFIER_MAX 64
+static void pair_log_identifier(const char *label, const uint8_t *data, size_t len) {
+    char escaped[PAIR_LOG_IDENTIFIER_MAX * 4 + 1];
+    size_t out = 0;
+    size_t shown = len < PAIR_LOG_IDENTIFIER_MAX ? len : PAIR_LOG_IDENTIFIER_MAX;
+    for (size_t i = 0; data && i < shown; i++) {
+        uint8_t c = data[i];
+        if (c >= 0x20 && c < 0x7f && c != '\\') {
+            escaped[out++] = (char)c;
+        } else {
+            snprintf(escaped + out, sizeof(escaped) - out, "\\x%02x", c);
+            out += 4;
+        }
+    }
+    escaped[out] = '\0';
+    printf("[PAIR]   %s (%zu): %s%s\n", label, len, escaped,
+           len > shown ? "..." : "");
+}
 
 #define SHA512_DIGEST_LENGTH 64
 
@@ -109,21 +139,6 @@ static BIGNUM *BN_bin2bn(const unsigned char *bytes, int length,
         return NULL;
     }
     return value;
-}
-
-static int BN_rand(BIGNUM *value, int bits, int top, int bottom) {
-    (void)top;
-    (void)bottom;
-    if (!value || bits <= 0) return 0;
-    size_t length = (size_t)((bits + 7) / 8);
-    unsigned char *bytes = malloc(length);
-    if (!bytes) return 0;
-    int ok = SecRandomCopyBytes(kSecRandomDefault, length, bytes) == errSecSuccess;
-    if (ok && (bits & 7)) bytes[0] &= (uint8_t)((1U << (bits & 7)) - 1U);
-    if (ok) ok = mp_from_ubin(value, bytes, length) == MP_OKAY;
-    crypto_wipe(bytes, length);
-    free(bytes);
-    return ok;
 }
 
 static int BN_mod_exp(BIGNUM *r, const BIGNUM *a, const BIGNUM *p,
@@ -212,9 +227,16 @@ static ng_t *ng_new(void) {
     if (!ng) return NULL;
     ng->N = BN_new();
     ng->g = BN_new();
-    if (!ng->N || !ng->g) { free(ng); return NULL; }
-    BN_hex2bn(&ng->N, N_3072_hex);
-    BN_hex2bn(&ng->g, "5");
+    /* Release whichever BIGNUM did allocate, and treat a failed parse of the
+     * group constants as an allocation failure rather than handing out a
+     * half-initialised group. */
+    if (!ng->N || !ng->g ||
+        !BN_hex2bn(&ng->N, N_3072_hex) || !BN_hex2bn(&ng->g, "5")) {
+        BN_free(ng->N);
+        BN_free(ng->g);
+        free(ng);
+        return NULL;
+    }
     return ng;
 }
 
@@ -283,21 +305,30 @@ static BIGNUM *H_nn_pad(const BIGNUM *N, const BIGNUM *n1, const BIGNUM *n2) {
     return BN_bin2bn(buf, SRP_HASH_LEN, NULL);
 }
 
-/* H(n || bytes) */
-static BIGNUM *H_ns(const BIGNUM *n, const unsigned char *bytes, int len_bytes) {
+/* H(PAD(n) || bytes) — n is LEFT-PADDED with zeros to pad_len bytes.
+ * The SRP salt is a fixed-width byte string on the wire; hashing its minimal
+ * BIGNUM encoding would drop leading zero bytes and make x (and therefore the
+ * verifier) disagree with the client whenever salt[0] == 0. */
+static BIGNUM *H_ns(const BIGNUM *n, int pad_len,
+                    const unsigned char *bytes, int len_bytes) {
     unsigned char buf[SRP_HASH_LEN];
     int len_n = BN_num_bytes(n);
-    int nbytes = len_n + len_bytes;
-    unsigned char *bin = malloc(nbytes);
+    if (len_n < 0 || pad_len < 0 || len_bytes < 0 || len_n > pad_len) return NULL;
+    int nbytes = pad_len + len_bytes;
+    unsigned char *bin = calloc(1, nbytes > 0 ? (size_t)nbytes : 1U);
     if (!bin) return NULL;
-    BN_bn2bin(n, bin);
-    memcpy(bin + len_n, bytes, len_bytes);
+    BN_bn2bin(n, bin + (pad_len - len_n));
+    memcpy(bin + pad_len, bytes, len_bytes);
     hash_bytes(bin, nbytes, buf);
+    crypto_wipe(bin, (size_t)nbytes);  /* holds H(user:password) */
     free(bin);
-    return BN_bin2bn(buf, SRP_HASH_LEN, NULL);
+    BIGNUM *r = BN_bin2bn(buf, SRP_HASH_LEN, NULL);
+    crypto_wipe(buf, sizeof(buf));
+    return r;
 }
 
-/* x = H(salt || H(username:password)) */
+/* x = H(salt || H(username:password)) — salt hashed as SRP_SALT_BYTES raw
+ * bytes (zero-padded), exactly as sent in TLV_SALT. */
 static BIGNUM *calculate_x(const BIGNUM *salt, const char *username,
                             const unsigned char *password, int pw_len) {
     unsigned char ucp_hash[SRP_HASH_LEN];
@@ -312,7 +343,9 @@ static BIGNUM *calculate_x(const BIGNUM *salt, const char *username,
     hctx_final(h, ucp_hash, &ucp_hash_len);
     hctx_free(h);
 
-    return H_ns(salt, ucp_hash, SRP_HASH_LEN);
+    BIGNUM *x = H_ns(salt, SRP_SALT_BYTES, ucp_hash, SRP_HASH_LEN);
+    crypto_wipe(ucp_hash, sizeof(ucp_hash));
+    return x;
 }
 
 /* Hash update with BIGNUM data */
@@ -345,12 +378,13 @@ static int hash_session_key(const BIGNUM *S, unsigned char *dest) {
 
     unsigned int len;
     hctx_t *h = hctx_new();
-    if (!h) { free(bin); return -1; }
+    if (!h) { crypto_wipe(bin, (size_t)nbytes); free(bin); return -1; }
 
     hctx_init(h);
     hctx_update(h, bin, nbytes);
     hctx_final(h, dest, &len);
     hctx_free(h);
+    crypto_wipe(bin, (size_t)nbytes);
     free(bin);
     return (int)len;  /* 64 */
 }
@@ -365,12 +399,13 @@ static int hash_session_key_padded(const BIGNUM *S, int padded_len,
 
     unsigned int len;
     hctx_t *h = hctx_new();
-    if (!h) { free(bin); return -1; }
+    if (!h) { crypto_wipe(bin, (size_t)padded_len); free(bin); return -1; }
 
     hctx_init(h);
     hctx_update(h, bin, padded_len);
     hctx_final(h, dest, &len);
     hctx_free(h);
+    crypto_wipe(bin, (size_t)padded_len);
     free(bin);
     return (int)len;
 }
@@ -472,21 +507,18 @@ static int srp_create_salt_verifier(const char *username,
     if (!s || !v || !ctx || !ng) goto done;
     srp_init_random();
 
-    BN_rand(s, SRP_SALT_BYTES * 8, -1, 0);
+    /* The salt is generated as SRP_SALT_BYTES raw bytes and sent verbatim;
+     * calculate_x hashes it zero-padded to the same width, so a leading 0x00
+     * byte no longer changes x. */
+    if (SecRandomCopyBytes(kSecRandomDefault, SRP_SALT_BYTES, salt_out) !=
+        errSecSuccess) goto done;
+    if (!BN_bin2bn(salt_out, SRP_SALT_BYTES, s)) { s = NULL; goto done; }
     x = calculate_x(s, username, password, pw_len);
     if (!x) goto done;
 
-    BN_mod_exp(v, ng->g, x, ng->N, ctx);
+    if (!BN_mod_exp(v, ng->g, x, ng->N, ctx)) goto done;
 
-    int slen = BN_num_bytes(s);
     int vlen = BN_num_bytes(v);
-
-    /* Pad salt to exactly SRP_SALT_BYTES */
-    memset(salt_out, 0, SRP_SALT_BYTES);
-    if (slen <= SRP_SALT_BYTES)
-        BN_bn2bin(s, salt_out + (SRP_SALT_BYTES - slen));
-    else
-        BN_bn2bin(s, salt_out);  /* shouldn't happen */
 
     *verifier_out = malloc(vlen);
     if (!*verifier_out) goto done;
@@ -527,10 +559,18 @@ static int srp_create_B(const unsigned char *verifier, int vlen,
     BN_mod_exp(tmp2, ng->g, b, ng->N, ctx);
     BN_mod_add(B, tmp1, tmp2, ng->N, ctx);
 
-    *B_len = BN_num_bytes(B);
-    *B_out = malloc(*B_len);
-    if (!*B_out) goto done;
-    BN_bn2bin(B, *B_out);
+    /* B goes on the wire left-padded to len(N): it is reduced mod N, so in
+     * ~1/256 runs its top byte is 0 and the minimal encoding is shorter.
+     * u and M already hash PAD(B), and controllers expect the fixed width. */
+    {
+        int len_N = BN_num_bytes(ng->N);
+        int len_B = BN_num_bytes(B);
+        if (len_N <= 0 || len_B > len_N) goto done;
+        *B_out = calloc(1, (size_t)len_N);
+        if (!*B_out) goto done;
+        BN_bn2bin(B, *B_out + (len_N - len_B));
+        *B_len = len_N;
+    }
     ret = 0;
 
 done:
@@ -592,7 +632,13 @@ static srp_verifier_t *srp_verifier_new(const char *username,
     ver->ng = ng_new();
     int ulen = strlen(username) + 1;
     ver->username = malloc(ulen);
-    if (!ver->username) { free(ver); ver = NULL; goto done; }
+    if (!ver->ng || !ver->username) {
+        ng_free(ver->ng);
+        free(ver->username);
+        free(ver);
+        ver = NULL;
+        goto done;
+    }
     memcpy(ver->username, username, ulen);
     ver->authenticated = 0;
 
@@ -608,6 +654,7 @@ static srp_verifier_t *srp_verifier_new(const char *username,
         hash_session_key_padded(S, len_N, ver->session_key_padded) != SRP_SKEY_LEN) {
         ng_free(ver->ng);
         free(ver->username);
+        crypto_wipe(ver, sizeof(*ver));
         free(ver);
         ver = NULL;
         goto done;
@@ -623,9 +670,10 @@ static srp_verifier_t *srp_verifier_new(const char *username,
                     ver->session_key_padded, len_N);
 
     /* Store B for reference */
-    ver->bytes_B = malloc(BN_num_bytes(B));
+    /* Stored padded to len(N), matching the B sent in M2. */
+    ver->bytes_B = calloc(1, (size_t)len_N);
     if (ver->bytes_B)
-        BN_bn2bin(B, ver->bytes_B);
+        BN_bn2bin(B, ver->bytes_B + (len_N - BN_num_bytes(B)));
 
 done:
     BN_free(s); BN_free(v); BN_free(A);
@@ -634,15 +682,17 @@ done:
     BN_free(B); BN_free(S); BN_free(b);
     BN_free(tmp1); BN_free(tmp2);
     BN_CTX_free(ctx);
-    /* ng is owned by ver if created, else freed */
-    if (!ver) ng_free(ng);
+    /* ng is only a scratch group for the computation above — the verifier
+     * allocates its own copy into ver->ng — so it is always released here.
+     * Freeing it only on the failure path leaked one group per pairing. */
+    ng_free(ng);
     return ver;
 }
 
 static int srp_verifier_verify(srp_verifier_t *ver,
                                 const unsigned char *client_M,
                                 const unsigned char **server_M2) {
-    printf("[PAIR] SRP S minimal len=%d, N len=%d\n",
+    PAIR_DIAG("[PAIR] SRP S minimal len=%d, N len=%d\n",
            ver->S_minimal_len, ver->N_len);
     if (memcmp(ver->M, client_M, SRP_HASH_LEN) == 0) {
         ver->authenticated = 1;
@@ -662,7 +712,7 @@ static int srp_verifier_verify(srp_verifier_t *ver,
         return 0;
     }
     *server_M2 = NULL;
-    printf("[PAIR] SRP proof mismatch using both minimal and padded KDF\n");
+    PAIR_DIAG("[PAIR] SRP proof mismatch using both minimal and padded KDF\n");
     return -1;
 }
 
@@ -671,7 +721,10 @@ static void srp_verifier_delete(srp_verifier_t *ver) {
         ng_free(ver->ng);
         free(ver->username);
         free(ver->bytes_B);
-        memset(ver, 0, sizeof(*ver));
+        /* crypto_wipe, not memset: a memset right before free() is a dead
+         * store the optimizer may drop, leaving session_key/M/H_AMK on the
+         * free heap. */
+        crypto_wipe(ver, sizeof(*ver));
         free(ver);
     }
 }
@@ -913,6 +966,17 @@ static int find_peer_index(const pair_ctx_t *ctx, const uint8_t *identifier,
     return -1;
 }
 
+/* The registry is kept in least-recently-used order: peers[0] is the
+ * controller that has gone longest without an authenticated pair-setup or
+ * pair-verify, the last slot the most recent one. Moves an entry to the end. */
+static void move_peer_to_end(pair_ctx_t *ctx, size_t index) {
+    if (!ctx || index + 1 >= ctx->peer_count) return;
+    __typeof__(ctx->peers[0]) entry = ctx->peers[index];
+    memmove(&ctx->peers[index], &ctx->peers[index + 1],
+            sizeof(ctx->peers[0]) * (ctx->peer_count - index - 1));
+    ctx->peers[ctx->peer_count - 1] = entry;
+}
+
 int pair_ctx_add_peer(pair_ctx_t *ctx, const uint8_t *identifier,
                       size_t identifier_len, const uint8_t public_key[32]) {
     if (!ctx || !identifier || !public_key || identifier_len == 0 ||
@@ -921,12 +985,15 @@ int pair_ctx_add_peer(pair_ctx_t *ctx, const uint8_t *identifier,
     int existing = find_peer_index(ctx, identifier, identifier_len);
     size_t index;
     if (existing >= 0) {
-        index = (size_t)existing;
+        move_peer_to_end(ctx, (size_t)existing);
+        index = ctx->peer_count - 1;
     } else if (ctx->peer_count < MAX_PAIRED_PEERS) {
         index = ctx->peer_count++;
     } else {
-        /* Keep the registry bounded. The oldest slot is replaced only when
-         * somebody intentionally completes a new authenticated pair-setup. */
+        /* Keep the registry bounded. The least recently used slot is replaced
+         * only when somebody intentionally completes a new authenticated
+         * pair-setup; successful pair-verify keeps active controllers at the
+         * end, so a daily-used iPhone is not evicted by newer pairings. */
         memmove(&ctx->peers[0], &ctx->peers[1],
                 sizeof(ctx->peers[0]) * (MAX_PAIRED_PEERS - 1));
         index = MAX_PAIRED_PEERS - 1;
@@ -1040,6 +1107,8 @@ int pair_derive_data_stream_keys(pair_ctx_t *ctx, uint64_t seed,
 
 void pair_ctx_destroy(pair_ctx_t *ctx) {
     if (ctx) {
+        if (ctx->srp_verifier)
+            crypto_wipe(ctx->srp_verifier, (size_t)ctx->srp_verifier_len);
         free(ctx->srp_verifier);
         crypto_wipe(ctx, sizeof(*ctx));
         free(ctx);
@@ -1059,15 +1128,29 @@ static uint8_t *make_error_response(uint8_t state, uint8_t error_code, size_t *o
     return tlv_build(items, 2, out_len);
 }
 
+/* Drop SRP secrets (b, session key, verifier) once they can no longer be
+ * used: after M6 completes or any setup step fails. Every such path leaves
+ * setup_state outside {2, 4}, so the next attempt must restart at M1, which
+ * regenerates all of them. */
+static void pair_setup_wipe_srp(pair_ctx_t *ctx) {
+    if (ctx->srp_verifier) {
+        crypto_wipe(ctx->srp_verifier, (size_t)ctx->srp_verifier_len);
+        free(ctx->srp_verifier);
+        ctx->srp_verifier = NULL;
+    }
+    ctx->srp_verifier_len = 0;
+    crypto_wipe(ctx->srp_b, sizeof(ctx->srp_b));
+    crypto_wipe(ctx->srp_session_key, sizeof(ctx->srp_session_key));
+    ctx->srp_has_session_key = 0;
+}
+
 /* M1 → M2: Generate SRP salt + server public key */
 static uint8_t *handle_setup_m1(pair_ctx_t *ctx, const tlv_t *in, size_t *out_len) {
-    printf("[PAIR] pair-setup M1 received (State=1, Method=PairSetup)\n");
-    printf("[PAIR] Pairing PIN configured\n");
+    PAIR_DIAG("[PAIR] pair-setup M1 received (State=1, Method=PairSetup)\n");
+    PAIR_DIAG("[PAIR] Pairing PIN configured\n");
 
     /* Reset SRP state for new pairing attempt */
-    free(ctx->srp_verifier);
-    ctx->srp_verifier = NULL;
-    ctx->srp_has_session_key = 0;
+    pair_setup_wipe_srp(ctx);
     ctx->client_pk_set = 0;
 
     /* Generate SRP salt + verifier from PIN */
@@ -1101,10 +1184,12 @@ static uint8_t *handle_setup_m1(pair_ctx_t *ctx, const tlv_t *in, size_t *out_le
         return make_error_response(2, 1, out_len);
     }
 
-    printf("[PAIR] SRP salt (%d): ", SRP_SALT_BYTES);
-    for (int i = 0; i < SRP_SALT_BYTES; i++) printf("%02x", ctx->srp_salt[i]);
-    printf("\n");
-    printf("[PAIR] SRP B (%d bytes)\n", B_len);
+    if (!showcase_preauth_quiet) {
+        printf("[PAIR] SRP salt (%d): ", SRP_SALT_BYTES);
+        for (int i = 0; i < SRP_SALT_BYTES; i++) printf("%02x", ctx->srp_salt[i]);
+        printf("\n");
+        printf("[PAIR] SRP B (%d bytes)\n", B_len);
+    }
 
     /* Build M2 response: State=2, Salt, PublicKey */
     uint8_t state = 2;
@@ -1117,28 +1202,28 @@ static uint8_t *handle_setup_m1(pair_ctx_t *ctx, const tlv_t *in, size_t *out_le
     free(B);
 
     ctx->setup_state = 2;
-    printf("[PAIR] pair-setup M2 sent (State=2, Salt=%d, PK=%d, total=%zu)\n",
+    PAIR_DIAG("[PAIR] pair-setup M2 sent (State=2, Salt=%d, PK=%d, total=%zu)\n",
            SRP_SALT_BYTES, B_len, *out_len);
     return resp;
 }
 
 /* M3 → M4: Verify client proof, send server proof */
 static uint8_t *handle_setup_m3(pair_ctx_t *ctx, const tlv_t *in, size_t *out_len) {
-    printf("[PAIR] pair-setup M3 received (State=3)\n");
+    PAIR_DIAG("[PAIR] pair-setup M3 received (State=3)\n");
 
     const tlv_item_t *pk_item = tlv_find(in, TLV_PUBLIC_KEY);
     const tlv_item_t *proof_item = tlv_find(in, TLV_PROOF);
 
     if (!pk_item || !proof_item) {
-        printf("[PAIR] ERROR: M3 missing PublicKey or Proof\n");
+        PAIR_DIAG("[PAIR] ERROR: M3 missing PublicKey or Proof\n");
         return make_error_response(4, 2, out_len);  /* Auth error */
     }
 
-    printf("[PAIR] SRP A len=%zu, client proof len=%zu\n",
+    PAIR_DIAG("[PAIR] SRP A len=%zu, client proof len=%zu\n",
            pk_item->len, proof_item->len);
 
     if (proof_item->len != SRP_HASH_LEN) {
-        printf("[PAIR] ERROR: Client proof wrong size (got %zu, expected %d)\n",
+        PAIR_DIAG("[PAIR] ERROR: Client proof wrong size (got %zu, expected %d)\n",
                proof_item->len, SRP_HASH_LEN);
         return make_error_response(4, 2, out_len);
     }
@@ -1150,11 +1235,11 @@ static uint8_t *handle_setup_m3(pair_ctx_t *ctx, const tlv_t *in, size_t *out_le
                                              pk_item->data, pk_item->len,
                                              ctx->srp_b, 32);
     if (!ver) {
-        printf("[PAIR] ERROR: srp_verifier_new failed (SRP-6a safety check?)\n");
+        PAIR_DIAG("[PAIR] ERROR: srp_verifier_new failed (SRP-6a safety check?)\n");
         return make_error_response(4, 2, out_len);
     }
     if ((int)pk_item->len < ver->N_len) {
-        printf("[PAIR] client public key A shorter than N (%zu < %d); padded compatibility path available\n",
+        PAIR_DIAG("[PAIR] client public key A shorter than N (%zu < %d); padded compatibility path available\n",
                pk_item->len, ver->N_len);
     }
 
@@ -1162,7 +1247,7 @@ static uint8_t *handle_setup_m3(pair_ctx_t *ctx, const tlv_t *in, size_t *out_le
     const unsigned char *server_M2 = NULL;
     int vret = srp_verifier_verify(ver, proof_item->data, &server_M2);
     if (vret != 0 || !server_M2) {
-        printf("[PAIR] ERROR: SRP proof verification failed after minimal and padded KDF checks\n");
+        PAIR_DIAG("[PAIR] ERROR: SRP proof verification failed after minimal and padded KDF checks\n");
         srp_verifier_delete(ver);
         return make_error_response(4, 2, out_len);
     }
@@ -1193,7 +1278,9 @@ static uint8_t *handle_setup_m3(pair_ctx_t *ctx, const tlv_t *in, size_t *out_le
 /* M5 → M6: Decrypt client sub-TLV, encrypt our sub-TLV.
  * Uses HKDF-SHA512 key derivation + ChaCha20-Poly1305 encryption.
  * Nonces: "PS-Msg05" for M5 decrypt, "PS-Msg06" for M6 encrypt. */
-static uint8_t *handle_setup_m5(pair_ctx_t *ctx, const tlv_t *in, size_t *out_len) {
+static uint8_t *handle_setup_m5_keys(pair_ctx_t *ctx, const tlv_t *in, size_t *out_len,
+                                     unsigned char enc_key[32],
+                                     unsigned char accessoryX[32]) {
     printf("[PAIR] pair-setup M5 received (State=5)\n");
     uint8_t peer_identifier[MAX_PEER_IDENTIFIER_LEN];
     size_t peer_identifier_len = 0;
@@ -1211,8 +1298,8 @@ static uint8_t *handle_setup_m5(pair_ctx_t *ctx, const tlv_t *in, size_t *out_le
 
     printf("[PAIR] M5 EncryptedData: %zu bytes\n", enc_item->len);
 
-    /* Derive 32-byte encryption key via HKDF-SHA512 */
-    unsigned char enc_key[32];
+    /* Derive 32-byte encryption key via HKDF-SHA512 (buffer owned and
+     * wiped by handle_setup_m5 on every return path) */
     derive_pair_setup_encrypt_key(ctx->srp_session_key, SRP_SKEY_LEN, enc_key);
 
     printf("[PAIR] Pair-setup encryption key derived\n");
@@ -1248,8 +1335,7 @@ static uint8_t *handle_setup_m5(pair_ctx_t *ctx, const tlv_t *in, size_t *out_le
         const tlv_item_t *sig = tlv_find(sub, TLV_SIGNATURE);
 
         if (ident) {
-            printf("[PAIR]   Identifier (%zu): %.*s\n",
-                   ident->len, (int)ident->len, ident->data);
+            pair_log_identifier("Identifier", ident->data, ident->len);
         }
         if (pk && pk->len == ED25519_KEY_LEN && ident && ident->len > 0 &&
             ident->len <= MAX_PEER_IDENTIFIER_LEN && sig && sig->len == 64) {
@@ -1288,8 +1374,7 @@ static uint8_t *handle_setup_m5(pair_ctx_t *ctx, const tlv_t *in, size_t *out_le
      *   salt="Pair-Setup-Accessory-Sign-Salt",
      *   info="Pair-Setup-Accessory-Sign-Info")[:32] */
 
-    /* Derive accessoryX for signing */
-    unsigned char accessoryX[32];
+    /* Derive accessoryX for signing (wiped by handle_setup_m5) */
     hkdf_sha512(ctx->srp_session_key, SRP_SKEY_LEN,
                 (const unsigned char *)"Pair-Setup-Accessory-Sign-Salt", 30,
                 (const unsigned char *)"Pair-Setup-Accessory-Sign-Info", 30,
@@ -1302,6 +1387,7 @@ static uint8_t *handle_setup_m5(pair_ctx_t *ctx, const tlv_t *in, size_t *out_le
     /* Build signing message: accessoryX || Identifier || our_pk */
     int sign_msg_len = 32 + m6_ident_len + ED25519_KEY_LEN;
     unsigned char *sign_msg = malloc(sign_msg_len);
+    if (!sign_msg) return make_error_response(6, 1, out_len);
     memcpy(sign_msg, accessoryX, 32);
     memcpy(sign_msg + 32, m6_ident, m6_ident_len);
     memcpy(sign_msg + 32 + m6_ident_len, ctx->our_pk, ED25519_KEY_LEN);
@@ -1316,9 +1402,11 @@ static uint8_t *handle_setup_m5(pair_ctx_t *ctx, const tlv_t *in, size_t *out_le
     crypto_ed25519_key_pair(signingSecret, signingPublic, signingSeed);
     crypto_ed25519_sign(signature, signingSecret, sign_msg,
                         (size_t)sign_msg_len);
+    crypto_wipe(signingSeed, sizeof(signingSeed));
     crypto_wipe(signingSecret, sizeof(signingSecret));
     crypto_wipe(signingPublic, sizeof(signingPublic));
     printf("[PAIR] M6 Ed25519 signature computed (%zu bytes)\n", sig_len);
+    crypto_wipe(sign_msg, (size_t)sign_msg_len);
     free(sign_msg);
 
     tlv_item_t sub_items[3] = {
@@ -1375,6 +1463,15 @@ static uint8_t *handle_setup_m5(pair_ctx_t *ctx, const tlv_t *in, size_t *out_le
     return resp;
 }
 
+static uint8_t *handle_setup_m5(pair_ctx_t *ctx, const tlv_t *in, size_t *out_len) {
+    unsigned char enc_key[32] = {0};
+    unsigned char accessoryX[32] = {0};
+    uint8_t *resp = handle_setup_m5_keys(ctx, in, out_len, enc_key, accessoryX);
+    crypto_wipe(enc_key, sizeof(enc_key));
+    crypto_wipe(accessoryX, sizeof(accessoryX));
+    return resp;
+}
+
 /* Main pair-setup dispatcher */
 uint8_t *pair_setup_handle(pair_ctx_t *ctx, const uint8_t *body, size_t bodyLen,
                             size_t *out_len) {
@@ -1384,14 +1481,14 @@ uint8_t *pair_setup_handle(pair_ctx_t *ctx, const uint8_t *body, size_t bodyLen,
 
     tlv_t *in = tlv_parse(body, bodyLen);
     if (!in) {
-        printf("[PAIR] ERROR: Failed to parse TLV8\n");
+        PAIR_DIAG("[PAIR] ERROR: Failed to parse TLV8\n");
         return NULL;
     }
 
     /* Extract State */
     const tlv_item_t *state_item = tlv_find(in, TLV_STATE);
     if (!state_item || state_item->len != 1) {
-        printf("[PAIR] ERROR: No State TLV in pair-setup request\n");
+        PAIR_DIAG("[PAIR] ERROR: No State TLV in pair-setup request\n");
         tlv_free(in);
         return NULL;
     }
@@ -1399,7 +1496,7 @@ uint8_t *pair_setup_handle(pair_ctx_t *ctx, const uint8_t *body, size_t bodyLen,
     uint8_t state = state_item->data[0];
     uint8_t *resp = NULL;
 
-    printf("[PAIR] pair-setup: incoming State=%d\n", state);
+    PAIR_DIAG("[PAIR] pair-setup: incoming State=%d\n", state);
 
     switch (state) {
         case 1:  /* M1 */
@@ -1418,10 +1515,13 @@ uint8_t *pair_setup_handle(pair_ctx_t *ctx, const uint8_t *body, size_t bodyLen,
             resp = handle_setup_m5(ctx, in, out_len);
             break;
         default:
-            printf("[PAIR] ERROR: Unexpected pair-setup state %d\n", state);
+            PAIR_DIAG("[PAIR] ERROR: Unexpected pair-setup state %d\n", state);
             resp = make_error_response(state + 1, 1, out_len);
             break;
     }
+
+    if (ctx->setup_state != 2 && ctx->setup_state != 4)
+        pair_setup_wipe_srp(ctx);
 
     tlv_free(in);
     return resp;
@@ -1434,18 +1534,20 @@ uint8_t *pair_setup_handle(pair_ctx_t *ctx, const uint8_t *body, size_t bodyLen,
 
 /* M1 → M2: Generate X25519 ECDH, sign with Ed25519, send encrypted signature */
 static uint8_t *handle_verify_m1(pair_ctx_t *ctx, const tlv_t *in, size_t *out_len) {
-    printf("[PAIR] pair-verify M1 received (State=1)\n");
+    PAIR_DIAG("[PAIR] pair-verify M1 received (State=1)\n");
 
     const tlv_item_t *pk_item = tlv_find(in, TLV_PUBLIC_KEY);
     if (!pk_item || pk_item->len != 32) {
-        printf("[PAIR] ERROR: M1 missing or invalid PublicKey (len=%zu)\n",
+        PAIR_DIAG("[PAIR] ERROR: M1 missing or invalid PublicKey (len=%zu)\n",
                pk_item ? pk_item->len : 0);
         return make_error_response(2, 2, out_len);
     }
 
-    printf("[PAIR] Client X25519 pk: ");
-    for (int i = 0; i < 32; i++) printf("%02x", pk_item->data[i]);
-    printf("\n");
+    if (!showcase_preauth_quiet) {
+        printf("[PAIR] Client X25519 pk: ");
+        for (int i = 0; i < 32; i++) printf("%02x", pk_item->data[i]);
+        printf("\n");
+    }
 
     /* Store client's X25519 pk for M3 signature verification */
     memcpy(ctx->client_ecdh_pk, pk_item->data, 32);
@@ -1461,19 +1563,23 @@ static uint8_t *handle_verify_m1(pair_ctx_t *ctx, const tlv_t *in, size_t *out_l
     unsigned char our_ecdh_pk[32];
     crypto_x25519_public_key(our_ecdh_pk, ctx->verify_ecdh_sk);
 
-    printf("[PAIR] Our X25519 pk: ");
-    for (int i = 0; i < 32; i++) printf("%02x", our_ecdh_pk[i]);
-    printf("\n");
+    if (!showcase_preauth_quiet) {
+        printf("[PAIR] Our X25519 pk: ");
+        for (int i = 0; i < 32; i++) printf("%02x", our_ecdh_pk[i]);
+        printf("\n");
+    }
 
     /* ECDH shared secret */
     crypto_x25519(ctx->verify_shared, ctx->verify_ecdh_sk, pk_item->data);
+    /* The ephemeral secret is only needed for the shared secret above. */
+    crypto_wipe(ctx->verify_ecdh_sk, sizeof(ctx->verify_ecdh_sk));
     static const uint8_t zeroSecret[32] = {0};
     if (crypto_verify32(ctx->verify_shared, zeroSecret) == 0) {
-        printf("[PAIR] ERROR: X25519 produced an invalid all-zero secret\n");
+        PAIR_DIAG("[PAIR] ERROR: X25519 produced an invalid all-zero secret\n");
         return make_error_response(2, 2, out_len);
     }
 
-    printf("[PAIR] ECDH shared secret established\n");
+    PAIR_DIAG("[PAIR] ECDH shared secret established\n");
 
     /* Save our ECDH public key for M3 */
     memcpy(ctx->verify_our_ecdh_pk, our_ecdh_pk, 32);
@@ -1497,11 +1603,12 @@ static uint8_t *handle_verify_m1(pair_ctx_t *ctx, const tlv_t *in, size_t *out_l
     crypto_ed25519_key_pair(signingSecret, signingPublic, signingSeed);
     crypto_ed25519_sign(signature, signingSecret, sig_msg,
                         (size_t)sig_msg_len);
+    crypto_wipe(signingSeed, sizeof(signingSeed));
     crypto_wipe(signingSecret, sizeof(signingSecret));
     crypto_wipe(signingPublic, sizeof(signingPublic));
     free(sig_msg);
 
-    printf("[PAIR] Ed25519 signature (%zu bytes)\n", sig_len);
+    PAIR_DIAG("[PAIR] Ed25519 signature (%zu bytes)\n", sig_len);
 
     /* Build sub-TLV: Identifier + Signature */
     tlv_item_t sub_items[2] = {
@@ -1512,7 +1619,7 @@ static uint8_t *handle_verify_m1(pair_ctx_t *ctx, const tlv_t *in, size_t *out_l
     uint8_t *sub_buf = tlv_build(sub_items, 2, &sub_len);
     if (!sub_buf) return make_error_response(2, 1, out_len);
 
-    printf("[PAIR] M2 sub-TLV: %zu bytes (Identifier=%d + Signature=%zu)\n",
+    PAIR_DIAG("[PAIR] M2 sub-TLV: %zu bytes (Identifier=%d + Signature=%zu)\n",
            sub_len, our_ident_len, sig_len);
 
     /* Derive encryption key: HKDF-SHA512(shared_secret,
@@ -1522,7 +1629,7 @@ static uint8_t *handle_verify_m1(pair_ctx_t *ctx, const tlv_t *in, size_t *out_l
                 (const unsigned char *)"Pair-Verify-Encrypt-Info", 24,
                 ctx->verify_enc_key, 32);
 
-    printf("[PAIR] Pair-verify encryption key derived\n");
+    PAIR_DIAG("[PAIR] Pair-verify encryption key derived\n");
 
     /* Encrypt sub-TLV with ChaCha20-Poly1305, nonce="PV-Msg02" */
     unsigned char *enc_ct = malloc(sub_len);
@@ -1547,7 +1654,7 @@ static uint8_t *handle_verify_m1(pair_ctx_t *ctx, const tlv_t *in, size_t *out_l
     memcpy(enc_out + enc_len, enc_tag, 16);
     free(enc_ct);
 
-    printf("[PAIR] M2 EncryptedData: %zu bytes (ct=%d + tag=16)\n", enc_total, enc_len);
+    PAIR_DIAG("[PAIR] M2 EncryptedData: %zu bytes (ct=%d + tag=16)\n", enc_total, enc_len);
 
     /* Build M2 response: State=2, PublicKey(our X25519), EncryptedData */
     uint8_t state = 2;
@@ -1560,17 +1667,17 @@ static uint8_t *handle_verify_m1(pair_ctx_t *ctx, const tlv_t *in, size_t *out_l
     free(enc_out);
 
     ctx->verify_state = 2;
-    printf("[PAIR] pair-verify M2 sent (State=2, PK=32, EncData=%zu)\n", enc_total);
+    PAIR_DIAG("[PAIR] pair-verify M2 sent (State=2, PK=32, EncData=%zu)\n", enc_total);
     return resp;
 }
 
 /* M3 → M4: Decrypt + verify client's signature */
 static uint8_t *handle_verify_m3(pair_ctx_t *ctx, const tlv_t *in, size_t *out_len) {
-    printf("[PAIR] pair-verify M3 received (State=3)\n");
+    PAIR_DIAG("[PAIR] pair-verify M3 received (State=3)\n");
 
     const tlv_item_t *enc_item = tlv_find(in, TLV_ENCRYPTED_DATA);
     if (!enc_item || enc_item->len < 16) {
-        printf("[PAIR] ERROR: M3 missing or short EncryptedData (len=%zu)\n",
+        PAIR_DIAG("[PAIR] ERROR: M3 missing or short EncryptedData (len=%zu)\n",
                enc_item ? enc_item->len : 0);
         return make_error_response(4, 2, out_len);
     }
@@ -1580,7 +1687,7 @@ static uint8_t *handle_verify_m3(pair_ctx_t *ctx, const tlv_t *in, size_t *out_l
     const unsigned char *ct = enc_item->data;
     const unsigned char *tag = enc_item->data + ct_len;
 
-    printf("[PAIR] M3 EncryptedData: %zu bytes (ct=%d + tag=16)\n", enc_item->len, ct_len);
+    PAIR_DIAG("[PAIR] M3 EncryptedData: %zu bytes (ct=%d + tag=16)\n", enc_item->len, ct_len);
 
     /* Decrypt with ChaCha20-Poly1305, nonce="PV-Msg03", same key as M2 */
     unsigned char *pt = malloc(ct_len);
@@ -1590,18 +1697,18 @@ static uint8_t *handle_verify_m3(pair_ctx_t *ctx, const tlv_t *in, size_t *out_l
                                  (const unsigned char *)"PV-Msg03",
                                  ct, ct_len, pt, tag);
     if (pt_len < 0) {
-        printf("[PAIR] ERROR: ChaCha20-Poly1305 decrypt FAILED for M3\n");
+        PAIR_DIAG("[PAIR] ERROR: ChaCha20-Poly1305 decrypt FAILED for M3\n");
         free(pt);
         return make_error_response(4, 2, out_len);
     }
 
-    printf("[PAIR] Decrypted M3 sub-TLV: %d bytes\n", pt_len);
+    PAIR_DIAG("[PAIR] Decrypted M3 sub-TLV: %d bytes\n", pt_len);
 
     /* Parse sub-TLV: Identifier + Signature */
     tlv_t *sub_tlv = tlv_parse(pt, pt_len);
     free(pt);
     if (!sub_tlv) {
-        printf("[PAIR] ERROR: Failed to parse M3 sub-TLV\n");
+        PAIR_DIAG("[PAIR] ERROR: Failed to parse M3 sub-TLV\n");
         return make_error_response(4, 2, out_len);
     }
 
@@ -1609,20 +1716,20 @@ static uint8_t *handle_verify_m3(pair_ctx_t *ctx, const tlv_t *in, size_t *out_l
     const tlv_item_t *sig_item = tlv_find(sub_tlv, TLV_SIGNATURE);
 
     if (!ident_item) {
-        printf("[PAIR] ERROR: M3 sub-TLV missing Identifier\n");
+        PAIR_DIAG("[PAIR] ERROR: M3 sub-TLV missing Identifier\n");
         tlv_free(sub_tlv);
         return make_error_response(4, 2, out_len);
     }
     if (!sig_item || sig_item->len != 64) {
-        printf("[PAIR] ERROR: M3 sub-TLV missing or invalid Signature (len=%zu)\n",
+        PAIR_DIAG("[PAIR] ERROR: M3 sub-TLV missing or invalid Signature (len=%zu)\n",
                sig_item ? sig_item->len : 0);
         tlv_free(sub_tlv);
         return make_error_response(4, 2, out_len);
     }
 
-    printf("[PAIR]   Client identifier (%zu): %.*s\n",
-           ident_item->len, (int)ident_item->len, ident_item->data);
-    printf("[PAIR]   Client signature (64 bytes)\n");
+    if (!showcase_preauth_quiet)
+        pair_log_identifier("Client identifier", ident_item->data, ident_item->len);
+    PAIR_DIAG("[PAIR]   Client signature (64 bytes)\n");
 
     /* Verify against the identifier-specific key restored from persistent
      * storage. A just-completed pair-setup has populated the same registry. */
@@ -1646,22 +1753,24 @@ static uint8_t *handle_verify_m3(pair_ctx_t *ctx, const tlv_t *in, size_t *out_l
                 printf("[PAIR] *** Ed25519 signature verification PASSED ***\n");
                 signature_valid = true;
             } else {
-                printf("[PAIR] ERROR: Ed25519 signature verification FAILED\n");
+                PAIR_DIAG("[PAIR] ERROR: Ed25519 signature verification FAILED\n");
             }
             free(verify_msg);
         }
     } else {
-        printf("[PAIR] WARNING: Skipping signature verification ");
-        if (!verify_pk) printf("(identifier is not paired) ");
-        if (!ctx->client_ecdh_pk_set) printf("(no client ECDH pk) ");
-        printf("\n");
+        PAIR_DIAG("[PAIR] WARNING: Skipping signature verification%s%s\n",
+                  verify_pk ? "" : " (identifier is not paired)",
+                  ctx->client_ecdh_pk_set ? "" : " (no client ECDH pk)");
     }
 
     tlv_free(sub_tlv);
     if (!signature_valid) {
-        printf("[PAIR] Rejecting unpaired or unauthenticated controller\n");
+        PAIR_DIAG("[PAIR] Rejecting unpaired or unauthenticated controller\n");
         return make_error_response(4, 2, out_len);
     }
+    /* Authenticated use: mark this controller most recently used so registry
+     * eviction is LRU rather than insertion order. The caller persists it. */
+    if (peer_index >= 0) move_peer_to_end(ctx, (size_t)peer_index);
 
     /* Build M4 response: State=4 (success) */
     uint8_t state = 4;
@@ -1685,13 +1794,13 @@ uint8_t *pair_verify_handle(pair_ctx_t *ctx, const uint8_t *body, size_t bodyLen
 
     tlv_t *in = tlv_parse(body, bodyLen);
     if (!in) {
-        printf("[PAIR] ERROR: Failed to parse TLV8\n");
+        PAIR_DIAG("[PAIR] ERROR: Failed to parse TLV8\n");
         return NULL;
     }
 
     const tlv_item_t *state_item = tlv_find(in, TLV_STATE);
     if (!state_item || state_item->len != 1) {
-        printf("[PAIR] ERROR: No State TLV in pair-verify request\n");
+        PAIR_DIAG("[PAIR] ERROR: No State TLV in pair-verify request\n");
         tlv_free(in);
         return NULL;
     }
@@ -1699,7 +1808,7 @@ uint8_t *pair_verify_handle(pair_ctx_t *ctx, const uint8_t *body, size_t bodyLen
     uint8_t state = state_item->data[0];
     uint8_t *resp = NULL;
 
-    printf("[PAIR] pair-verify: incoming State=%d\n", state);
+    PAIR_DIAG("[PAIR] pair-verify: incoming State=%d\n", state);
 
     switch (state) {
         case 1:
@@ -1713,7 +1822,7 @@ uint8_t *pair_verify_handle(pair_ctx_t *ctx, const uint8_t *body, size_t bodyLen
             resp = handle_verify_m3(ctx, in, out_len);
             break;
         default:
-            printf("[PAIR] ERROR: Unexpected pair-verify state %d\n", state);
+            PAIR_DIAG("[PAIR] ERROR: Unexpected pair-verify state %d\n", state);
             resp = make_error_response(state + 1, 1, out_len);
             break;
     }

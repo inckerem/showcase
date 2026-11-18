@@ -14,11 +14,11 @@ class BluetoothSecurityTests(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(prefix='showcase-bt-security-')
         root = Path(cls.tmp.name)
         args_code = SOURCE[SOURCE.index('static char kDeviceName'):SOURCE.index('/* ══════════════════════════════════════════════════\n *  AirPlay receiver identity')]
-        args_code = args_code[0:args_code.index('static const uint8_t kWifiSecurityType')] + '\n' + args_code[args_code.index('static int parse_args'):]
-        (root/'args.c').write_text('#include <stdio.h>\n#include <string.h>\n#include <unistd.h>\n#include <errno.h>\n' + args_code + r'''
+        args_code = args_code[0:args_code.index('static const uint8_t kWifiSecurityType')] + '\n' + args_code[args_code.index('static size_t utf8_boundary_len'):]
+        (root/'args.c').write_text('#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n#include <unistd.h>\n#include <errno.h>\n' + args_code + r'''
 int main(int argc, char **argv) {
     if (parse_args(argc, argv)) return 2;
-    printf("%s\n%zu\n", kWifiSSID, strlen(kWifiPassword));
+    printf("%s\n%zu\n%s\n", kWifiSSID, strlen(kWifiPassword), kDeviceName);
     return 0;
 }
 ''')
@@ -40,6 +40,7 @@ static uint8_t my_initial_psn,my_next_psn,peer_psn;
 static uint8_t ck(uint8_t *d,int l) { uint8_t sum=0; for(int i=0;i<l;i++) sum+=d[i]; return (uint8_t)(0-sum); }
 static void send_syn(void){} static void send_ack(void){sent++;}
 static void reset_wireless_handoff_state(void){}
+static void cancel_detect_retry(void){} static void schedule_syn_timeout(void){}
 static void handle_ctrl_msg(uint16_t id,uint8_t *p,int n){(void)p;(void)n;assert(id==0x5702);delivered++;}
 ''' + params_code + frame_code + r'''
 int main(void) {
@@ -72,8 +73,19 @@ int main(void) {
         for password in (b'12345678', b'x'*63):
             p = self.run_args(['--ssid', 'router', '--pass-stdin', 'ignored'], password)
             self.assertEqual(p.returncode, 0, p.stderr)
-            self.assertEqual(p.stdout, b'router\n%d\n' % len(password))
+            self.assertEqual(p.stdout, b'router\n%d\nRoadLink\n' % len(password))
         self.assertEqual(self.run_args(['--ssid', 'router', '--pass', 'legacy']).returncode, 0)
+
+    def test_device_name_truncation_keeps_utf8_whole(self):
+        base = ['--ssid', 'router', '--pass', '12345678', '--name']
+        fits = 'a' * 29 + 'ğ'          # 31 bytes: fits the 32-byte buffer
+        split = 'a' * 30 + 'ğ'         # 32 bytes: 'ğ' would be cut in half
+        p = self.run_args(base + [fits])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.split(b'\n')[2], fits.encode())
+        p = self.run_args(base + [split])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.split(b'\n')[2], b'a' * 30)
 
     def test_invalid_credentials_fail_closed(self):
         for password in (b'', b'x'*64, b'ab\0cd'):

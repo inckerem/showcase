@@ -64,4 +64,21 @@ exit 1
     assert result.returncode != 0 and not (data/'enabled').exists()
     result = run('postinst','configure','nopid')
     assert result.returncode != 0 and not (data/'enabled').exists() and not (root/'loaded').exists()
+    # R5-09: prerm records the enabled state so the old postinst's abort-upgrade
+    # (dpkg's rollback after a failed upgrade) restores the service; without the
+    # record abort-upgrade must not enable anything.
+    assert run('postinst','configure').returncode == 0
+    assert run('prerm','upgrade').returncode == 0 and not (data/'enabled').exists() and not (root/'loaded').exists()
+    assert (data/'was-enabled').exists()
+    result = run('postinst','abort-upgrade')
+    assert result.returncode == 0, result.stderr
+    assert (data/'enabled').exists() and (root/'loaded').exists() and not (data/'was-enabled').exists()
+    assert run('prerm','upgrade').returncode == 0
+    (data/'was-enabled').unlink()
+    result = run('postinst','abort-upgrade')
+    assert result.returncode == 0 and not (data/'enabled').exists() and not (root/'loaded').exists()
+    # A prerm that fails restores enabled itself and leaves no abort record.
+    assert run('postinst','configure').returncode == 0
+    result = run('prerm','upgrade','unloadfail')
+    assert result.returncode != 0 and (data/'enabled').exists() and not (data/'was-enabled').exists()
 print('PASS: service install, reload, failure, removal and marker handling')

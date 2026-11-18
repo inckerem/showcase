@@ -2,8 +2,8 @@
 
 "Wi-Fi network is required." = "Un réseau Wi-Fi est requis.";
 "Wi-Fi name must be at least 6 characters. iOS rejects shorter names for CarPlay." = "Le nom Wi-Fi doit comporter au moins 6 caractères. iOS refuse les noms plus courts pour CarPlay.";
-"Wi-Fi name cannot contain \"%@\". Rename this %@ in Settings › General › About › Name." = "Le nom Wi-Fi ne peut pas contenir « %@ ». Renommez cet %@ dans Réglages › Général › Informations › Nom.";
 "Wi-Fi name must be at most 32 bytes." = "Le nom Wi-Fi ne doit pas dépasser 32 octets.";
+"Wi-Fi name cannot contain \"%@\". Rename this %@ in Settings › General › About › Name." = "Le nom Wi-Fi ne peut pas contenir « %@ ». Renommez cet %@ dans Réglages › Général › Informations › Nom.";
 "Wi-Fi password must be 8 to 63 UTF-8 bytes." = "Le mot de passe Wi-Fi doit contenir entre 8 et 63 octets UTF-8.";
 "Hotspot passwords must be at least 8 characters." = "Le mot de passe du point d’accès doit comporter au moins 8 caractères.";
 "Copy Diagnostic" = "Copier le diagnostic";
@@ -12,7 +12,12 @@
 "Give us a star on GitHub!" = "Donnez-nous une étoile sur GitHub !";
 "Copy Link" = "Copier le lien";
 "Open GitHub" = "Ouvrir GitHub";
-"Safe travels" = "Bonne route";
+"CarPlay Could Not Start" = "CarPlay n’a pas pu démarrer";
+"Showcase's CarPlay services could not start. Try again; if it keeps happening, reinstall Showcase or send logs to KCS from Settings." = "Les services CarPlay de Showcase n’ont pas pu démarrer. Réessayez ; si le problème persiste, réinstallez Showcase ou envoyez les journaux à KCS depuis les Réglages.";
+"OK" = "OK";
+"CarPlay disconnected" = "CarPlay déconnecté";
+"Wireless CarPlay" = "CarPlay sans fil";
+"Mirror iPhone Screen" = "Recopier l’écran de l’iPhone";
 "Settings" = "Réglages";
 "CarPlay services" = "Services CarPlay";
 "Verification" = "Vérification";
@@ -25,9 +30,9 @@
 "Set Up Wi-Fi" = "Configurer le Wi-Fi";
 "Preparing" = "Préparation";
 "Preparing…" = "Préparation…";
-"Connect to the Internet" = "Connectez-vous à Internet";
+"Reinstall Showcase" = "Réinstallez Showcase";
 "Try Again" = "Réessayer";
-"Wireless CarPlay" = "CarPlay sans fil";
+"Connect to the Internet" = "Connectez-vous à Internet";
 "Start CarPlay" = "Démarrer CarPlay";
 "Starting Personal Hotspot" = "Activation du partage de connexion";
 "Turn On Personal Hotspot" = "Activez le partage de connexion";
@@ -42,7 +47,8 @@
 "Could not read the connected Wi-Fi name. Check Wi-Fi in Settings and try again." = "Impossible de lire le nom du réseau Wi-Fi connecté. Vérifiez le Wi-Fi dans Réglages et réessayez.";
 "This device is connected to “%@”, but Showcase is configured for “%@”. Connect both devices to the same network and update Wi-Fi settings." = "Cet appareil est connecté à « %@ », mais Showcase utilise « %@ ». Connectez les deux appareils au même réseau et modifiez les réglages Wi-Fi.";
 "Wi-Fi Setup" = "Configuration Wi-Fi";
-"OK" = "OK";
+"This %1$@'s hotspot is called “%2$@”. Your iPhone joins the name you enter here, so it has to match. To use “%3$@”, rename the %1$@ in Settings > General > About > Name." = "Le point d’accès de cet %1$@ s’appelle « %2$@ ». Votre iPhone rejoint le nom saisi ici, ils doivent donc correspondre. Pour utiliser « %3$@ », renommez l’%1$@ dans Réglages > Général > Informations > Nom.";
+"The Personal Hotspot password is different from the one saved in Showcase. Update the hotspot details and try again." = "Le mot de passe du Partage de connexion est différent de celui enregistré dans Showcase. Modifiez les infos du point d’accès et réessayez.";
 "Bluetooth Hardware Not Supported" = "Matériel Bluetooth non pris en charge";
 "Bluetooth Setup Failed" = "Échec de la configuration Bluetooth";
 "Showcase could not take over this device's Bluetooth controller. Tell the developer or community that this model is not yet supported and include the diagnostic below." = "Showcase n’a pas pu prendre le contrôle du contrôleur Bluetooth de cet appareil. Signalez au développeur ou à la communauté que ce modèle n’est pas encore pris en charge, en joignant le diagnostic ci-dessous.";
@@ -55,7 +61,6 @@
 "Password" = "Mot de passe";
 "Save" = "Enregistrer";
 "Different Name" = "Nom différent";
-"This iPad's hotspot is called “%@”. Your iPhone joins the name you enter here, so it has to match. To use “%@”, rename the iPad in Settings > General > About > Name." = "Le point d’accès de cet iPad s’appelle « %@ ». Votre iPhone rejoint le nom saisi ici, ils doivent donc correspondre. Pour utiliser « %@ », renommez l’iPad dans Réglages > Général > Informations > Nom.";
 "Use “%@”" = "Utiliser « %@ »";
 "Keep" = "Conserver";
 "%@\n\nSaved to:\n%@" = "%@\n\nEnregistré dans :\n%@";
@@ -88,11 +93,12 @@
 "Stop CarPlay" = "Arrêter CarPlay";
 "Edit" = "Modifier";
 "Add Car" = "Ajouter une voiture";
+"Stop CarPlay to change these settings." = "Arrêtez CarPlay pour modifier ces réglages.";
 "Use This Car" = "Utiliser cette voiture";
 "Tap Again to Delete" = "Touchez à nouveau pour supprimer";
 "Delete Car" = "Supprimer la voiture";
 "Enter a name for the car." = "Saisissez un nom pour la voiture.";
-"Use a shorter name. CarPlay allows up to 31 characters." = "Choisissez un nom plus court. CarPlay accepte 31 caractères au maximum.";
+"Use a shorter name. CarPlay allows up to 31 bytes (fewer characters for non-Latin letters)." = "Choisissez un nom plus court. CarPlay accepte 31 octets au maximum (moins de caractères pour les lettres non latines).";
 "Another car already uses this name." = "Une autre voiture porte déjà ce nom.";
 "Existing Wi-Fi network" = "Réseau Wi-Fi existant";
 "Personal Hotspot" = "Partage de connexion";
@@ -102,7 +108,7 @@
 "Connected to “%@”. To use this network, enter its name and password below, then tap Save." = "Connecté à « %@ ». Pour utiliser ce réseau, saisissez son nom et son mot de passe ci-dessous, puis touchez Enregistrer.";
 "8 characters or more" = "8 caractères ou plus";
 "Rename This %@" = "Renommer cet %@";
-"Saved, but this iPad's hotspot is called “%@”. Your iPhone can't join until the names match." = "Enregistré, mais le point d’accès de cet iPad s’appelle « %@ ». Votre iPhone ne pourra pas s’y connecter tant que les noms ne correspondent pas.";
+"Saved, but this %1$@'s hotspot is called “%2$@”. Your iPhone can't join until the names match." = "Enregistré, mais le point d’accès de cet %1$@ s’appelle « %2$@ ». Votre iPhone ne pourra pas s’y connecter tant que les noms ne correspondent pas.";
 "Saved." = "Enregistré.";
 "Play Sound on This %@" = "Lire le son sur cet %@";
 "%u × %u at %u fps" = "%u × %u à %u i/s";
@@ -131,6 +137,7 @@
 "Stop and Send Network Capture" = "Arrêter et envoyer la capture réseau";
 "Start Network Capture" = "Démarrer la capture réseau";
 "Capturing" = "Capture en cours";
+"Network capture could not start. Turn on Personal Hotspot or join the Wi-Fi network first, then try again." = "La capture réseau n’a pas pu démarrer. Activez le Partage de connexion ou rejoignez d’abord le réseau Wi-Fi, puis réessayez.";
 "Send Last Network Capture" = "Envoyer la dernière capture réseau";
 "Tap Again to Clear" = "Touchez à nouveau pour effacer";
 "Clear Logs and Captures" = "Effacer le journal et les captures";
@@ -152,3 +159,11 @@
 "2.  Enter Hotspot Details" = "2.  Saisir les infos du point d’accès";
 "Enter Details" = "Saisir les infos";
 "Copy" = "Copier";
+"Waiting for a new frame…\nShowing the last frame received." = "En attente d’une nouvelle image…\nAffichage de la dernière image reçue.";
+"Showcase pairing QR code" = "Code QR de jumelage Showcase";
+"Could not create the QR code. Close this screen and open it again." = "Impossible de créer le code QR. Fermez cet écran et rouvrez-le.";
+"Scan the QR code in Showcase Mirror.\nBoth devices must be on the same Wi-Fi network." = "Scannez le code QR dans Showcase Mirror.\nLes deux appareils doivent être sur le même réseau Wi-Fi.";
+"Connect the iPad to the same Wi-Fi network as the iPhone." = "Connectez l’iPad au même réseau Wi-Fi que l’iPhone.";
+"Could not create the pairing code." = "Impossible de créer le code de jumelage.";
+"Could not start the Wi-Fi receiver." = "Impossible de démarrer le récepteur Wi-Fi.";
+"Starting the Wi-Fi receiver…" = "Démarrage du récepteur Wi-Fi…";

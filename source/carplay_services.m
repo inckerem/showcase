@@ -53,6 +53,37 @@
 static pthread_mutex_t g_service_log_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_service_log_at_line_start = true;
 
+/*
+ * The app truncates carplay_services.log only when it spawns the daemon, and
+ * the daemon can wait in AwaitingPhone for days while LAN peers reach port
+ * 7000. Bound the file in place: once it passes the cap, keep the head
+ * (launch arguments and the first negotiation) and drop the rest. stdout is
+ * opened O_APPEND by spawn_daemon, so later writes continue at the new end.
+ * Checked every SERVICE_LOG_CHECK_BYTES so normal logging stays cheap; fstat
+ * also accounts for stderr and direct fwrite output sharing the file.
+ */
+#define SERVICE_LOG_MAX_BYTES   (8 * 1024 * 1024)
+#define SERVICE_LOG_KEEP_BYTES  (1024 * 1024)
+#define SERVICE_LOG_CHECK_BYTES (64 * 1024)
+static size_t g_service_log_unchecked_bytes = 0;
+
+/* Caller holds g_service_log_lock. */
+static void service_log_enforce_cap_locked(void) {
+    if (g_service_log_unchecked_bytes < SERVICE_LOG_CHECK_BYTES) return;
+    g_service_log_unchecked_bytes = 0;
+    fflush(stdout);
+    struct stat st;
+    int fd = fileno(stdout);
+    if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) return;
+    if (st.st_size <= SERVICE_LOG_MAX_BYTES) return;
+    if (ftruncate(fd, SERVICE_LOG_KEEP_BYTES) != 0) return;
+    fseeko(stdout, 0, SEEK_END);
+    fprintf(stdout, "\n[LOG] carplay_services.log reached %lld bytes; "
+                    "dropped everything after the first %d bytes\n",
+            (long long)st.st_size, SERVICE_LOG_KEEP_BYTES);
+    g_service_log_at_line_start = true;
+}
+
 int showcase_service_log_printf(const char *format, ...) {
     va_list args;
     va_start(args, format);
@@ -92,6 +123,8 @@ int showcase_service_log_printf(const char *format, ...) {
         cursor += chunk;
         if (newline) g_service_log_at_line_start = true;
     }
+    g_service_log_unchecked_bytes += (size_t)length;
+    service_log_enforce_cap_locked();
     pthread_mutex_unlock(&g_service_log_lock);
     free(rendered);
     return length;
@@ -185,12 +218,43 @@ static char g_wifi_interface[IFNAMSIZ] = "bridge100";
  * displays mounted to the driver's right. */
 static bool g_right_hand_drive = false;
 
+/* A byte-limited copy may split a multi-byte UTF-8 sequence; drop the
+ * incomplete trailing sequence so the name stays valid UTF-8 (otherwise
+ * NSString stringWithUTF8String: returns nil and mDNS names are corrupt). */
+static void truncate_utf8_tail(char *s) {
+    size_t len = strlen(s);
+    if (len == 0) return;
+    size_t start = len;
+    /* Walk back over at most 3 continuation bytes to the lead byte. */
+    while (start > 0 && len - start < 4 &&
+           ((unsigned char)s[start - 1] & 0xC0) == 0x80)
+        start--;
+    if (start == 0) { s[0] = '\0'; return; }
+    unsigned char lead = (unsigned char)s[start - 1];
+    size_t need;
+    if (lead < 0x80) return;                 /* ASCII: complete */
+    else if ((lead & 0xE0) == 0xC0) need = 2;
+    else if ((lead & 0xF0) == 0xE0) need = 3;
+    else if ((lead & 0xF8) == 0xF0) need = 4;
+    else need = 0;                           /* invalid lead byte */
+    if (need == 0 || len - (start - 1) < need)
+        s[start - 1] = '\0';
+}
+
+static NSString *instance_name_string(void) {
+    NSString *name = [NSString stringWithUTF8String:g_instance_name];
+    return name.length > 0 ? name : @"RoadLink";
+}
+
 static void parse_args(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if ((!strcmp(argv[i], "--name") || !strcmp(argv[i], "-n")) &&
             i + 1 < argc) {
             strncpy(g_instance_name, argv[i+1], sizeof(g_instance_name) - 1);
             g_instance_name[sizeof(g_instance_name) - 1] = '\0';
+            truncate_utf8_tail(g_instance_name);
+            if (g_instance_name[0] == '\0')
+                strlcpy(g_instance_name, "RoadLink", sizeof(g_instance_name));
             snprintf(g_raop_name, sizeof(g_raop_name),
                      "%s@%s", DEVICE_ID_RAW, g_instance_name);
             i++;
@@ -236,13 +300,16 @@ static void parse_args(int argc, char *argv[]) {
 #define MDNS_REANNOUNCE_SECONDS 300
 #define MDNS_REANNOUNCE_INTERVAL 3
 
-/* Ed25519 keypair — REAL key generated via PyNaCl.
+/* Accessory long-term Ed25519 identity — REAL key generated via PyNaCl.
+ * It is shared by every installation (it is in the public source). A
+ * per-device key would stop already-paired iPhones from pair-verifying (the
+ * iPhone would see a known deviceid with a different key and ask to pair the
+ * car again), so changing it is a product decision and stays parked.
  * pk = 32-byte Ed25519 public key, hex-encoded for TXT record.
  * sk = 32-byte Ed25519 private seed, stored for pair-setup/verify. */
+#define ACCESSORY_STATE_DIR  "/var/root/Library/ShowcaseCarPlay"
 #define HK_PK "1b15f0ad62c894721c4097651801e62845451a183c8df8af7d6b20430823586f"
 #define HK_PI "29f0a5dc-2c2a-4b3e-9e5d-1a6c85f201a3"   /* UUID format, not MAC */
-
-/* Ed25519 private key seed (32 bytes) — needed for pair-verify signatures */
 static const uint8_t ed25519_sk[32] = {
     0x95, 0x74, 0xdb, 0x39, 0x5b, 0x64, 0x5e, 0xae,
     0x89, 0xd1, 0xfa, 0x7d, 0x01, 0xb7, 0xa4, 0x6b,
@@ -255,6 +322,8 @@ static const uint8_t ed25519_pk[32] = {
     0x45, 0x45, 0x1a, 0x18, 0x3c, 0x8d, 0xf8, 0xaf,
     0x7d, 0x6b, 0x20, 0x43, 0x08, 0x23, 0x58, 0x6f
 };
+static const char g_hk_pk_hex[] = HK_PK;
+static const char g_hk_pi[] = HK_PI;
 
 /* Features bitmask — UxPlay base + MFi bit 26 restored for CarPlay:
  * Lower 32 = 0x5E7FFEE6:
@@ -290,20 +359,278 @@ static bool g_useHK = true;
 
 /* Global pairing context — initialized in main(), used by pair handlers */
 static pair_ctx_t *g_pair = NULL;
-#define PAIRING_STORE_DIR  "/var/mobile/Library/Showcase"
-#define PAIRING_STORE_PATH PAIRING_STORE_DIR "/paired-controllers.plist"
+/* g_pair holds one SRP / pair-verify state machine for the whole process, but
+ * every control connection runs on its own thread. All calls into it (and
+ * reads of its results) are serialized here. Lock order: g_pair_lock, then
+ * g_control_owner_lock. */
+static pthread_mutex_t g_pair_lock = PTHREAD_MUTEX_INITIALIZER;
+/* The controller registry is this root daemon's authorization store: every
+ * entry may pair-verify without the PIN. It therefore lives in the root-only
+ * state directory, never in a mobile-writable location. */
+#define PAIRING_STORE_PATH ACCESSORY_STATE_DIR "/paired-controllers.plist"
+/* Former mobile-owned location. It is imported once into the root-only store
+ * and then removed, so iPhones paired before the move keep pair-verifying
+ * without asking to pair the car again. */
+#define LEGACY_PAIRING_STORE_PATH \
+    "/var/mobile/Library/Showcase/paired-controllers.plist"
+/* The same location, walked one component at a time (see
+ * open_legacy_showcase_dir) so no mobile-controlled symlink is followed. */
+#define LEGACY_PAIRING_STORE_NAME "paired-controllers.plist"
+#define MOBILE_UID 501
 #define BT_ID_PATH "/tmp/showcase_bt_id"
 /* /tmp is emptied at boot; the Bluetooth helper keeps a persistent copy so the
  * iPhone keeps seeing the same car identity even before BT re-reads its MAC. */
 #define BT_ID_PERSIST_PATH "/var/mobile/Library/Showcase/bt-id"
+
+/* Creates the root-only state directory and refuses one that is a symlink,
+ * owned by another user, or reachable by group/other. */
+static bool ensure_accessory_state_dir(void) {
+    mkdir("/var/root/Library", 0755);
+    if (mkdir(ACCESSORY_STATE_DIR, 0700) != 0 && errno != EEXIST) {
+        printf("[PAIR] ERROR: cannot create %s: %s\n",
+               ACCESSORY_STATE_DIR, strerror(errno));
+        return false;
+    }
+    struct stat st;
+    if (lstat(ACCESSORY_STATE_DIR, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != 0) {
+        printf("[PAIR] ERROR: %s is not a root-owned directory\n",
+               ACCESSORY_STATE_DIR);
+        return false;
+    }
+    if ((st.st_mode & 0077) != 0 && chmod(ACCESSORY_STATE_DIR, 0700) != 0) {
+        printf("[PAIR] ERROR: cannot restrict %s: %s\n",
+               ACCESSORY_STATE_DIR, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+/* Reads a file only when it is a regular, root-owned, root-only file (the
+ * final component is not followed if it is a symlink). */
+static NSData *read_root_private_file(const char *path, size_t maxLength) {
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return nil;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != 0 ||
+        (st.st_mode & 0077) != 0 || st.st_size < 0 ||
+        (uint64_t)st.st_size > maxLength) {
+        printf("[PAIR] WARN: ignoring %s (not a root-only regular file)\n",
+               path);
+        close(fd);
+        return nil;
+    }
+    NSMutableData *data = [NSMutableData dataWithLength:(NSUInteger)st.st_size];
+    uint8_t *bytes = data.mutableBytes;
+    size_t got = 0;
+    while (got < (size_t)st.st_size) {
+        ssize_t n = read(fd, bytes + got, (size_t)st.st_size - got);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    close(fd);
+    return got == (size_t)st.st_size ? data : nil;
+}
+
+/* Atomically replaces path with a root-owned 0600 file. */
+static bool write_root_private_file(const char *path, const void *bytes,
+                                    size_t length) {
+    char tmp[PATH_MAX];
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp))
+        return false;
+    unlink(tmp);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                  0600);
+    if (fd < 0) return false;
+    size_t written = 0;
+    while (written < length) {
+        ssize_t n = write(fd, (const uint8_t *)bytes + written,
+                          length - written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        written += (size_t)n;
+    }
+    bool ok = written == length && fchown(fd, 0, 0) == 0 &&
+              fchmod(fd, 0600) == 0 && fsync(fd) == 0;
+    if (close(fd) != 0) ok = false;
+    if (ok && rename(tmp, path) != 0) ok = false;
+    if (!ok) unlink(tmp);
+    return ok;
+}
+
+/* Written once the legacy location has been dealt with, whether or not
+ * there was anything to import. Without it, any process able to write the
+ * mobile-owned legacy path could plant a controller key that a later start
+ * would import into the root authorization store. */
+#define LEGACY_PAIRING_MIGRATED_PATH \
+    ACCESSORY_STATE_DIR "/legacy-pairing-migrated"
+
+/* Copies the legacy registry into the root-only store. Returns true when the
+ * legacy file may be removed: it was copied, the root store already exists,
+ * or the legacy entry is not an importable regular file. Returns false when
+ * it must be kept for a later attempt. */
+static bool import_legacy_pairing_registry(int legacyDir) {
+    struct stat st;
+    if (lstat(PAIRING_STORE_PATH, &st) == 0) return true;
+    if (errno != ENOENT) {
+        printf("[PAIR] WARN: cannot inspect %s: %s\n",
+               PAIRING_STORE_PATH, strerror(errno));
+        return false;
+    }
+    /* O_NONBLOCK: a FIFO planted in the mobile-owned directory must not hang
+     * the open (and with it every pair-setup/verify); S_ISREG rejects it. */
+    int fd = openat(legacyDir, LEGACY_PAIRING_STORE_NAME,
+                    O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ELOOP) return true;  /* a symlink: never imported */
+        printf("[PAIR] WARN: cannot open the legacy controller registry: %s\n",
+               strerror(errno));
+        return false;
+    }
+    struct stat lst;
+    if (fstat(fd, &lst) != 0) {
+        close(fd);
+        return false;
+    }
+    if (!S_ISREG(lst.st_mode) || lst.st_size <= 0 ||
+        lst.st_size > 1024 * 1024) {
+        close(fd);
+        return true;
+    }
+    NSMutableData *data = [NSMutableData dataWithLength:(NSUInteger)lst.st_size];
+    size_t got = 0;
+    while (got < (size_t)lst.st_size) {
+        ssize_t n = read(fd, (uint8_t *)data.mutableBytes + got,
+                         (size_t)lst.st_size - got);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    close(fd);
+    if (got == (size_t)lst.st_size &&
+        write_root_private_file(PAIRING_STORE_PATH, data.bytes, got)) {
+        printf("[PAIR] Moved controller registry to the root-only store\n");
+        return true;
+    }
+    printf("[PAIR] WARN: could not move the legacy controller registry\n");
+    return false;
+}
+
+/* Reads the Bluetooth identity published by the Bluetooth helper. Both copies
+ * live in locations other users can write, so the read must never block (a
+ * FIFO), follow a symlink in the final component (/dev/zero), or read more
+ * than a short regular file. Returns nil unless it holds XX:XX:XX:XX:XX:XX. */
+static NSString *read_bt_id_at(int dirFd, const char *path) {
+    int fd = openat(dirFd, path,
+                    O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return nil;
+    enum { BT_ID_MAX_FILE = 64 };
+    char buf[BT_ID_MAX_FILE + 1];
+    struct stat st;
+    size_t got = 0;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&
+        st.st_size <= BT_ID_MAX_FILE) {
+        while (got < (size_t)st.st_size) {
+            ssize_t n = read(fd, buf + got, (size_t)st.st_size - got);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            got += (size_t)n;
+        }
+    }
+    close(fd);
+    while (got > 0 && (buf[got - 1] == '\n' || buf[got - 1] == '\r' ||
+                       buf[got - 1] == ' ' || buf[got - 1] == '\t'))
+        got--;
+    if (got != 17) return nil;
+    for (size_t i = 0; i < 17; i++) {
+        bool ok = (i % 3 == 2) ? buf[i] == ':' : isxdigit((unsigned char)buf[i]);
+        if (!ok) return nil;
+    }
+    buf[got] = '\0';
+    return [NSString stringWithUTF8String:buf];
+}
+
+/* Opens the legacy mobile-owned directory without following a symlink in any
+ * mobile-writable component: O_NOFOLLOW on the full path would protect only
+ * the file name, and a mobile process could otherwise point "Showcase" at the
+ * root-only state directory so the migration deletes the root registry.
+ * Returns -1 with errno ENOENT when it does not exist, or another errno when
+ * it is not a plain directory owned by mobile (or root). */
+static int open_legacy_showcase_dir(void) {
+    static const char *const components[] = { "mobile", "Library",
+                                              "Showcase" };
+    /* /var itself is a root-owned symlink to /private/var. */
+    int dirFd = open("/var", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    for (size_t i = 0;
+         dirFd >= 0 && i < sizeof(components) / sizeof(components[0]); i++) {
+        int next = openat(dirFd, components[i],
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        int openErrno = errno;
+        close(dirFd);
+        dirFd = next;
+        errno = openErrno;
+    }
+    if (dirFd < 0) return -1;
+    struct stat st;
+    if (fstat(dirFd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        (st.st_uid != MOBILE_UID && st.st_uid != 0)) {
+        close(dirFd);
+        errno = EPERM;
+        return -1;
+    }
+    return dirFd;
+}
+
+/* One-time move of the registry from the former mobile-owned location. The
+ * legacy file is imported at most once (on the first start of this version)
+ * and is removed only once it is safe to lose: a failure to create the root
+ * store keeps it so paired iPhones are not forgotten. */
+static void migrate_legacy_pairing_registry(void) {
+    if (!ensure_accessory_state_dir()) return;
+    struct stat st;
+    bool migrated = lstat(LEGACY_PAIRING_MIGRATED_PATH, &st) == 0;
+    int legacyDir = open_legacy_showcase_dir();
+    if (legacyDir < 0 && errno != ENOENT) {
+        /* A symlinked or foreign directory is never imported from or
+         * cleaned up; record the migration so nothing planted later is. */
+        printf("[PAIR] WARN: skipping the legacy controller registry: "
+               "unexpected /var/mobile/Library/Showcase (%s)\n",
+               strerror(errno));
+    }
+    bool legacyExists = legacyDir >= 0 &&
+        fstatat(legacyDir, LEGACY_PAIRING_STORE_NAME, &st,
+                AT_SYMLINK_NOFOLLOW) == 0;
+    if (!migrated) {
+        /* Only a regular file is ever opened for import; anything else (a
+         * FIFO, a device node) is just cleaned up below. */
+        if (legacyExists && S_ISREG(st.st_mode) &&
+            !import_legacy_pairing_registry(legacyDir)) {
+            close(legacyDir);
+            return;
+        }
+        static const char marker[] = "1\n";
+        if (!write_root_private_file(LEGACY_PAIRING_MIGRATED_PATH, marker,
+                                     sizeof(marker) - 1))
+            printf("[PAIR] WARN: could not record the registry migration\n");
+    } else if (legacyExists) {
+        printf("[PAIR] Ignoring a legacy controller registry written after "
+               "the one-time migration\n");
+    }
+    if (legacyExists) unlinkat(legacyDir, LEGACY_PAIRING_STORE_NAME, 0);
+    if (legacyDir >= 0) close(legacyDir);
+}
 
 static bool ensure_pair_context(void) {
     if (g_pair) return true;
     g_pair = pair_ctx_create(ed25519_sk, ed25519_pk, NULL);
     if (!g_pair) return false;
 
+    @autoreleasepool { migrate_legacy_pairing_registry(); }
+
     @autoreleasepool {
-        NSData *data = [NSData dataWithContentsOfFile:@PAIRING_STORE_PATH];
+        NSData *data = read_root_private_file(PAIRING_STORE_PATH,
+                                              1024 * 1024);
         if (!data) {
             printf("[PAIR] No saved controller registry yet\n");
             return true;
@@ -359,17 +686,13 @@ static void save_pairing_registry(void) {
                           format:NSPropertyListBinaryFormat_v1_0
                          options:0
                            error:&error];
-        mkdir("/var/mobile/Library", 0755);
-        mkdir(PAIRING_STORE_DIR, 0755);
-        if (!plist || ![plist writeToFile:@PAIRING_STORE_PATH
-                                  options:NSDataWritingAtomic
-                                    error:&error]) {
+        if (!plist || !ensure_accessory_state_dir() ||
+            !write_root_private_file(PAIRING_STORE_PATH, plist.bytes,
+                                     plist.length)) {
             printf("[PAIR] ERROR: Could not persist controller registry: %s\n",
-                   error.localizedDescription.UTF8String ?: "serialization failed");
+                   error.localizedDescription.UTF8String ?: "write failed");
             return;
         }
-        chmod(PAIRING_STORE_PATH, 0600);
-        chown(PAIRING_STORE_PATH, 501, 501);
         printf("[PAIR] Persisted %zu paired controller(s)\n", entries.count);
     }
 }
@@ -384,21 +707,49 @@ static int        g_baa_inter_len = 0;
 static bool       g_baa_ready = false;
 static SecKeyRef  g_baa_broker_key = NULL;
 
+/* g_baa_lock guards the certificate globals above in this process; once
+ * g_baa_ready is set they are never replaced. g_baa_load_lock serializes
+ * broker loads so concurrent auth-setup handlers (one detached thread per
+ * control connection) cannot both fetch and race on the globals. */
+static pthread_mutex_t g_baa_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_baa_load_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static void load_baa_from_broker(void) {
+    pthread_mutex_lock(&g_baa_load_lock);
+    pthread_mutex_lock(&g_baa_lock);
+    bool alreadyReady = g_baa_ready;
+    pthread_mutex_unlock(&g_baa_lock);
+    if (alreadyReady) {
+        pthread_mutex_unlock(&g_baa_load_lock);
+        return;
+    }
+
     printf("[BAA] Loading preheated certificate from Showcase...\n");
+    uint8_t *leaf = NULL;
+    uint8_t *intermediate = NULL;
+    int leafLength = 0;
+    int intermediateLength = 0;
     int rc = -1;
     for (int attempt = 0; attempt < 30 && rc != 0; attempt++) {
-        rc = baa_broker_get_certs(&g_baa_leaf_der, &g_baa_leaf_len,
-                                  &g_baa_inter_der, &g_baa_inter_len);
+        rc = baa_broker_get_certs(&leaf, &leafLength,
+                                  &intermediate, &intermediateLength);
         if (rc != 0) usleep(100000);
     }
     if (rc == 0) {
+        /* Publish only a complete pair; ready is set last. */
+        pthread_mutex_lock(&g_baa_lock);
+        g_baa_leaf_der = leaf;
+        g_baa_leaf_len = leafLength;
+        g_baa_inter_der = intermediate;
+        g_baa_inter_len = intermediateLength;
         g_baa_ready = true;
+        pthread_mutex_unlock(&g_baa_lock);
         printf("[BAA] Leaf=%d Inter=%d — preheated and ready\n",
-               g_baa_leaf_len, g_baa_inter_len);
+               leafLength, intermediateLength);
     } else {
         printf("[BAA] Could not retrieve preheated certificate (rc=%d)\n", rc);
     }
+    pthread_mutex_unlock(&g_baa_load_lock);
 }
 
 static bool issue_baa_for_broker(void) {
@@ -646,14 +997,97 @@ static bool control_is_encrypted(int sock) {
     pthread_mutex_unlock(&g_control_owner_lock);
     return active;
 }
-static bool control_claim(int sock) {
+/* An owner that has not completed pair-verify within this window can be
+ * displaced by another connection that starts pairing, so a LAN peer that
+ * opens a pairing request and then idles cannot lock the iPhone out. */
+#define CONTROL_UNVERIFIED_CLAIM_SECONDS 60
+#define CONTROL_NANOS_PER_SECOND 1000000000ULL
+/* Idle limits. A connection that has not started pairing only needs to
+ * answer discovery probes; the verified pairing owner gets the long limit so
+ * the iPhone can send SETUP Phase 2 well after RECORD. */
+#define CONTROL_IDLE_SECONDS_UNCLAIMED 30
+#define CONTROL_IDLE_SECONDS_OWNER     600
+/* Until pair-verify succeeds the owner only gets the takeover window: an
+ * owner silent for that long has stalled and must not hold the session for
+ * the full owner limit. */
+#define CONTROL_IDLE_SECONDS_UNVERIFIED_OWNER CONTROL_UNVERIFIED_CLAIM_SECONDS
+static uint64_t g_control_claim_nanos = 0;
+static uint64_t control_monotonic_nanos(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * CONTROL_NANOS_PER_SECOND +
+           (uint64_t)now.tv_nsec;
+}
+/* Caller holds g_control_owner_lock. Drops an owner that has not completed
+ * pair-verify within CONTROL_UNVERIFIED_CLAIM_SECONDS. The displaced handler
+ * sees EOF, closes its own descriptor and, because it no longer owns the
+ * session, does not end it. Returns true when an owner was dropped. */
+static bool control_expire_unverified_owner_locked(uint64_t now) {
+    if (g_control_owner < 0 || g_enc.active ||
+        now - g_control_claim_nanos <
+            (uint64_t)CONTROL_UNVERIFIED_CLAIM_SECONDS *
+                CONTROL_NANOS_PER_SECOND)
+        return false;
+    shutdown(g_control_owner, SHUT_RDWR);
+    g_control_owner = -1;
+    return true;
+}
+static bool control_has_owner(void) {
     pthread_mutex_lock(&g_control_owner_lock);
-    if (g_control_owner < 0) g_control_owner = sock;
+    bool owned = g_control_owner >= 0;
+    pthread_mutex_unlock(&g_control_owner_lock);
+    return owned;
+}
+/* Like control_has_owner, but an owner stuck before pair-verify past the
+ * takeover window is dropped instead of counted, so the ctrl-int retry is
+ * not blocked by a peer that never finishes pairing. */
+static bool control_has_live_owner(void) {
+    pthread_mutex_lock(&g_control_owner_lock);
+    int stale = g_control_owner;
+    bool expired =
+        control_expire_unverified_owner_locked(control_monotonic_nanos());
+    bool owned = g_control_owner >= 0;
+    pthread_mutex_unlock(&g_control_owner_lock);
+    if (expired)
+        printf("[AP] Unverified control owner fd=%d timed out; "
+               "releasing it for a new ctrl-int connect\n", stale);
+    return owned;
+}
+static bool control_is_owner(int sock) {
+    pthread_mutex_lock(&g_control_owner_lock);
+    bool owned = g_control_owner == sock;
+    pthread_mutex_unlock(&g_control_owner_lock);
+    return owned;
+}
+static bool control_has_encrypted_session(void) {
+    pthread_mutex_lock(&g_control_owner_lock);
+    bool active = g_control_owner >= 0 && g_enc.active;
+    pthread_mutex_unlock(&g_control_owner_lock);
+    return active;
+}
+/* Returns true when sock owns the pairing/session state. *newlyClaimed is set
+ * when this call is the one that granted ownership. */
+static bool control_claim(int sock, bool *newlyClaimed) {
+    if (newlyClaimed) *newlyClaimed = false;
+    pthread_mutex_lock(&g_control_owner_lock);
+    uint64_t now = control_monotonic_nanos();
+    int previous = g_control_owner;
+    if (previous != sock && control_expire_unverified_owner_locked(now)) {
+        printf("[AP] Unverified control owner fd=%d timed out; "
+               "handing pairing to fd=%d\n", previous, sock);
+    }
+    if (g_control_owner < 0) {
+        g_control_owner = sock;
+        g_control_claim_nanos = now;
+        if (newlyClaimed) *newlyClaimed = true;
+    }
     bool owned = g_control_owner == sock;
     pthread_mutex_unlock(&g_control_owner_lock);
     return owned;
 }
 static dispatch_semaphore_t g_event_send_lock = NULL;
+/* Send deadline of the event connection (SO_SNDTIMEO). */
+#define EVENT_SEND_TIMEOUT_SEC 3
 static bool process_event_command_frame(const uint8_t *bytes, size_t length);
 
 /* Decrypt one encrypted frame from the socket.
@@ -761,7 +1195,17 @@ static int enc_send_frame(int sock, encrypted_ctx_t *enc, const uint8_t *data, s
     size_t sent = 0;
     while (sent < totalLen) {
         ssize_t n = send(sock, out + sent, totalLen - sent, 0);
-        if (n <= 0) { free(out); return -1; }
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            /* A partly written record (for example after a send timeout)
+             * cannot be resumed; end the connection so the peer reconnects
+             * instead of failing on every following record. */
+            int sendErrno = errno;
+            if (sent > 0) shutdown(sock, SHUT_RDWR);
+            free(out);
+            errno = sendErrno;
+            return -1;
+        }
         sent += n;
     }
     free(out);
@@ -782,8 +1226,15 @@ static int enc_send_stream(int sock, encrypted_ctx_t *enc,
         size_t chunk = dataLen - offset;
         if (chunk > ENCRYPTED_MAX_WRITE_SIZE)
             chunk = ENCRYPTED_MAX_WRITE_SIZE;
-        if (enc_send_frame(sock, enc, data + offset, chunk) < 0)
+        if (enc_send_frame(sock, enc, data + offset, chunk) < 0) {
+            /* Earlier records already carried part of this message; the
+             * peer would splice the next message onto the truncated one.
+             * Like a partly written record, the stream cannot be resumed. */
+            int sendErrno = errno;
+            if (offset > 0) shutdown(sock, SHUT_RDWR);
+            errno = sendErrno;
             return -1;
+        }
         offset += chunk;
     }
     return 0;
@@ -921,19 +1372,73 @@ static bool parse_http(const uint8_t *buf, size_t len, HTTPReq *r) {
     return true;
 }
 
+/* Header limit for a plaintext control connection that does not own the
+ * session. Discovery and pairing requests carry a few hundred header bytes. */
+#define HTTP_PREAUTH_HEADER_LIMIT 8192
+
+/* Per-connection progress through the request at the front of a buffer. A
+ * peer that sends a request a byte at a time would otherwise make every read
+ * rescan the whole buffer (quadratic CPU). Reset to {0} whenever bytes are
+ * removed from the front of the buffer. */
+typedef struct {
+    size_t scanned; /* leading bytes searched without finding CRLFCRLF */
+    size_t total;   /* header plus body length, once the header is parsed */
+} http_progress_t;
+
+/* parse_http for a buffer that only grows between calls (apart from resets
+ * of *progress). headerLimit bounds the header, terminator included. */
+static bool parse_http_incremental(const uint8_t *buf, size_t len,
+                                   size_t headerLimit,
+                                   http_progress_t *progress, HTTPReq *r) {
+    if (progress->total == 0) {
+        /* Restart three bytes back so a terminator split across reads is
+         * found. The clamp covers a recv that consumed fewer bytes than a
+         * preceding MSG_PEEK scanned. */
+        size_t scanned = progress->scanned < len ? progress->scanned : len;
+        size_t from = scanned > 3 ? scanned - 3 : 0;
+        const char *s = (const char *)buf;
+        const char *mark = http_find(s + from, s + len, "\r\n\r\n", 4);
+        if (!mark) {
+            memset(r, 0, sizeof(*r));
+            progress->scanned = len;
+            r->invalid = len >= HTTP_STREAM_LIMIT || len >= headerLimit;
+            return false;
+        }
+        if ((size_t)(mark - s) + 4 > headerLimit) {
+            memset(r, 0, sizeof(*r));
+            r->invalid = true;
+            return false;
+        }
+    } else if (len < progress->total) {
+        /* Header already validated; the body is still arriving. */
+        memset(r, 0, sizeof(*r));
+        return false;
+    }
+    bool complete = parse_http(buf, len, r);
+    if (!complete && !r->invalid && r->body)
+        progress->total = (size_t)(r->body - buf) + r->contentLength;
+    return complete;
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * HTTP Response Helper
  * ═══════════════════════════════════════════════════════════════ */
 
-static void send_response(int sock, const char *proto, int status,
-                          const char *statusText, const char *contentType,
-                          const uint8_t *body, size_t bodyLen, int cseq) {
+/* extraHeaders, when non-NULL, is inserted verbatim and must end in CRLF. */
+static void send_response_with_headers(int sock, const char *proto, int status,
+                                       const char *statusText,
+                                       const char *contentType,
+                                       const char *extraHeaders,
+                                       const uint8_t *body, size_t bodyLen,
+                                       int cseq) {
     @autoreleasepool {
         NSMutableString *hdr = [NSMutableString string];
         [hdr appendFormat:@"%s %d %s\r\n", proto, status, statusText];
         [hdr appendFormat:@"Server: AirTunes/%s\r\n", SOURCE_VERSION];
         if (cseq > 0)
             [hdr appendFormat:@"CSeq: %d\r\n", cseq];
+        if (extraHeaders)
+            [hdr appendFormat:@"%s", extraHeaders];
         if (contentType)
             [hdr appendFormat:@"Content-Type: %s\r\n", contentType];
         [hdr appendFormat:@"Content-Length: %zu\r\n", bodyLen];
@@ -970,6 +1475,22 @@ static void send_response(int sock, const char *proto, int status,
     }
 }
 
+static void send_response(int sock, const char *proto, int status,
+                          const char *statusText, const char *contentType,
+                          const uint8_t *body, size_t bodyLen, int cseq) {
+    send_response_with_headers(sock, proto, status, statusText, contentType,
+                               NULL, body, bodyLen, cseq);
+}
+
+/* Typed accessors for plist values received from the network. A value of the
+ * wrong class would otherwise raise an unrecognized-selector exception. */
+static NSNumber *plist_number(id value) {
+    return [value isKindOfClass:[NSNumber class]] ? (NSNumber *)value : nil;
+}
+static NSString *plist_string(id value) {
+    return [value isKindOfClass:[NSString class]] ? (NSString *)value : nil;
+}
+
 static void send_ok(int sock, const HTTPReq *r) {
     bool rtsp = (strncmp(r->protocol, "RTSP", 4) == 0);
     send_response(sock, rtsp ? "RTSP/1.0" : "HTTP/1.1",
@@ -980,6 +1501,10 @@ static void send_ok(int sock, const HTTPReq *r) {
  * TLV8 Parser (for HomeKit pair-setup/verify)
  * ═══════════════════════════════════════════════════════════════ */
 
+/* Pair bodies arrive before authentication; a body of empty items must not
+ * turn into megabytes of log lines. */
+#define TLV8_DUMP_MAX_ITEMS 32
+
 static void dump_tlv8(const uint8_t *data, size_t len) {
     const char *typeNames[] = {
         "Method", "Identifier", "Salt", "PublicKey", "Proof",
@@ -987,10 +1512,15 @@ static void dump_tlv8(const uint8_t *data, size_t len) {
         "Certificate", "Signature", "Permissions", "FragmentData", "FragmentLast"
     };
     size_t i = 0;
+    unsigned items = 0;
     while (i + 2 <= len) {
         uint8_t type = data[i];
         uint8_t tlen = data[i + 1];
         if (i + 2 + tlen > len) break;
+        if (items++ == TLV8_DUMP_MAX_ITEMS) {
+            printf("    ... (%zu more bytes not shown)\n", len - i);
+            break;
+        }
         const char *name = (type < 14) ? typeNames[type] : "Unknown";
         printf("    TLV type=%d(%s) len=%d", type, name, tlen);
         if (tlen <= 16) {
@@ -1006,21 +1536,23 @@ static void dump_tlv8(const uint8_t *data, size_t len) {
  * Endpoint: GET /info
  * ═══════════════════════════════════════════════════════════════ */
 
-static NSData *hex_to_data(const char *hex) {
-    size_t len = strlen(hex) / 2;
-    NSMutableData *d = [NSMutableData dataWithLength:len];
-    uint8_t *bytes = d.mutableBytes;
-    for (size_t i = 0; i < len; i++) {
-        unsigned int val;
-        sscanf(hex + i * 2, "%2x", &val);
-        bytes[i] = (uint8_t)val;
-    }
-    return d;
-}
+/* Set by handle_client (one thread per connection) for repeated
+ * unauthenticated GET /info on the same connection, so a LAN peer cannot grow
+ * the daemon log without bound by polling /info.
+ *
+ * Also set for every unauthenticated request once the pre-auth log budget is
+ * spent. It is exported (not static) as showcase_preauth_quiet so the pairing
+ * module (carplay_pair.c, which logs through showcase_service_log_printf) can
+ * silence its per-M1 diagnostics under the same budget. */
+extern __thread bool showcase_preauth_quiet;
+__thread bool showcase_preauth_quiet = false;
+#define t_quiet_request_log showcase_preauth_quiet
 
 static void handle_info(int sock, const HTTPReq *r) {
     @autoreleasepool {
-        printf("[AP] -> GET /info (CSeq=%d, proto=%s)\n", r->cseq, r->protocol);
+        if (!t_quiet_request_log)
+            printf("[AP] -> GET /info (CSeq=%d, proto=%s)\n",
+                   r->cseq, r->protocol);
 
         bool rtsp = (strncmp(r->protocol, "RTSP", 4) == 0);
         const char *proto = rtsp ? "RTSP/1.0" : "HTTP/1.1";
@@ -1032,7 +1564,7 @@ static void handle_info(int sock, const HTTPReq *r) {
         info[@"macAddress"] = @DEVICE_ID;
         info[@"features"] = @(features);
         info[@"model"] = @MODEL_NAME;
-        info[@"name"] = [NSString stringWithUTF8String:g_instance_name];
+        info[@"name"] = instance_name_string();
         info[@"manufacturer"] = @"iPadPlay";
         info[@"sourceVersion"] = @SOURCE_VERSION;
         info[@"protocolVersion"] = @"1.1";
@@ -1040,27 +1572,29 @@ static void handle_info(int sock, const HTTPReq *r) {
         /* statusFlags: bit 2 (0x4) = AudioLink (always set in reference).
          * Zero flags may signal "not ready" to iPhone. */
         info[@"statusFlags"] = @(0x4);
-        NSString *bluetoothID = [NSString stringWithContentsOfFile:@BT_ID_PATH
-                                                          encoding:NSUTF8StringEncoding
-                                                             error:NULL];
-        if (bluetoothID.length == 0)
-            bluetoothID = [NSString stringWithContentsOfFile:@BT_ID_PERSIST_PATH
-                                                    encoding:NSUTF8StringEncoding
-                                                       error:NULL];
-        bluetoothID = [bluetoothID stringByTrimmingCharactersInSet:
-            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSString *bluetoothID = read_bt_id_at(AT_FDCWD, BT_ID_PATH);
+        if (!bluetoothID) {
+            /* BT_ID_PERSIST_PATH, walked without following a mobile-owned
+             * symlinked directory. */
+            int showcaseDir = open_legacy_showcase_dir();
+            if (showcaseDir >= 0) {
+                bluetoothID = read_bt_id_at(showcaseDir, "bt-id");
+                close(showcaseDir);
+            }
+        }
         if (bluetoothID.length == 17) {
             info[@"bluetoothIDs"] = @[bluetoothID];
-            printf("[AP] Bluetooth transport identity: %s\n",
-                   bluetoothID.UTF8String);
-        } else {
+            if (!t_quiet_request_log)
+                printf("[AP] Bluetooth transport identity: %s\n",
+                       bluetoothID.UTF8String);
+        } else if (!t_quiet_request_log) {
             printf("[AP] WARN: Bluetooth transport identity unavailable\n");
         }
 
         info[@"keepAliveLowPower"] = @YES;
         info[@"keepAliveSendStatsAsBody"] = @YES;
-        info[@"pi"] = @HK_PI;
-        info[@"pk"] = hex_to_data(HK_PK);
+        info[@"pi"] = @(g_hk_pi);
+        info[@"pk"] = [NSData dataWithBytes:ed25519_pk length:sizeof(ed25519_pk)];
 
         info[@"firmwareRevision"] = @"1.0.0";
         info[@"hardwareRevision"] = @"1.0";
@@ -1078,9 +1612,10 @@ static void handle_info(int sock, const HTTPReq *r) {
          */
         if (g_receiver_audio)
             info[@"mainBufferedInfo"] = @{};
-        printf("[AUDIO] output route: %s\n",
-               g_receiver_audio ? "receiver (MainAudio advertised)"
-                                : "sender (MainAudio left on the iPhone)");
+        if (!t_quiet_request_log)
+            printf("[AUDIO] output route: %s\n",
+                   g_receiver_audio ? "receiver (MainAudio advertised)"
+                                    : "sender (MainAudio left on the iPhone)");
         /*
          * ElectronicTollCollection is an installed-capability declaration,
          * not a generic inactive vehicle state. Advertising it with
@@ -1104,17 +1639,17 @@ static void handle_info(int sock, const HTTPReq *r) {
             if (path.length == 0) continue;
             oemIcon = [NSData dataWithContentsOfFile:path];
             if (oemIcon.length > 0) {
-                printf("[AP] OEM vehicle icon: %s (%lu bytes)\n",
-                       path.UTF8String, (unsigned long)oemIcon.length);
+                if (!t_quiet_request_log)
+                    printf("[AP] OEM vehicle icon: %s (%lu bytes)\n",
+                           path.UTF8String, (unsigned long)oemIcon.length);
                 break;
             }
         }
         if (oemIcon.length > 0) {
             info[@"oemIcon"] = oemIcon;
-            info[@"oemIconLabel"] =
-                [NSString stringWithUTF8String:g_instance_name];
+            info[@"oemIconLabel"] = instance_name_string();
             info[@"oemIconVisible"] = @YES;
-        } else {
+        } else if (!t_quiet_request_log) {
             printf("[AP] WARN: OEM vehicle icon unavailable\n");
         }
         NSArray<NSString *> *oemRenderedIconPaths = @[
@@ -1128,9 +1663,10 @@ static void handle_info(int sock, const HTTPReq *r) {
             if (path.length == 0) continue;
             oemRenderedIcon = [NSData dataWithContentsOfFile:path];
             if (oemRenderedIcon.length > 0) {
-                printf("[AP] OEM pre-rendered icon: %s (%lu bytes)\n",
-                       path.UTF8String,
-                       (unsigned long)oemRenderedIcon.length);
+                if (!t_quiet_request_log)
+                    printf("[AP] OEM pre-rendered icon: %s (%lu bytes)\n",
+                           path.UTF8String,
+                           (unsigned long)oemRenderedIcon.length);
                 break;
             }
         }
@@ -1143,7 +1679,7 @@ static void handle_info(int sock, const HTTPReq *r) {
                     @"imageData": oemRenderedIcon
                 }
             ];
-        } else {
+        } else if (!t_quiet_request_log) {
             printf("[AP] WARN: OEM pre-rendered icon unavailable\n");
         }
         info[@"limitedUI"] = @NO;
@@ -1381,10 +1917,15 @@ static void handle_info(int sock, const HTTPReq *r) {
             return;
         }
 
-        /* Dump full /info plist for debugging */
-        printf("[AP] <- /info response: %zu bytes binary plist\n",
-               (size_t)plist.length);
-        printf("[AP] /info dict: %s\n", [[info description] UTF8String]);
+        /* Log only key names: values include icon NSData that would be
+         * hex-dumped (~80 KB per request). */
+        if (!t_quiet_request_log) {
+            NSArray *keys = [info.allKeys
+                sortedArrayUsingSelector:@selector(compare:)];
+            printf("[AP] <- /info response: %zu bytes binary plist, keys: %s\n",
+                   (size_t)plist.length,
+                   [[keys componentsJoinedByString:@","] UTF8String]);
+        }
         send_response(sock, proto, 200, "OK",
                      "application/x-apple-binary-plist",
                      plist.bytes, plist.length, r->cseq);
@@ -1396,12 +1937,15 @@ static void handle_info(int sock, const HTTPReq *r) {
  * ═══════════════════════════════════════════════════════════════ */
 
 static void handle_pair_setup(int sock, const HTTPReq *r) {
-    printf("[AP] -> POST /pair-setup (HKP=%s, bodyLen=%zu)\n",
-           r->xAppleHKP[0] ? r->xAppleHKP : "none", r->bodyLen);
-
-    if (r->body && r->bodyLen > 0) {
-        printf("[AP] pair-setup TLV8 payload:\n");
-        dump_tlv8(r->body, r->bodyLen);
+    /* Reachable before pair-verify: nothing once the pre-auth log budget is
+     * spent (t_quiet_request_log). */
+    if (!t_quiet_request_log) {
+        printf("[AP] -> POST /pair-setup (HKP=%s, bodyLen=%zu)\n",
+               r->xAppleHKP[0] ? r->xAppleHKP : "none", r->bodyLen);
+        if (r->body && r->bodyLen > 0) {
+            printf("[AP] pair-setup TLV8 payload:\n");
+            dump_tlv8(r->body, r->bodyLen);
+        }
     }
 
     /* Determine protocol (RTSP or HTTP) */
@@ -1409,46 +1953,67 @@ static void handle_pair_setup(int sock, const HTTPReq *r) {
     const char *proto = rtsp ? "RTSP/1.0" : "HTTP/1.1";
 
     if (!r->body || r->bodyLen == 0) {
-        printf("[AP] pair-setup: no body, sending empty 200\n");
+        if (!t_quiet_request_log)
+            printf("[AP] pair-setup: no body, sending empty 200\n");
         send_response(sock, proto, 200, "OK",
                      "application/octet-stream", NULL, 0, r->cseq);
         return;
     }
 
-    /* The SRP state machine resets internally on each M1. */
-    if (!ensure_pair_context()) {
+    /* The SRP state machine resets internally on each M1. It is shared by
+     * every connection, so it runs under g_pair_lock and only for the
+     * connection that still owns the control session: an owner displaced by
+     * control_claim may still be inside this handler. */
+    size_t resp_len = 0;
+    uint8_t *resp_data = NULL;
+    bool setupComplete = false;
+    app_send_status(STATUS_PAIR_SETUP_STARTED);
+    pthread_mutex_lock(&g_pair_lock);
+    bool ready = ensure_pair_context();
+    bool owner = ready && control_is_owner(sock);
+    if (owner) {
+        resp_data = pair_setup_handle(g_pair, r->body, r->bodyLen, &resp_len);
+        setupComplete = pair_setup_is_complete(g_pair);
+        if (setupComplete) save_pairing_registry();
+    }
+    pthread_mutex_unlock(&g_pair_lock);
+
+    if (!ready) {
         printf("[AP] ERROR: Failed to create pair context\n");
         send_response(sock, proto, 500, "Internal Error",
                      NULL, NULL, 0, r->cseq);
         return;
     }
-
-    app_send_status(STATUS_PAIR_SETUP_STARTED);
-
-    /* Handle the pair-setup request through our SRP state machine */
-    size_t resp_len = 0;
-    uint8_t *resp_data = pair_setup_handle(g_pair, r->body, r->bodyLen, &resp_len);
+    if (!owner) {
+        if (!t_quiet_request_log)
+            printf("[AP] pair-setup on a displaced connection; ignoring\n");
+        send_response(sock, proto, 503, "Service Unavailable",
+                     NULL, NULL, 0, r->cseq);
+        return;
+    }
 
     if (resp_data && resp_len > 0) {
-        printf("[AP] pair-setup response: %zu bytes TLV8\n", resp_len);
-        printf("[AP] pair-setup response hex:");
-        size_t dumpLen = resp_len > 128 ? 128 : resp_len;
-        for (size_t i = 0; i < dumpLen; i++) printf(" %02X", resp_data[i]);
-        if (resp_len > 128) printf(" ...");
-        printf("\n");
+        if (!t_quiet_request_log) {
+            printf("[AP] pair-setup response: %zu bytes TLV8\n", resp_len);
+            printf("[AP] pair-setup response hex:");
+            size_t dumpLen = resp_len > 128 ? 128 : resp_len;
+            for (size_t i = 0; i < dumpLen; i++) printf(" %02X", resp_data[i]);
+            if (resp_len > 128) printf(" ...");
+            printf("\n");
+        }
 
         send_response(sock, proto, 200, "OK",
                      "application/octet-stream",
                      resp_data, resp_len, r->cseq);
         free(resp_data);
     } else {
-        printf("[AP] pair-setup: handler returned no data, sending empty 200\n");
+        if (!t_quiet_request_log)
+            printf("[AP] pair-setup: handler returned no data, sending empty 200\n");
         send_response(sock, proto, 200, "OK",
                      "application/octet-stream", NULL, 0, r->cseq);
     }
 
-    if (pair_setup_is_complete(g_pair)) {
-        save_pairing_registry();
+    if (setupComplete) {
         printf("\n[AP] ╔══════════════════════════════════════╗\n");
         printf("[AP] ║  PAIR-SETUP COMPLETE — SUCCESS!      ║\n");
         printf("[AP] ║  Waiting for pair-verify...           ║\n");
@@ -1462,14 +2027,15 @@ static void handle_pair_setup(int sock, const HTTPReq *r) {
  * ═══════════════════════════════════════════════════════════════ */
 
 static void handle_pair_verify(int sock, const HTTPReq *r) {
-    printf("[AP] -> POST /pair-verify (HKP=%s, PD=%s, bodyLen=%zu)\n",
-           r->xAppleHKP[0] ? r->xAppleHKP : "none",
-           r->xApplePD[0] ? r->xApplePD : "none",
-           r->bodyLen);
-
-    if (r->body && r->bodyLen > 0) {
-        printf("[AP] pair-verify TLV8 payload:\n");
-        dump_tlv8(r->body, r->bodyLen);
+    if (!t_quiet_request_log) {
+        printf("[AP] -> POST /pair-verify (HKP=%s, PD=%s, bodyLen=%zu)\n",
+               r->xAppleHKP[0] ? r->xAppleHKP : "none",
+               r->xApplePD[0] ? r->xApplePD : "none",
+               r->bodyLen);
+        if (r->body && r->bodyLen > 0) {
+            printf("[AP] pair-verify TLV8 payload:\n");
+            dump_tlv8(r->body, r->bodyLen);
+        }
     }
 
     bool rtsp = (strncmp(r->protocol, "RTSP", 4) == 0);
@@ -1481,22 +2047,59 @@ static void handle_pair_verify(int sock, const HTTPReq *r) {
         return;
     }
 
-    if (!ensure_pair_context()) {
+    /* Same serialization as pair-setup. Session keys are derived into local
+     * buffers here and published to g_enc/g_event_enc only below, after the
+     * plaintext reply, and only while this connection still owns the
+     * session. */
+    size_t resp_len = 0;
+    uint8_t *resp_data = NULL;
+    bool verifyComplete = false;
+    bool haveControlKeys = false;
+    bool haveEventKeys = false;
+    encrypted_ctx_t controlKeys = {0};
+    encrypted_ctx_t eventKeys = {0};
+    pthread_mutex_lock(&g_pair_lock);
+    bool ready = ensure_pair_context();
+    bool owner = ready && control_is_owner(sock);
+    if (owner) {
+        resp_data = pair_verify_handle(g_pair, r->body, r->bodyLen, &resp_len);
+        verifyComplete = pair_verify_is_complete(g_pair);
+        if (verifyComplete) {
+            haveControlKeys = pair_derive_control_keys(
+                g_pair, controlKeys.readKey, controlKeys.writeKey) == 0;
+            haveEventKeys = pair_derive_event_keys(
+                g_pair, eventKeys.readKey, eventKeys.writeKey) == 0;
+            /* handle_verify_m3 moved this controller to the most recently
+             * used end of the registry; persist that order so LRU eviction
+             * survives a daemon restart. pair_verify_handle clears the done
+             * state on every call, so this runs once per successful verify. */
+            save_pairing_registry();
+        }
+    }
+    pthread_mutex_unlock(&g_pair_lock);
+
+    if (!ready) {
         send_response(sock, proto, 500, "Internal Error",
                      NULL, NULL, 0, r->cseq);
         return;
     }
-
-    size_t resp_len = 0;
-    uint8_t *resp_data = pair_verify_handle(g_pair, r->body, r->bodyLen, &resp_len);
+    if (!owner) {
+        if (!t_quiet_request_log)
+            printf("[AP] pair-verify on a displaced connection; ignoring\n");
+        send_response(sock, proto, 503, "Service Unavailable",
+                     NULL, NULL, 0, r->cseq);
+        return;
+    }
 
     if (resp_data && resp_len > 0) {
-        printf("[AP] pair-verify response: %zu bytes TLV8\n", resp_len);
-        printf("[AP] pair-verify response hex:");
-        size_t dumpLen = resp_len > 128 ? 128 : resp_len;
-        for (size_t i = 0; i < dumpLen; i++) printf(" %02X", resp_data[i]);
-        if (resp_len > 128) printf(" ...");
-        printf("\n");
+        if (!t_quiet_request_log) {
+            printf("[AP] pair-verify response: %zu bytes TLV8\n", resp_len);
+            printf("[AP] pair-verify response hex:");
+            size_t dumpLen = resp_len > 128 ? 128 : resp_len;
+            for (size_t i = 0; i < dumpLen; i++) printf(" %02X", resp_data[i]);
+            if (resp_len > 128) printf(" ...");
+            printf("\n");
+        }
 
         send_response(sock, proto, 200, "OK",
                      "application/octet-stream",
@@ -1507,27 +2110,53 @@ static void handle_pair_verify(int sock, const HTTPReq *r) {
                      "application/octet-stream", NULL, 0, r->cseq);
     }
 
-    if (pair_verify_is_complete(g_pair)) {
-        /* Derive control channel encryption keys */
-        if (pair_derive_control_keys(g_pair, g_enc.readKey, g_enc.writeKey) == 0) {
+    if (verifyComplete) {
+        /* Install the control channel keys. A connection displaced by
+         * control_claim must not touch the new owner's cipher state, so the
+         * keys, nonces and active flag change only under the owner lock and
+         * only while this connection still owns the session.
+         *
+         * Event channel keys are pre-derived so they're ready when iPhone
+         * connects to event port (before RECORD). Reference derives these in
+         * _ControlStart during RECORD, but our event thread accepts
+         * connections earlier. */
+        pthread_mutex_lock(&g_control_owner_lock);
+        bool stillOwner = g_control_owner == sock;
+        if (stillOwner && haveControlKeys) {
+            memcpy(g_enc.readKey, controlKeys.readKey, sizeof(g_enc.readKey));
+            memcpy(g_enc.writeKey, controlKeys.writeKey, sizeof(g_enc.writeKey));
             g_enc.readNonce = 0;
             g_enc.writeNonce = 0;
-            pthread_mutex_lock(&g_control_owner_lock);
             g_enc.active = true;
-            pthread_mutex_unlock(&g_control_owner_lock);
-            printf("[AP] *** Encrypted transport layer ACTIVE ***\n");
         }
-
-        /* Pre-derive event channel encryption keys so they're ready
-         * when iPhone connects to event port (before RECORD).
-         * Reference derives these in _ControlStart during RECORD,
-         * but our event thread accepts connections earlier. */
-        if (pair_derive_event_keys(g_pair, g_event_enc.readKey, g_event_enc.writeKey) == 0) {
+        if (stillOwner && haveEventKeys) {
+            memcpy(g_event_enc.readKey, eventKeys.readKey,
+                   sizeof(g_event_enc.readKey));
+            memcpy(g_event_enc.writeKey, eventKeys.writeKey,
+                   sizeof(g_event_enc.writeKey));
             g_event_enc.readNonce = 0;
             g_event_enc.writeNonce = 0;
             g_event_enc.active = true;
-            printf("[AP] *** Event channel encryption keys PRE-DERIVED ***\n");
         }
+        pthread_mutex_unlock(&g_control_owner_lock);
+        crypto_wipe(&controlKeys, sizeof(controlKeys));
+        crypto_wipe(&eventKeys, sizeof(eventKeys));
+        if (!stillOwner) {
+            printf("[AP] pair-verify finished on a displaced connection; "
+                   "ignoring\n");
+            return;
+        }
+        if (haveControlKeys) {
+            /* Verified: the owner may now idle for the long limit so the
+             * iPhone can send SETUP Phase 2 well after RECORD. */
+            struct timeval ownerTv = {
+                .tv_sec = CONTROL_IDLE_SECONDS_OWNER, .tv_usec = 0 };
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+                       &ownerTv, sizeof(ownerTv));
+            printf("[AP] *** Encrypted transport layer ACTIVE ***\n");
+        }
+        if (haveEventKeys)
+            printf("[AP] *** Event channel encryption keys PRE-DERIVED ***\n");
 
         printf("\n[AP] ╔══════════════════════════════════════╗\n");
         printf("[AP] ║  PAIR-VERIFY COMPLETE — SUCCESS!     ║\n");
@@ -1542,14 +2171,17 @@ static void handle_pair_verify(int sock, const HTTPReq *r) {
  * ═══════════════════════════════════════════════════════════════ */
 
 static void handle_fp_setup(int sock, const HTTPReq *r) {
-    printf("[AP] -> POST /fp-setup (bodyLen=%zu)\n", r->bodyLen);
-
-    if (r->body && r->bodyLen > 0) {
-        printf("[AP] fp-setup hex dump (%zu):", r->bodyLen);
-        size_t dumpLen = r->bodyLen > 256 ? 256 : r->bodyLen;
-        for (size_t i = 0; i < dumpLen; i++) printf(" %02X", r->body[i]);
-        if (r->bodyLen > 256) printf(" ...");
-        printf("\n");
+    /* fp-setup is reachable before pair-verify: log only the header bytes
+     * (version/mode), and nothing once the pre-auth log budget is spent. */
+    if (!t_quiet_request_log) {
+        printf("[AP] -> POST /fp-setup (bodyLen=%zu)\n", r->bodyLen);
+        if (r->body && r->bodyLen > 0) {
+            size_t dumpLen = r->bodyLen > 16 ? 16 : r->bodyLen;
+            printf("[AP] fp-setup head (%zu):", r->bodyLen);
+            for (size_t i = 0; i < dumpLen; i++) printf(" %02X", r->body[i]);
+            if (r->bodyLen > dumpLen) printf(" ...");
+            printf("\n");
+        }
     }
 
     send_response(sock, "HTTP/1.1", 200, "OK",
@@ -1557,18 +2189,195 @@ static void handle_fp_setup(int sock, const HTTPReq *r) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * Network plist parsing with a bounded container depth
+ *
+ * CoreFoundation's plist parsers recurse once per nested container, and
+ * every network plist is parsed on a 512 KB control-client thread (or a
+ * GCD worker), so a ~1 KB plist nested a few hundred levels deep overflows
+ * the stack and kills the root daemon. Senders only ever use binary
+ * plists, so anything else is refused, and the bplist object graph is
+ * walked here without recursion before CoreFoundation sees it.
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* Expected request plists are a handful of levels deep (SETUP streams,
+ * command dictionaries); auth-setup arrives before pair-verify and is a
+ * single flat dictionary. */
+#define NETWORK_PLIST_MAX_DEPTH 16
+#define AUTH_SETUP_PLIST_MAX_DEPTH 4
+
+#define BPLIST_HEADER_BYTES 8
+#define BPLIST_TRAILER_BYTES 32
+#define BPLIST_STATE_IN_PROGRESS 0xFF
+
+static uint64_t bplist_read_be(const uint8_t *p, size_t width) {
+    uint64_t value = 0;
+    for (size_t i = 0; i < width; i++) value = (value << 8) | p[i];
+    return value;
+}
+
+typedef struct {
+    const uint8_t *data;
+    uint64_t objectCount;
+    uint64_t offsetTable;   /* objects live in [8, offsetTable) */
+    size_t offsetSize;
+    size_t refSize;
+} BPlist;
+
+/* Locates the object reference list of a container object; a non-container
+ * object reports zero references. Returns false on malformed input. */
+static bool bplist_object_refs(const BPlist *b, uint64_t index,
+                               bool *isContainer, uint64_t *refPos,
+                               uint64_t *refCount) {
+    uint64_t off = bplist_read_be(b->data + b->offsetTable +
+                                  index * b->offsetSize, b->offsetSize);
+    if (off < BPLIST_HEADER_BYTES || off >= b->offsetTable) return false;
+    uint8_t marker = b->data[off];
+    uint8_t type = marker >> 4;
+    *isContainer = type == 0xA || type == 0xB || type == 0xC || type == 0xD;
+    *refPos = 0;
+    *refCount = 0;
+    if (!*isContainer) return true;
+
+    uint64_t count = marker & 0x0F;
+    uint64_t pos = off + 1;
+    if (count == 0x0F) {
+        if (pos >= b->offsetTable) return false;
+        uint8_t intMarker = b->data[pos];
+        if ((intMarker >> 4) != 0x1 || (intMarker & 0x0F) > 3) return false;
+        size_t width = (size_t)1 << (intMarker & 0x0F);
+        if (b->offsetTable - (pos + 1) < width) return false;
+        count = bplist_read_be(b->data + pos + 1, width);
+        pos += 1 + width;
+    }
+    uint64_t refs = type == 0xD ? count * 2 : count;
+    if (count > b->offsetTable || refs > (b->offsetTable - pos) / b->refSize)
+        return false;
+    *refPos = pos;
+    *refCount = refs;
+    return true;
+}
+
+/* True when body is a well-formed bplist00 whose container nesting does not
+ * exceed maxDepth and whose object graph has no cycles. Iterative, O(objects
+ * + references), with at most maxDepth explicit frames. */
+static bool bplist_depth_ok(const uint8_t *data, size_t length,
+                            unsigned maxDepth) {
+    if (!data || maxDepth == 0 || maxDepth >= BPLIST_STATE_IN_PROGRESS - 1 ||
+        length < BPLIST_HEADER_BYTES + BPLIST_TRAILER_BYTES ||
+        memcmp(data, "bplist00", BPLIST_HEADER_BYTES) != 0)
+        return false;
+
+    const uint8_t *trailer = data + length - BPLIST_TRAILER_BYTES;
+    BPlist b = {
+        .data = data,
+        .offsetSize = trailer[6],
+        .refSize = trailer[7],
+        .objectCount = bplist_read_be(trailer + 8, 8),
+        .offsetTable = bplist_read_be(trailer + 24, 8),
+    };
+    uint64_t top = bplist_read_be(trailer + 16, 8);
+    uint64_t trailerStart = length - BPLIST_TRAILER_BYTES;
+    if (b.offsetSize < 1 || b.offsetSize > 8 || b.refSize < 1 ||
+        b.refSize > 8 || b.objectCount == 0 || top >= b.objectCount ||
+        b.offsetTable < BPLIST_HEADER_BYTES || b.offsetTable > trailerStart ||
+        b.objectCount > (trailerStart - b.offsetTable) / b.offsetSize)
+        return false;
+
+    /* Per-object state: 0 unvisited, IN_PROGRESS on the walk stack (a
+     * reference back to it is a cycle), otherwise nesting depth + 1. */
+    uint8_t *state = calloc((size_t)b.objectCount, 1);
+    if (!state) return false;
+
+    struct { uint64_t index, refPos, refsLeft; unsigned best; }
+        stack[NETWORK_PLIST_MAX_DEPTH + 1];
+    if (maxDepth > NETWORK_PLIST_MAX_DEPTH) maxDepth = NETWORK_PLIST_MAX_DEPTH;
+
+    bool ok = false, isContainer = false;
+    uint64_t refPos = 0, refCount = 0;
+    unsigned height = 0;
+    if (!bplist_object_refs(&b, top, &isContainer, &refPos, &refCount))
+        goto done;
+    if (!isContainer) { ok = true; goto done; }
+    stack[0].index = top;
+    stack[0].refPos = refPos;
+    stack[0].refsLeft = refCount;
+    stack[0].best = 0;
+    state[top] = BPLIST_STATE_IN_PROGRESS;
+    height = 1;
+
+    while (height > 0) {
+        __typeof__(stack[0]) *frame = &stack[height - 1];
+        if (frame->refsLeft == 0) {
+            unsigned depth = frame->best + 1;
+            if (depth > maxDepth) goto done;
+            state[frame->index] = (uint8_t)(depth + 1);
+            height--;
+            if (height > 0 && stack[height - 1].best < depth)
+                stack[height - 1].best = depth;
+            continue;
+        }
+        uint64_t child = bplist_read_be(data + frame->refPos, b.refSize);
+        frame->refPos += b.refSize;
+        frame->refsLeft--;
+        if (child >= b.objectCount) goto done;
+        uint8_t childState = state[child];
+        if (childState == BPLIST_STATE_IN_PROGRESS) goto done;
+        if (childState != 0) {
+            if (frame->best < (unsigned)childState - 1)
+                frame->best = (unsigned)childState - 1;
+            continue;
+        }
+        if (!bplist_object_refs(&b, child, &isContainer, &refPos, &refCount))
+            goto done;
+        if (!isContainer) { state[child] = 1; continue; }
+        if (height >= maxDepth) goto done;
+        stack[height].index = child;
+        stack[height].refPos = refPos;
+        stack[height].refsLeft = refCount;
+        stack[height].best = 0;
+        state[child] = BPLIST_STATE_IN_PROGRESS;
+        height++;
+    }
+    ok = true;
+done:
+    free(state);
+    return ok;
+}
+
+/* Parses a network-supplied plist body, or returns nil when it is not a
+ * binary plist within maxDepth nested containers. */
+static id network_plist_parse(const uint8_t *body, size_t length,
+                              unsigned maxDepth) {
+    if (!body || length == 0 || !bplist_depth_ok(body, length, maxDepth))
+        return nil;
+    NSData *d = [NSData dataWithBytesNoCopy:(void *)body
+                                     length:length
+                               freeWhenDone:NO];
+    return [NSPropertyListSerialization
+        propertyListWithData:d options:NSPropertyListImmutable format:NULL
+                       error:NULL];
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * Endpoint: POST /auth-setup
  * ═══════════════════════════════════════════════════════════════ */
+
+/* Like TLV8_DUMP_MAX_ITEMS: an auth-setup plist arrives before pair-verify. */
+#define AUTH_SETUP_DUMP_MAX_FIELDS 16
 
 static void handle_auth_setup(int sock, const HTTPReq *r) {
     bool rtsp = (strncmp(r->protocol, "RTSP", 4) == 0);
     const char *proto = rtsp ? "RTSP/1.0" : "HTTP/1.1";
 
-    printf("[AP] -> POST /auth-setup (bodyLen=%zu, CSeq=%d, AT=%s)\n",
-           r->bodyLen, r->cseq, r->xAppleAT[0] ? r->xAppleAT : "none");
+    /* Reachable before pair-verify: nothing once the pre-auth log budget is
+     * spent (t_quiet_request_log). */
+    if (!t_quiet_request_log)
+        printf("[AP] -> POST /auth-setup (bodyLen=%zu, CSeq=%d, AT=%s)\n",
+               r->bodyLen, r->cseq, r->xAppleAT[0] ? r->xAppleAT : "none");
 
     if (!r->body || r->bodyLen == 0) {
-        printf("[AP] auth-setup: empty body\n");
+        if (!t_quiet_request_log)
+            printf("[AP] auth-setup: empty body\n");
         send_response(sock, proto, 403, "Forbidden", NULL, NULL, 0, r->cseq);
         return;
     }
@@ -1588,11 +2397,8 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
     } else {
         /* Try binary plist */
         @autoreleasepool {
-            NSData *d = [NSData dataWithBytesNoCopy:(void *)r->body
-                                             length:r->bodyLen
-                                       freeWhenDone:NO];
-            id obj = [NSPropertyListSerialization
-                propertyListWithData:d options:0 format:NULL error:NULL];
+            id obj = network_plist_parse(r->body, r->bodyLen,
+                                         AUTH_SETUP_PLIST_MAX_DEPTH);
             if (obj) {
                 isPlist = true;
 
@@ -1600,15 +2406,27 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
                 NSData *pkData = nil;
                 if ([obj isKindOfClass:[NSDictionary class]]) {
                     NSDictionary *dict = (NSDictionary *)obj;
-                    pkData = dict[@"pk"] ?: dict[@"publicKey"] ?: dict[@"epk"];
+                    /* Network data: a non-NSData value must not reach
+                     * -length/-bytes (unrecognized selector aborts root). */
+                    id pkValue = dict[@"pk"] ?: dict[@"publicKey"] ?: dict[@"epk"];
+                    if ([pkValue isKindOfClass:[NSData class]])
+                        pkData = (NSData *)pkValue;
                     if (!pkData) {
-                        /* Inspect types and lengths without logging values. */
+                        /* Inspect types and lengths without logging values;
+                         * a pre-auth plist may hold thousands of keys, so
+                         * only the first few are logged. */
+                        unsigned fields = 0;
                         for (NSString *key in dict) {
                             id val = dict[key];
+                            bool logField = !t_quiet_request_log &&
+                                fields++ < AUTH_SETUP_DUMP_MAX_FIELDS;
                             if ([val isKindOfClass:[NSData class]]) {
                                 NSData *dv = (NSData *)val;
-                                printf("[AP] auth-setup field: data (%zu bytes)\n", dv.length);
+                                if (logField)
+                                    printf("[AP] auth-setup field: data (%zu bytes)\n", dv.length);
                                 if (dv.length == 32 && !pkData) pkData = dv;
+                            } else if (!logField) {
+                                continue;
                             } else if ([val isKindOfClass:[NSNumber class]]) {
                                 printf("[AP] auth-setup field: number\n");
                             } else if ([val isKindOfClass:[NSString class]]) {
@@ -1616,6 +2434,10 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
                                        [(NSString *)val lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
                             }
                         }
+                        if (!t_quiet_request_log &&
+                            dict.count > AUTH_SETUP_DUMP_MAX_FIELDS)
+                            printf("[AP] auth-setup: ... %zu more fields\n",
+                                   (size_t)(dict.count - AUTH_SETUP_DUMP_MAX_FIELDS));
                     }
                     if (pkData && pkData.length == 32) {
                         memcpy(peerPKBuf, pkData.bytes, 32);
@@ -1623,14 +2445,15 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
                         version = 1;
                     }
                 }
-            } else {
+            } else if (!t_quiet_request_log) {
                 printf("[AP] auth-setup: not a plist (%zu bytes)\n", r->bodyLen);
             }
         }
     }
 
     if (!peerPK) {
-        printf("[AP] auth-setup: could not extract peer public key (bodyLen=%zu)\n", r->bodyLen);
+        if (!t_quiet_request_log)
+            printf("[AP] auth-setup: could not extract peer public key (bodyLen=%zu)\n", r->bodyLen);
         /* Return 200 OK with empty plist to not kill the connection */
         @autoreleasepool {
             NSDictionary *resp = @{};
@@ -1644,16 +2467,34 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
         return;
     }
 
-    printf("[AP] auth-setup: version=%d, %s, client ECDH pk:", version, isPlist ? "plist" : "raw");
-    for (int i = 0; i < 32; i++) printf(" %02x", peerPK[i]);
-    printf("\n");
+    /* Everything below is still pre-auth: honor the pre-auth log budget. */
+    if (!t_quiet_request_log) {
+        printf("[AP] auth-setup: version=%d, %s, client ECDH pk:", version, isPlist ? "plist" : "raw");
+        for (int i = 0; i < 32; i++) printf(" %02x", peerPK[i]);
+        printf("\n");
+    }
 
-    if (!g_baa_ready) {
-        printf("[AP] auth-setup: BAA not ready, attempting issuance...\n");
+    pthread_mutex_lock(&g_baa_lock);
+    bool baaReady = g_baa_ready;
+    pthread_mutex_unlock(&g_baa_lock);
+    if (!baaReady) {
+        if (!t_quiet_request_log)
+            printf("[AP] auth-setup: BAA not ready, attempting issuance...\n");
         load_baa_from_broker();
     }
-    if (!g_baa_ready) {
-        printf("[AP] auth-setup: BAA certificate unavailable\n");
+    /* Snapshot pointer and length together; the buffers are never freed
+     * or replaced once ready. */
+    pthread_mutex_lock(&g_baa_lock);
+    baaReady = g_baa_ready;
+    const uint8_t *baaLeafDer = g_baa_leaf_der;
+    int baaLeafLen = g_baa_leaf_len;
+    const uint8_t *baaInterDer = g_baa_inter_der;
+    int baaInterLen = g_baa_inter_len;
+    pthread_mutex_unlock(&g_baa_lock);
+    if (!baaReady || !baaLeafDer || !baaInterDer ||
+        baaLeafLen <= 0 || baaInterLen <= 0) {
+        if (!t_quiet_request_log)
+            printf("[AP] auth-setup: BAA certificate unavailable\n");
         send_response(sock, proto, 403, "Forbidden", NULL, NULL, 0, r->cseq);
         return;
     }
@@ -1664,23 +2505,27 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
     uint8_t ourPK[32];
     if (SecRandomCopyBytes(kSecRandomDefault, sizeof(ourSK), ourSK) !=
         errSecSuccess) {
-        printf("[AP] auth-setup: secure random generation failed\n");
+        if (!t_quiet_request_log)
+            printf("[AP] auth-setup: secure random generation failed\n");
         send_response(sock, proto, 500, "Internal Server Error",
                       NULL, NULL, 0, r->cseq);
         return;
     }
     crypto_x25519_public_key(ourPK, ourSK);
 
-    printf("[AP] auth-setup: our ECDH pk:");
-    for (int i = 0; i < 32; i++) printf(" %02x", ourPK[i]);
-    printf("\n");
+    if (!t_quiet_request_log) {
+        printf("[AP] auth-setup: our ECDH pk:");
+        for (int i = 0; i < 32; i++) printf(" %02x", ourPK[i]);
+        printf("\n");
+    }
 
     /* Compute ECDH shared secret */
     uint8_t sharedSecret[32];
     crypto_x25519(sharedSecret, ourSK, peerPK);
     crypto_wipe(ourSK, sizeof(ourSK));
 
-    printf("[AP] auth-setup: shared secret established\n");
+    if (!t_quiet_request_log)
+        printf("[AP] auth-setup: shared secret established\n");
 
     /* Derive AES key and IV: SHA1("AES-KEY" + shared) and SHA1("AES-IV" + shared) */
     uint8_t aesKey[20], aesIV[20];
@@ -1710,27 +2555,44 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
         int signRC = baa_broker_sign(digestData, sizeof(digestData),
                                      &sigBytesOwned, &sigLength);
         if (signRC != 0) {
-            printf("[AP] auth-setup: BAA broker sign FAILED: %d\n", signRC);
+            if (!t_quiet_request_log)
+                printf("[AP] auth-setup: BAA broker sign FAILED: %d\n", signRC);
             send_response(sock, proto, 403, "Forbidden", NULL, NULL, 0, r->cseq);
             return;
         }
 
         const uint8_t *sigBytes = sigBytesOwned;
         size_t sigLen = (size_t)sigLength;
-        printf("[AP] auth-setup: ECDSA signature: %zu bytes\n", sigLen);
+        if (!t_quiet_request_log)
+            printf("[AP] auth-setup: ECDSA signature: %zu bytes\n", sigLen);
 
         /* Encrypt signature with AES-128-CTR */
-        uint8_t *encSig = malloc(sigLen);
+        uint8_t *encSig = sigLen > 0 ? malloc(sigLen) : NULL;
         size_t encLen = 0;
-        CCCryptorRef cryptor;
-        CCCryptorCreateWithMode(kCCEncrypt, kCCModeCTR, kCCAlgorithmAES128,
-                                ccNoPadding, aesIV, aesKey, 16,
-                                NULL, 0, 0, kCCModeOptionCTR_BE, &cryptor);
-        CCCryptorUpdate(cryptor, sigBytes, sigLen, encSig, sigLen, &encLen);
-        CCCryptorRelease(cryptor);
+        CCCryptorRef cryptor = NULL;
+        CCCryptorStatus cryptStatus = encSig
+            ? CCCryptorCreateWithMode(kCCEncrypt, kCCModeCTR,
+                                      kCCAlgorithmAES128, ccNoPadding,
+                                      aesIV, aesKey, 16, NULL, 0, 0,
+                                      kCCModeOptionCTR_BE, &cryptor)
+            : kCCMemoryFailure;
+        if (cryptStatus == kCCSuccess)
+            cryptStatus = CCCryptorUpdate(cryptor, sigBytes, sigLen,
+                                          encSig, sigLen, &encLen);
+        if (cryptor) CCCryptorRelease(cryptor);
         free(sigBytesOwned);
+        if (cryptStatus != kCCSuccess || encLen != sigLen) {
+            if (!t_quiet_request_log)
+                printf("[AP] auth-setup: signature encryption failed (%d)\n",
+                       (int)cryptStatus);
+            free(encSig);
+            send_response(sock, proto, 500, "Internal Server Error",
+                          NULL, NULL, 0, r->cseq);
+            return;
+        }
 
-        printf("[AP] auth-setup: encrypted sig: %zu bytes\n", encLen);
+        if (!t_quiet_request_log)
+            printf("[AP] auth-setup: encrypted sig: %zu bytes\n", encLen);
 
         /* ── Build OPACK blob for intermediate cert: {"baIC": inter_der} ──
          *
@@ -1749,33 +2611,42 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
         opackHdr[0] = 0xE1;             /* dict, 1 entry */
         opackHdr[1] = 0x44;             /* string len=4 */
         opackHdr[2] = 'b'; opackHdr[3] = 'a'; opackHdr[4] = 'I'; opackHdr[5] = 'C';
-        if (g_baa_inter_len <= 0x20) {
-            opackHdr[6] = 0x70 + (uint8_t)g_baa_inter_len;
+        if (baaInterLen <= 0x20) {
+            opackHdr[6] = 0x70 + (uint8_t)baaInterLen;
             opackHdrLen = 7;
-        } else if (g_baa_inter_len <= 0xFF) {
+        } else if (baaInterLen <= 0xFF) {
             opackHdr[6] = 0x91;
-            opackHdr[7] = (uint8_t)(g_baa_inter_len & 0xFF);
+            opackHdr[7] = (uint8_t)(baaInterLen & 0xFF);
             opackHdrLen = 8;
-        } else if (g_baa_inter_len <= 0xFFFF) {
+        } else if (baaInterLen <= 0xFFFF) {
             opackHdr[6] = 0x92;
-            opackHdr[7] = (uint8_t)(g_baa_inter_len & 0xFF);        /* LE low */
-            opackHdr[8] = (uint8_t)((g_baa_inter_len >> 8) & 0xFF); /* LE high */
+            opackHdr[7] = (uint8_t)(baaInterLen & 0xFF);        /* LE low */
+            opackHdr[8] = (uint8_t)((baaInterLen >> 8) & 0xFF); /* LE high */
             opackHdrLen = 9;
         } else {
             opackHdr[6] = 0x93;
-            opackHdr[7] = (uint8_t)(g_baa_inter_len & 0xFF);
-            opackHdr[8] = (uint8_t)((g_baa_inter_len >> 8) & 0xFF);
-            opackHdr[9] = (uint8_t)((g_baa_inter_len >> 16) & 0xFF);
-            opackHdr[10] = (uint8_t)((g_baa_inter_len >> 24) & 0xFF);
+            opackHdr[7] = (uint8_t)(baaInterLen & 0xFF);
+            opackHdr[8] = (uint8_t)((baaInterLen >> 8) & 0xFF);
+            opackHdr[9] = (uint8_t)((baaInterLen >> 16) & 0xFF);
+            opackHdr[10] = (uint8_t)((baaInterLen >> 24) & 0xFF);
             opackHdrLen = 11;
         }
-        size_t opackBlobLen = opackHdrLen + g_baa_inter_len;
+        size_t opackBlobLen = opackHdrLen + baaInterLen;
         uint8_t *opackBlob = malloc(opackBlobLen);
+        if (!opackBlob) {
+            if (!t_quiet_request_log)
+                printf("[AP] auth-setup: out of memory (OPACK blob)\n");
+            free(encSig);
+            send_response(sock, proto, 500, "Internal Server Error",
+                          NULL, NULL, 0, r->cseq);
+            return;
+        }
         memcpy(opackBlob, opackHdr, opackHdrLen);
-        memcpy(opackBlob + opackHdrLen, g_baa_inter_der, g_baa_inter_len);
+        memcpy(opackBlob + opackHdrLen, baaInterDer, baaInterLen);
 
-        printf("[AP] auth-setup: OPACK baIC blob: %zu bytes (hdr=%zu + inter=%d)\n",
-               opackBlobLen, opackHdrLen, g_baa_inter_len);
+        if (!t_quiet_request_log)
+            printf("[AP] auth-setup: OPACK baIC blob: %zu bytes (hdr=%zu + inter=%d)\n",
+                   opackBlobLen, opackHdrLen, baaInterLen);
 
         /* ── Build BAA MFi-SAP M2 response ──
          *
@@ -1788,20 +2659,29 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
          *   baIC_len_be[4]             ← OPACK blob length
          *   OPACK({"baIC": inter})[baIC_len]
          */
-        size_t respLen = 32 + 4 + g_baa_leaf_len + 4 + encLen + 4 + opackBlobLen;
+        size_t respLen = 32 + 4 + baaLeafLen + 4 + encLen + 4 + opackBlobLen;
         uint8_t *resp = malloc(respLen);
+        if (!resp) {
+            if (!t_quiet_request_log)
+                printf("[AP] auth-setup: out of memory (M2 response)\n");
+            free(opackBlob);
+            free(encSig);
+            send_response(sock, proto, 500, "Internal Server Error",
+                          NULL, NULL, 0, r->cseq);
+            return;
+        }
         uint8_t *p = resp;
 
         /* 1) Server Curve25519 public key */
         memcpy(p, ourPK, 32); p += 32;
 
         /* 2) Leaf cert only */
-        p[0] = (g_baa_leaf_len >> 24) & 0xFF;
-        p[1] = (g_baa_leaf_len >> 16) & 0xFF;
-        p[2] = (g_baa_leaf_len >> 8)  & 0xFF;
-        p[3] =  g_baa_leaf_len        & 0xFF;
+        p[0] = (baaLeafLen >> 24) & 0xFF;
+        p[1] = (baaLeafLen >> 16) & 0xFF;
+        p[2] = (baaLeafLen >> 8)  & 0xFF;
+        p[3] =  baaLeafLen        & 0xFF;
         p += 4;
-        memcpy(p, g_baa_leaf_der, g_baa_leaf_len); p += g_baa_leaf_len;
+        memcpy(p, baaLeafDer, baaLeafLen); p += baaLeafLen;
 
         /* 3) Encrypted ECDSA signature */
         p[0] = (encLen >> 24) & 0xFF;
@@ -1820,9 +2700,10 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
         p += 4;
         memcpy(p, opackBlob, opackBlobLen); p += opackBlobLen;
 
-        printf("[AP] auth-setup M2 response: %zu bytes "
-               "(pk=32 + leaf=%d + sig=%zu + opack=%zu)\n",
-               respLen, g_baa_leaf_len, encLen, opackBlobLen);
+        if (!t_quiet_request_log)
+            printf("[AP] auth-setup M2 response: %zu bytes "
+                   "(pk=32 + leaf=%d + sig=%zu + opack=%zu)\n",
+                   respLen, baaLeafLen, encLen, opackBlobLen);
 
         send_response(sock, proto, 200, "OK",
                      "application/octet-stream", resp, respLen, r->cseq);
@@ -1839,23 +2720,16 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
  * ═══════════════════════════════════════════════════════════════ */
 
 static void handle_options(int sock, const HTTPReq *r) {
-    printf("[AP] -> OPTIONS\n");
+    if (!t_quiet_request_log) printf("[AP] -> OPTIONS\n");
     const char *proto = strncmp(r->protocol, "RTSP", 4) == 0 ?
                         "RTSP/1.0" : "HTTP/1.1";
 
-    @autoreleasepool {
-        NSMutableString *hdr = [NSMutableString string];
-        [hdr appendFormat:@"%s 200 OK\r\n", proto];
-        [hdr appendFormat:@"Server: AirTunes/%s\r\n", SOURCE_VERSION];
-        if (r->cseq > 0)
-            [hdr appendFormat:@"CSeq: %d\r\n", r->cseq];
-        [hdr appendString:@"Public: ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, "
-                          @"TEARDOWN, OPTIONS, POST, GET, PUT\r\n"];
-        [hdr appendString:@"Content-Length: 0\r\n"];
-        [hdr appendString:@"\r\n"];
-        const char *h = hdr.UTF8String;
-        send(sock, h, strlen(h), 0);
-    }
+    /* Shared writer: after pair-verify the reply must be encrypted like
+     * every other response on this socket. */
+    send_response_with_headers(sock, proto, 200, "OK", NULL,
+                               "Public: ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, "
+                               "TEARDOWN, OPTIONS, POST, GET, PUT\r\n",
+                               NULL, 0, r->cseq);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -2394,8 +3268,26 @@ static bool  g_event_thread_running = false;
 static atomic_int g_event_client_fd = -1;  /* accepted event connection */
 static volatile uint64_t g_last_touch_nanos = 0;
 
+/*
+ * Upper bound for one screen-stream body. The 32-bit length at the start of
+ * the 128-byte header is plaintext that arrives before the AEAD check runs,
+ * so it is attacker-controlled. VideoConfig, VideoFrame and KeepAliveWithBody
+ * are the only bodies this stream carries, and the largest 4K H.264 access
+ * unit is a few MiB, so 16 MiB is far above anything real while staying far
+ * below the point where the length arithmetic can wrap.
+ */
+#define SCREEN_MAX_BODY_BYTES (16u * 1024u * 1024u)
+
 /* Screen stream state */
 static int      g_screen_listen_fd = -1;     /* TCP listen socket for screen data */
+/* g_screen_lock guards the descriptors below and g_screen_listen_fd handoff:
+ * the listener the screen thread owns, the accepted stream socket, and the
+ * stream generation that TEARDOWN/replacement SETUP advance. */
+#define SCREEN_ACCEPT_TIMEOUT_SECONDS 30
+static pthread_mutex_t g_screen_lock = PTHREAD_MUTEX_INITIALIZER;
+static int      g_screen_thread_listen_fd = -1;
+static int      g_screen_client_fd = -1;
+static uint32_t g_screen_generation = 0;
 static uint16_t g_screen_data_port = 0;
 static uint64_t g_screen_conn_id = 0;        /* streamConnectionID from SETUP Phase 2 */
 static uint8_t  g_screen_key[32] = {0};      /* ChaCha20-Poly1305 decryption key */
@@ -2410,8 +3302,80 @@ static volatile int g_timing_sync_count = 0;  /* responses received during negot
 static volatile double g_timing_remote_minus_local = 0.0;
 static volatile double g_timing_best_rtt = DBL_MAX;
 static volatile int32_t g_timing_offset_valid = 0;
+/* Recent NTP samples. The offset follows the lowest-RTT sample among the
+ * last TIMING_SAMPLE_WINDOW responses: the window holds the whole negotiation
+ * burst (so the first choice is its best sample) and then slides over the
+ * 2.5 s maintenance probes, so the offset keeps tracking the drift between
+ * the two clocks instead of freezing on the best RTT ever seen. Only the
+ * timing thread touches the samples; a new negotiation asks it to drop them
+ * through g_timing_samples_reset. */
+#define TIMING_SAMPLE_WINDOW 8
+static double   g_timing_sample_rtt[TIMING_SAMPLE_WINDOW];
+static double   g_timing_sample_offset[TIMING_SAMPLE_WINDOW];
+static unsigned g_timing_sample_count = 0;
+static volatile int32_t g_timing_samples_reset = 0;
 static volatile uint32_t g_timing_maintenance_generation = 0;
 static bool app_send_video_timing(void);
+
+/* True only for the address of the iPhone whose SETUP created this session.
+ * The event, screen and timing endpoints are unauthenticated at the socket
+ * level, so other LAN hosts must not be able to occupy or feed them. */
+static bool sockaddr_is_session_iphone(const struct sockaddr *sa,
+                                       socklen_t length) {
+    if (g_iphone_ip[0] == '\0') return false;
+    char host[NI_MAXHOST] = {0};
+    char serv[NI_MAXSERV] = {0};
+    if (!sockaddr_to_numeric(sa, length, host, sizeof(host),
+                             serv, sizeof(serv)))
+        return false;
+    const char *ip = host;
+    if (sa->sa_family == AF_INET6 &&
+        IN6_IS_ADDR_V4MAPPED(&((const struct sockaddr_in6 *)sa)->sin6_addr) &&
+        strncmp(ip, "::ffff:", 7) == 0)
+        ip += 7;
+    return strcmp(ip, g_iphone_ip) == 0;
+}
+
+static uint16_t sockaddr_port(const struct sockaddr *sa) {
+    if (sa->sa_family == AF_INET)
+        return ntohs(((const struct sockaddr_in *)sa)->sin_port);
+    if (sa->sa_family == AF_INET6)
+        return ntohs(((const struct sockaddr_in6 *)sa)->sin6_port);
+    return 0;
+}
+
+/* Transmit timestamps of our outstanding NTP requests. A pt=211 response is
+ * accepted only if its originate time echoes one of them, once. */
+#define TIMING_PENDING_SLOTS 16
+static pthread_mutex_t g_timing_pending_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_timing_pending[TIMING_PENDING_SLOTS];
+static unsigned g_timing_pending_next = 0;
+
+static void timing_remember_request(const uint8_t transmit[8]) {
+    uint64_t stamp = 0;
+    memcpy(&stamp, transmit, sizeof(stamp));
+    pthread_mutex_lock(&g_timing_pending_lock);
+    g_timing_pending[g_timing_pending_next] = stamp;
+    g_timing_pending_next = (g_timing_pending_next + 1) % TIMING_PENDING_SLOTS;
+    pthread_mutex_unlock(&g_timing_pending_lock);
+}
+
+static bool timing_consume_request(const uint8_t originate[8]) {
+    uint64_t stamp = 0;
+    memcpy(&stamp, originate, sizeof(stamp));
+    if (stamp == 0) return false;
+    bool found = false;
+    pthread_mutex_lock(&g_timing_pending_lock);
+    for (unsigned i = 0; i < TIMING_PENDING_SLOTS; i++) {
+        if (g_timing_pending[i] == stamp) {
+            g_timing_pending[i] = 0;
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_timing_pending_lock);
+    return found;
+}
 
 /* ═══════════════════════════════════════════════════════════════
  * NTP Timing Responder Thread
@@ -2523,6 +3487,16 @@ static void timing_thread_func(void *ctx) {
 
     uint8_t buf[64];
     struct sockaddr_storage from;
+    uint64_t answered = 0;
+    uint64_t ignored = 0;
+    /* Every per-packet log below is counter-limited (first line, then every
+     * 100th with the running total): the session gate only checks the source
+     * IP, which UDP does not authenticate, so a spoofing LAN host could
+     * otherwise flood the log until its size cap truncates real lines. */
+    uint64_t shortPackets = 0;
+    uint64_t sendFailures = 0;
+    uint64_t unmatchedReplies = 0;
+    uint64_t unknownPackets = 0;
 
     while (g_timing_fd >= 0) {
         socklen_t fromLen = sizeof(from);
@@ -2533,10 +3507,28 @@ static void timing_thread_func(void *ctx) {
             printf("[TIMING] recvfrom error: %s\n", strerror(errno));
             break;
         }
-        if (n < 32) {
-            printf("[TIMING] Short packet (%zd bytes), ignoring\n", n);
+        /* The socket is unconnected: answer and log only the session
+         * iPhone. Replying to any source would make this root daemon a
+         * spoofable UDP reflector and lets LAN hosts flood app.log. */
+        if (!sockaddr_is_session_iphone((struct sockaddr *)&from, fromLen)) {
+            if (++ignored % 100 == 1) {
+                printf("[TIMING] Ignoring datagram from a host that is "
+                       "not the session iPhone (%llu so far)\n",
+                       (unsigned long long)ignored);
+                fflush(stdout);
+            }
             continue;
         }
+        if (n < 32) {
+            if (++shortPackets % 100 == 1) {
+                printf("[TIMING] Short packet (%zd bytes), ignoring "
+                       "(%llu so far)\n", n,
+                       (unsigned long long)shortPackets);
+                fflush(stdout);
+            }
+            continue;
+        }
+        bool wroteLog = false;
 
         char fromHost[NI_MAXHOST] = {0};
         char fromPort[NI_MAXSERV] = {0};
@@ -2548,8 +3540,14 @@ static void timing_thread_func(void *ctx) {
 
         if (pt == 210) {
             /* Timing request from iPhone — build response */
-            printf("[TIMING] Received timing REQUEST (%zd bytes) from %s:%s family=%s\n",
-                   n, fromHost, fromPort, addr_family_name(from.ss_family));
+            bool logThis = ++answered % 100 == 1;
+            wroteLog = logThis;
+            if (logThis)
+                printf("[TIMING] Received timing REQUEST (%zd bytes) from "
+                       "%s:%s family=%s (%llu answered)\n",
+                       n, fromHost, fromPort,
+                       addr_family_name(from.ss_family),
+                       (unsigned long long)answered);
 
             uint32_t recvSec, recvFrac;
             get_ntp_time(&recvSec, &recvFrac);
@@ -2586,10 +3584,39 @@ static void timing_thread_func(void *ctx) {
 
             ssize_t sent = sendto(g_timing_fd, resp, 32, 0,
                                   (struct sockaddr *)&from, fromLen);
-            printf("[TIMING] Sent NTP response (%zd bytes) to %s:%s family=%s\n",
-                   sent, fromHost, fromPort, addr_family_name(from.ss_family));
+            if (sent != 32) {
+                if (++sendFailures % 100 == 1) {
+                    printf("[TIMING] NTP response send failed (%zd bytes) "
+                           "to %s:%s family=%s (%llu failures so far)\n",
+                           sent, fromHost, fromPort,
+                           addr_family_name(from.ss_family),
+                           (unsigned long long)sendFailures);
+                    wroteLog = true;
+                }
+            } else if (logThis) {
+                printf("[TIMING] Sent NTP response (%zd bytes) to %s:%s "
+                       "family=%s\n", sent, fromHost, fromPort,
+                       addr_family_name(from.ss_family));
+            }
         } else if (pt == 211) {
-            /* Timing response from iPhone to our negotiation request */
+            /* Timing response from iPhone to our negotiation request. Only
+             * the session iPhone's timing port may answer, and only a request
+             * we actually sent: a forged near-zero-RTT reply would otherwise
+             * lock in an arbitrary clock offset that real replies cannot
+             * displace. */
+            if (!sockaddr_is_session_iphone((struct sockaddr *)&from,
+                                            fromLen) ||
+                sockaddr_port((struct sockaddr *)&from) !=
+                    g_iphone_timing_port ||
+                !timing_consume_request(buf + 8)) {
+                if (++unmatchedReplies % 100 == 1) {
+                    printf("[TIMING] Ignoring unmatched pt=211 from %s:%s "
+                           "(%llu so far)\n", fromHost, fromPort,
+                           (unsigned long long)unmatchedReplies);
+                    fflush(stdout);
+                }
+                continue;
+            }
             uint32_t receiveSeconds = 0;
             uint32_t receiveFraction = 0;
             get_ntp_time(&receiveSeconds, &receiveFraction);
@@ -2602,13 +3629,31 @@ static void timing_thread_func(void *ctx) {
             double remoteMinusLocal =
                 ((t2 - t1) + (t3 - t4)) * 0.5;
             bool selected = false;
-            if (rtt >= 0.0 && rtt < 1.0 &&
-                rtt < g_timing_best_rtt) {
-                g_timing_best_rtt = rtt;
-                g_timing_remote_minus_local = remoteMinusLocal;
-                g_timing_offset_valid = 1;
-                selected = true;
-                app_send_video_timing();
+            if (rtt >= 0.0 && rtt < 1.0) {
+                if (__sync_bool_compare_and_swap(&g_timing_samples_reset,
+                                                 1, 0))
+                    g_timing_sample_count = 0;
+                unsigned slot = g_timing_sample_count % TIMING_SAMPLE_WINDOW;
+                g_timing_sample_rtt[slot] = rtt;
+                g_timing_sample_offset[slot] = remoteMinusLocal;
+                g_timing_sample_count++;
+                unsigned filled = g_timing_sample_count < TIMING_SAMPLE_WINDOW
+                    ? g_timing_sample_count : TIMING_SAMPLE_WINDOW;
+                unsigned best = slot;
+                for (unsigned i = 0; i < filled; i++) {
+                    if (g_timing_sample_rtt[i] < g_timing_sample_rtt[best])
+                        best = i;
+                }
+                selected = best == slot;
+                if (!g_timing_offset_valid ||
+                    g_timing_sample_offset[best] !=
+                        g_timing_remote_minus_local) {
+                    g_timing_best_rtt = g_timing_sample_rtt[best];
+                    g_timing_remote_minus_local =
+                        g_timing_sample_offset[best];
+                    g_timing_offset_valid = 1;
+                    app_send_video_timing();
+                }
             }
             g_timing_sync_count++;
             printf("[TIMING] Received timing RESPONSE (pt=211) from %s:%s "
@@ -2617,10 +3662,14 @@ static void timing_thread_func(void *ctx) {
                    fromHost, fromPort, addr_family_name(from.ss_family),
                    g_timing_sync_count, rtt * 1000.0,
                    remoteMinusLocal * 1000.0, selected ? 1 : 0);
-        } else {
-            printf("[TIMING] Unknown packet type %u (%zd bytes)\n", pt, n);
+            wroteLog = true;
+        } else if (++unknownPackets % 100 == 1) {
+            printf("[TIMING] Unknown packet type %u (%zd bytes) "
+                   "(%llu so far)\n", pt, n,
+                   (unsigned long long)unknownPackets);
+            wroteLog = true;
         }
-        fflush(stdout);
+        if (wroteLog) fflush(stdout);
     }
     printf("[TIMING] Responder thread exiting\n");
     g_timing_thread_running = false;
@@ -2648,27 +3697,81 @@ static void event_thread_func(void *ctx) {
            g_event_port, g_event_fd);
     fflush(stdout);
 
+    /* A connection already accepted and validated by the read loop below
+     * that replaces an idle channel. */
+    int nextClient = -1;
+    struct sockaddr_storage nextAddr;
+    socklen_t nextAddrLen = 0;
+    /* The listener stays bound on all interfaces for the daemon's
+     * lifetime, so any LAN host can connect in a loop. Log rejections
+     * sparsely or they fill the capped log and push out session lines. */
+    uint64_t rejected = 0;
     while (g_event_fd >= 0) {
         struct sockaddr_storage ca;
         socklen_t cl = sizeof(ca);
-        int client = accept(g_event_fd, (struct sockaddr *)&ca, &cl);
+        int client;
+        if (nextClient >= 0) {
+            client = nextClient;
+            memcpy(&ca, &nextAddr, sizeof(ca));
+            cl = nextAddrLen;
+            nextClient = -1;
+        } else {
+            client = accept(g_event_fd, (struct sockaddr *)&ca, &cl);
+        }
         if (client < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            int acceptErr = errno;
+            /* EINTR, and ECONNABORTED (peer reset between the handshake and
+             * accept), are per-connection failures: the listener is still
+             * usable and the iPhone must be able to (re)connect for the rest
+             * of the session. Descriptor exhaustion is transient. Only a
+             * closed/invalid listener (teardown) ends the thread. */
+            if (acceptErr == EINTR || acceptErr == ECONNABORTED)
+                continue;
+            if (acceptErr == EAGAIN || acceptErr == EWOULDBLOCK ||
+                acceptErr == EMFILE || acceptErr == ENFILE ||
+                acceptErr == ENOBUFS || acceptErr == ENOMEM) {
+                if (acceptErr != EAGAIN && acceptErr != EWOULDBLOCK)
+                    printf("[EVENT] accept error (retrying): %s\n",
+                           strerror(acceptErr));
                 usleep(100000);
                 continue;
             }
-            printf("[EVENT] accept error: %s\n", strerror(errno));
+            printf("[EVENT] accept error: %s\n", strerror(acceptErr));
             break;
         }
 
         char host[NI_MAXHOST], serv[NI_MAXSERV];
         sockaddr_to_numeric((struct sockaddr *)&ca, cl,
                             host, sizeof(host), serv, sizeof(serv));
+
+        /* The event channel is served one client at a time. Only the
+         * pair-verified session iPhone may hold it; a LAN peer that took it
+         * would receive HID/requestUI traffic while the iPhone waited. */
+        if (!g_event_enc.active ||
+            !sockaddr_is_session_iphone((struct sockaddr *)&ca, cl)) {
+            if (++rejected % 100 == 1) {
+                printf("[EVENT] Rejecting %s:%s (%s) (%llu so far)\n",
+                       host, serv,
+                       g_event_enc.active ? "not the session iPhone"
+                                          : "no event channel keys",
+                       (unsigned long long)rejected);
+                fflush(stdout);
+            }
+            close(client);
+            continue;
+        }
         printf("[EVENT] *** Connection from %s:%s family=%s ***\n",
                host, serv, addr_family_name(ca.ss_family));
         fflush(stdout);
 
+        /* The iPhone starts the nonces of every new event connection at
+         * zero, including a reconnect within the same session. */
+        if (g_event_send_lock)
+            dispatch_semaphore_wait(g_event_send_lock, DISPATCH_TIME_FOREVER);
+        g_event_enc.readNonce = 0;
+        g_event_enc.writeNonce = 0;
         g_event_client_fd = client;
+        if (g_event_send_lock) dispatch_semaphore_signal(g_event_send_lock);
 
         /* HID commands are tiny and latency-sensitive. Without TCP_NODELAY,
          * Nagle combines consecutive reports while waiting for the iPhone's
@@ -2682,6 +3785,14 @@ static void event_thread_func(void *ctx) {
         uint8_t buf[16384];
         struct timeval tv = { .tv_sec = 120, .tv_usec = 0 };
         setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        /* Every event-channel write runs under g_event_send_lock, which the
+         * HID queue and IPC-triggered commands also wait for. Bound a write
+         * into a stalled connection so they are not held for as long as TCP
+         * keeps retransmitting. */
+        struct timeval sendTimeout = {
+            .tv_sec = EVENT_SEND_TIMEOUT_SEC, .tv_usec = 0 };
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout,
+                   sizeof(sendTimeout));
 
         if (g_event_enc.active) {
             printf("[EVENT] Encrypted event channel active\n");
@@ -2690,9 +3801,51 @@ static void event_thread_func(void *ctx) {
             uint64_t normalResponseCount = 0;
             uint8_t pending[HTTP_STREAM_LIMIT + ENCRYPTED_MAX_READ_SIZE];
             size_t used = 0;
+            http_progress_t progress = {0};
             while (1) {
                 int ptLen = enc_recv_frame(client, &g_event_enc, buf, sizeof(buf));
                 if (ptLen == -2) {
+                    /* A new connection from the session iPhone replaces one
+                     * that went silent (for example a half-open socket).
+                     * Anything else waiting on the listener is accepted and
+                     * closed here so it cannot displace the live channel. */
+                    struct pollfd listener = { .fd = g_event_fd,
+                                               .events = POLLIN };
+                    bool superseded = false;
+                    while (g_event_fd >= 0 && poll(&listener, 1, 0) > 0 &&
+                           (listener.revents & POLLIN)) {
+                        struct sockaddr_storage na;
+                        socklen_t nl = sizeof(na);
+                        int candidate = accept(g_event_fd,
+                                               (struct sockaddr *)&na, &nl);
+                        if (candidate < 0) break;
+                        if (!sockaddr_is_session_iphone(
+                                (struct sockaddr *)&na, nl)) {
+                            if (++rejected % 100 == 1) {
+                                char nh[NI_MAXHOST], ns[NI_MAXSERV];
+                                sockaddr_to_numeric((struct sockaddr *)&na, nl,
+                                                    nh, sizeof(nh),
+                                                    ns, sizeof(ns));
+                                printf("[EVENT] Rejecting %s:%s while the "
+                                       "channel is idle (not the session "
+                                       "iPhone) (%llu so far)\n",
+                                       nh, ns, (unsigned long long)rejected);
+                                fflush(stdout);
+                            }
+                            close(candidate);
+                            continue;
+                        }
+                        nextClient = candidate;
+                        memcpy(&nextAddr, &na, sizeof(nextAddr));
+                        nextAddrLen = nl;
+                        superseded = true;
+                        break;
+                    }
+                    if (superseded) {
+                        printf("[EVENT] Idle channel superseded by a new "
+                               "connection from the session iPhone\n");
+                        break;
+                    }
                     printf("[EVENT] Encrypted channel idle, still alive\n");
                     fflush(stdout);
                     continue;
@@ -2705,7 +3858,8 @@ static void event_thread_func(void *ctx) {
                 memcpy(pending + used, buf, (size_t)ptLen);
                 used += (size_t)ptLen;
                 HTTPReq request;
-                while (parse_http(pending, used, &request)) {
+                while (parse_http_incremental(pending, used, HTTP_STREAM_LIMIT,
+                                              &progress, &request)) {
                     size_t length = (size_t)(request.body - pending) + request.bodyLen;
                     if (length >= 12 && memcmp(pending, "RTSP/1.0 200", 12) == 0) {
                         if (++normalResponseCount % 250 == 0)
@@ -2716,6 +3870,7 @@ static void event_thread_func(void *ctx) {
                     }
                     used -= length;
                     memmove(pending, pending + length, used);
+                    progress = (http_progress_t){0};
                 }
                 if (request.invalid) break;
             }
@@ -2749,6 +3904,7 @@ static void event_thread_func(void *ctx) {
         printf("[EVENT] Client connection closed\n");
         fflush(stdout);
     }
+    if (nextClient >= 0) close(nextClient);
     g_event_thread_running = false;
 }
 
@@ -2776,6 +3932,8 @@ static void keepalive_thread_func(void *ctx) {
 
     uint8_t buf[256];
     struct sockaddr_storage from;
+    uint64_t echoed = 0;
+    uint64_t ignored = 0;
 
     while (g_keepalive_fd >= 0) {
         socklen_t fromLen = sizeof(from);
@@ -2785,11 +3943,25 @@ static void keepalive_thread_func(void *ctx) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
             break;
         }
-        printf("[KEEPALIVE] Received %zd bytes\n", n);
-        /* Echo back */
-        sendto(g_keepalive_fd, buf, n, 0,
+        /* Echo only to the session iPhone. Answering any source would make
+         * this port a reflector and lets a spoofed packet start an endless
+         * ping-pong with another UDP echo service. */
+        if (!sockaddr_is_session_iphone((struct sockaddr *)&from, fromLen)) {
+            if (++ignored % 100 == 1) {
+                printf("[KEEPALIVE] Ignoring datagram from a host that is "
+                       "not the session iPhone (%llu so far)\n",
+                       (unsigned long long)ignored);
+                fflush(stdout);
+            }
+            continue;
+        }
+        if (++echoed % 100 == 1) {
+            printf("[KEEPALIVE] Received %zd bytes (%llu echoed)\n", n,
+                   (unsigned long long)echoed);
+            fflush(stdout);
+        }
+        sendto(g_keepalive_fd, buf, (size_t)n, 0,
                (struct sockaddr *)&from, fromLen);
-        fflush(stdout);
     }
     g_keepalive_thread_running = false;
 }
@@ -2971,6 +4143,10 @@ static bool screen_read_exact(int fd, uint8_t *buf, size_t len,
 #define MSG_APP_VISIBILITY 0x05 /* app → services, 1 while foreground */
 #define MSG_VIDEO_TIMING 0x06   /* services → app, uint32 latency in ms */
 #define MSG_VIDEO_RESYNC 0x07   /* app → services, renderer needs keyframe */
+/* app → services, uint32 streamType: an audio packet arrived for a stream the
+ * app has no player for, so AUDIO_CONFIG is sent again. (0x0D/0x0E are the
+ * video-in-car bench messages.) */
+#define MSG_AUDIO_RESYNC 0x0F
 #define VIDEO_FRAME_METADATA_SIZE 56
 /* STATUS_* codes are forward-declared at the top of the file. */
 
@@ -3010,32 +4186,268 @@ static dispatch_semaphore_t g_app_send_lock = NULL;
 static dispatch_semaphore_t g_video_config_lock = NULL;
 static uint8_t *g_latest_video_config = NULL;
 static uint32_t g_latest_video_config_length = 0;
-static void start_touch_reader(int fd);  /* forward declaration */
+static bool start_touch_reader(int fd);  /* forward declaration */
 static void send_request_ui_command(const char *reason);
 static void send_take_main_screen_command(const char *reason);
 
-static bool app_write_all(int fd, const uint8_t *data, size_t length) {
+/* The app can be suspended by iOS (background, audio stopped) while the
+ * sender keeps streaming. A blocking write into a full AF_UNIX buffer would
+ * then hold g_app_send_lock forever, and RTSP control (SETRATE, FLUSH,
+ * TEARDOWN) waiting on that lock would stall until the iPhone drops the
+ * session. Every IPC message therefore has a bounded write deadline; a stalled
+ * peer gets its connection dropped (a partial message cannot be resumed) and
+ * reconnects are paused briefly so a suspended app is not hammered. */
+#define APP_IPC_WRITE_TIMEOUT_MS 300
+/* A lock holder writes at most two deadlines' worth: one shared by all
+ * catch-up writes (bootstrap, audio configs, pending controls) and one for
+ * its own message. */
+#define APP_IPC_LOCK_TIMEOUT_MS  (APP_IPC_WRITE_TIMEOUT_MS * 2 + 100)
+#define APP_IPC_STALL_BACKOFF_MS 1000
+static uint64_t g_app_reconnect_after_nanos = 0; /* guarded by g_app_send_lock */
+
+static uint64_t app_ipc_deadline(void) {
+    return monotonic_nanos_now() +
+        (uint64_t)APP_IPC_WRITE_TIMEOUT_MS * NSEC_PER_MSEC;
+}
+
+static bool app_send_lock_acquire(void) {
+    if (!g_app_send_lock) return true;
+    return dispatch_semaphore_wait(
+        g_app_send_lock,
+        dispatch_time(DISPATCH_TIME_NOW,
+                      (int64_t)APP_IPC_LOCK_TIMEOUT_MS * NSEC_PER_MSEC)) == 0;
+}
+
+/* Non-blocking send + poll so the touch reader can keep using the same
+ * (blocking) descriptor. Fails with errno = ETIMEDOUT at the deadline. */
+static bool app_write_all(int fd, const uint8_t *data, size_t length,
+                          uint64_t deadlineNanos) {
     size_t sent = 0;
     while (sent < length) {
-        ssize_t n = write(fd, data + sent, length - sent);
-        if (n <= 0) return false;
-        sent += (size_t)n;
+        ssize_t n = send(fd, data + sent, length - sent, MSG_DONTWAIT);
+        if (n > 0) {
+            sent += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+            return false;
+        uint64_t now = monotonic_nanos_now();
+        if (now >= deadlineNanos) {
+            errno = ETIMEDOUT;
+            return false;
+        }
+        uint64_t remainingMs = (deadlineNanos - now + NSEC_PER_MSEC - 1) /
+            NSEC_PER_MSEC;
+        struct pollfd pfd = { .fd = fd, .events = POLLOUT, .revents = 0 };
+        int ready = poll(&pfd, 1, (int)remainingMs);
+        if (ready < 0 && errno != EINTR) return false;
+        if (ready > 0 && (pfd.revents & (POLLERR | POLLNVAL))) return false;
     }
     return true;
 }
 
-static bool app_write_msg_to_socket(int fd, uint8_t type,
-                                    const uint8_t *data, uint32_t len) {
+static bool app_write_msg_until(int fd, uint8_t type, const uint8_t *data,
+                                uint32_t len, uint64_t deadline) {
     uint8_t hdr[5] = {
         len & 0xFF, (len >> 8) & 0xFF,
         (len >> 16) & 0xFF, (len >> 24) & 0xFF, type
     };
-    return app_write_all(fd, hdr, sizeof(hdr)) &&
-           app_write_all(fd, data, len);
+    return app_write_all(fd, hdr, sizeof(hdr), deadline) &&
+           app_write_all(fd, data, len, deadline);
 }
 
-static bool app_ensure_connected(void) {
+static bool app_write_msg_to_socket(int fd, uint8_t type,
+                                    const uint8_t *data, uint32_t len) {
+    return app_write_msg_until(fd, type, data, len, app_ipc_deadline());
+}
+
+/* A video message that could not be delivered (lock timeout or failed write)
+ * leaves the app's H.264 chain without its reference or parameter sets.
+ * g_app_needs_keyframe stays set until an IDR reaches the app;
+ * g_app_bootstrap_pending makes the next sender re-send the timing contract
+ * and latest SPS/PPS before its own message. Both are read and cleared under
+ * g_app_send_lock; setting them without it is safe (a redundant resend at
+ * worst). */
+#define APP_KEYFRAME_REQUEST_INTERVAL_MS 1000
+#define APP_RECONNECT_SLACK_MS 50
+static volatile bool g_app_needs_keyframe = false;
+static volatile bool g_app_bootstrap_pending = false;
+/* Set when an AUDIO_CONFIG could not be delivered; the streams concerned
+ * carry appConfigPending. Read and cleared under g_app_send_lock like
+ * g_app_bootstrap_pending. */
+static volatile bool g_app_audio_config_pending = false;
+static bool app_write_audio_configs(bool allActive, uint64_t deadline);
+/* Set when an AUDIO_CONTROL (PAUSE/RESUME/STOP) could not be delivered; the
+ * streams concerned carry appControlPending with their latest action. The
+ * app has no other way to learn a rate change, so like AUDIO_CONFIG it is
+ * never just dropped. Read and cleared under g_app_send_lock. */
+static volatile bool g_app_audio_control_pending = false;
+/* MSG_BT_HANDOFF (from the iPhone's one-shot disableBluetooth) has not
+ * reached the app yet. Read and cleared under g_app_send_lock. */
+static volatile bool g_app_bt_handoff_pending = false;
+static bool app_write_pending_controls(uint64_t deadline);
+static volatile uint64_t g_app_last_keyframe_request_nanos = 0;
+static bool g_app_reconnect_scheduled = false; /* guarded by g_app_send_lock */
+static void send_force_key_frame_command(const char *reason);
+static bool app_ensure_connected(uint64_t deadline);
+
+/* Event-channel writes can block, so the request is sent off the caller's
+ * thread (which may hold g_app_send_lock or be the screen reader). */
+static void app_request_keyframe(const char *reason) {
+    uint64_t now = monotonic_nanos_now();
+    uint64_t last = g_app_last_keyframe_request_nanos;
+    if (last != 0 &&
+        now - last < (uint64_t)APP_KEYFRAME_REQUEST_INTERVAL_MS * NSEC_PER_MSEC)
+        return;
+    if (!__sync_bool_compare_and_swap(&g_app_last_keyframe_request_nanos,
+                                      last, now))
+        return;
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        send_force_key_frame_command(reason);
+    });
+}
+
+static void app_note_send_lock_timeout(uint8_t type) {
+    if (type == MSG_VIDEO_CONFIG || type == MSG_VIDEO_TIMING)
+        g_app_bootstrap_pending = true;
+    if (type == MSG_VIDEO_CONFIG || type == MSG_VIDEO_FRAME) {
+        g_app_needs_keyframe = true;
+        app_request_keyframe("app IPC lock timeout lost video");
+    }
+    printf("[SCREEN] App IPC lock wait >%dms; message type=%u not sent\n",
+           APP_IPC_LOCK_TIMEOUT_MS, type);
+    fflush(stdout);
+}
+
+static void app_schedule_reconnect(void);
+
+/* Caller holds g_app_send_lock. Must be called right after the failed write
+ * so errno still describes it. */
+static void app_drop_connection(void) {
+    bool stalled = errno == ETIMEDOUT;
+    if (g_app_sock >= 0) {
+        /* The touch reader owns a dup() of this socket; shutdown wakes it
+         * with EOF so it closes its own copy and exits. */
+        shutdown(g_app_sock, SHUT_RDWR);
+        close(g_app_sock);
+    }
+    g_app_sock = -1;
+    if (stalled) {
+        g_app_reconnect_after_nanos = monotonic_nanos_now() +
+            (uint64_t)APP_IPC_STALL_BACKOFF_MS * NSEC_PER_MSEC;
+        printf("[SCREEN] App IPC write stalled >%dms; dropped connection\n",
+               APP_IPC_WRITE_TIMEOUT_MS);
+        fflush(stdout);
+    }
+    /* Senders only reconnect when they have something to send. With the app
+     * backgrounded, video is paused and nothing else may be sent for a long
+     * time, so the app would return to a dead channel (no frames, touches
+     * going nowhere). Reconnect on our own once the backoff has passed. */
+    app_schedule_reconnect();
+}
+
+static void app_reconnect_after(uint64_t delayMs);
+
+static void app_reconnect_attempt(void) {
+    if (!app_send_lock_acquire()) {
+        /* Another sender holds the channel; look again later. */
+        app_reconnect_after(APP_IPC_STALL_BACKOFF_MS);
+        return;
+    }
+    g_app_reconnect_scheduled = false;
+    if (g_app_sock < 0 && !app_ensure_connected(app_ipc_deadline()) &&
+        g_app_sock < 0)
+        app_schedule_reconnect();
+    if (g_app_send_lock) dispatch_semaphore_signal(g_app_send_lock);
+}
+
+static void app_reconnect_after(uint64_t delayMs) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)delayMs * NSEC_PER_MSEC),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        app_reconnect_attempt();
+    });
+}
+
+/* Caller holds g_app_send_lock. At most one attempt is pending; it keeps
+ * retrying (one connect per backoff period) until a connection exists. */
+static void app_schedule_reconnect(void) {
+    if (g_app_reconnect_scheduled) return;
+    g_app_reconnect_scheduled = true;
+    app_reconnect_after(APP_IPC_STALL_BACKOFF_MS + APP_RECONNECT_SLACK_MS);
+}
+
+/* Caller holds g_app_send_lock and g_app_sock is connected. Writes the
+ * timing contract and the latest SPS/PPS under the caller's catch-up
+ * deadline, which the other catch-up writes share, so catch-up plus the
+ * caller's own message stay within APP_IPC_LOCK_TIMEOUT_MS and queued
+ * senders do not time out behind it. */
+static bool app_write_bootstrap(bool *configSent, uint64_t deadline) {
+    *configSent = false;
+    g_app_bootstrap_pending = false;
+    uint8_t timingPayload[14];
+    uint32_t timingLen = build_video_timing_payload(timingPayload);
+    if (!app_write_msg_until(g_app_sock, MSG_VIDEO_TIMING,
+                             timingPayload, timingLen, deadline))
+        goto fail;
+    if (g_video_config_lock)
+        dispatch_semaphore_wait(g_video_config_lock,
+                                DISPATCH_TIME_FOREVER);
+    if (g_latest_video_config && g_latest_video_config_length > 0) {
+        bool sent = app_write_msg_until(
+            g_app_sock, MSG_VIDEO_CONFIG, g_latest_video_config,
+            g_latest_video_config_length, deadline);
+        int configErrno = errno;
+        if (g_video_config_lock)
+            dispatch_semaphore_signal(g_video_config_lock);
+        if (!sent) {
+            errno = configErrno;
+            goto fail;
+        }
+        *configSent = true;
+    } else if (g_video_config_lock) {
+        dispatch_semaphore_signal(g_video_config_lock);
+    }
+    return true;
+
+fail:
+    {
+        int writeErrno = errno;
+        g_app_bootstrap_pending = true;
+        errno = writeErrno;
+    }
+    return false;
+}
+
+/* Caller holds g_app_send_lock and g_app_sock is connected. Re-sends what an
+ * earlier lock timeout lost before the caller's own message, all under the
+ * catch-up deadline. On failure errno describes the write, as
+ * app_drop_connection expects. */
+static bool app_flush_pending_bootstrap(uint64_t deadline) {
+    if (g_app_bootstrap_pending) {
+        bool configSent = false;
+        if (!app_write_bootstrap(&configSent, deadline)) return false;
+        printf("[SCREEN] Re-sent video timing%s lost to an IPC lock timeout\n",
+               configSent ? " + config" : "");
+        fflush(stdout);
+    }
+    if (g_app_audio_config_pending &&
+        !app_write_audio_configs(false, deadline))
+        return false;
+    /* After the configs: a pending PAUSE/RESUME applies to the player a
+     * re-sent AUDIO_CONFIG may just have created. */
+    if ((g_app_audio_control_pending || g_app_bt_handoff_pending) &&
+        !app_write_pending_controls(deadline))
+        return false;
+    return true;
+}
+
+/* Caller holds g_app_send_lock. deadline is the caller's catch-up deadline,
+ * shared by every bootstrap write to a new connection. */
+static bool app_ensure_connected(uint64_t deadline) {
     if (g_app_sock >= 0) return true;
+    if (monotonic_nanos_now() < g_app_reconnect_after_nanos) return false;
     g_app_sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (g_app_sock < 0) return false;
     struct sockaddr_un addr;
@@ -3049,65 +4461,91 @@ static bool app_ensure_connected(void) {
     }
     int yes = 1;
     setsockopt(g_app_sock, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+    /* The AF_UNIX default (~8 KB) is smaller than one IDR frame, so a brief
+     * stall in the app's reader would hit the write timeout immediately. */
+    int ipcBuffer = 512 * 1024;
+    setsockopt(g_app_sock, SOL_SOCKET, SO_SNDBUF, &ipcBuffer, sizeof(ipcBuffer));
     printf("[SCREEN] Connected to iPadPlay app via %s\n", IPADPLAY_SOCK);
     fflush(stdout);
 
-    /* Start touch reader on this socket (reads touch events from app) */
-    start_touch_reader(g_app_sock);
+    /* Start touch reader on this socket (reads touch events from app).
+     * Without one, touches and visibility/resync messages would go unread,
+     * so a connection the reader cannot own is dropped and retried. */
+    if (!start_touch_reader(g_app_sock)) goto fail;
 
     /* A relaunched UI process has no H.264 format description. Bootstrap each
      * new IPC connection with the negotiated timing and latest SPS/PPS before
      * the next video frame. */
-    uint8_t timingPayload[14];
-    uint32_t timingLen = build_video_timing_payload(timingPayload);
-    if (!app_write_msg_to_socket(g_app_sock, MSG_VIDEO_TIMING,
-                                 timingPayload, timingLen))
+    bool configSent = false;
+    if (!app_write_bootstrap(&configSent, deadline)) goto fail;
+    /* A relaunched UI process has no audio players either, and AUDIO_CONFIG
+     * is otherwise sent only once per stream: give the new connection the
+     * config of every active stream. */
+    if (!app_write_audio_configs(true, deadline)) goto fail;
+    /* Controls and the BT hand-off lost to the old connection (or to a
+     * lock timeout) go out now, also when only the background reconnect
+     * opened this connection and no other sender follows. */
+    if ((g_app_audio_control_pending || g_app_bt_handoff_pending) &&
+        !app_write_pending_controls(deadline))
         goto fail;
-    if (g_video_config_lock)
-        dispatch_semaphore_wait(g_video_config_lock,
-                                DISPATCH_TIME_FOREVER);
-    if (g_latest_video_config && g_latest_video_config_length > 0) {
-        bool configSent = app_write_msg_to_socket(
-            g_app_sock, MSG_VIDEO_CONFIG, g_latest_video_config,
-            g_latest_video_config_length);
-        if (g_video_config_lock)
-            dispatch_semaphore_signal(g_video_config_lock);
-        if (!configSent) goto fail;
+    if (configSent) {
         printf("[SCREEN] Bootstrapped new app connection with video config\n");
         /* The new decoder cannot consume an arbitrary delta frame. Cycling
          * MainScreen asks the phone for a fresh config + IDR instead of
-         * copying and replaying an ever-growing compressed GOP. */
-        send_take_main_screen_command("new app decoder");
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                     100 * NSEC_PER_MSEC),
-                       dispatch_get_global_queue(0, 0), ^{
-            send_request_ui_command("new app decoder");
+         * copying and replaying an ever-growing compressed GOP.
+         *
+         * The caller holds g_app_send_lock; event-channel writes can block
+         * on the radio or the HID queue, so they are sent off this thread.
+         * requestUI would pull CarPlay back to the car screen, so it is only
+         * sent while Showcase is in the foreground; a backgrounded app's
+         * MSG_APP_VISIBILITY=1 requests the UI when it returns. */
+        dispatch_async(dispatch_get_global_queue(0, 0), ^{
+            send_take_main_screen_command("new app decoder");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         100 * NSEC_PER_MSEC),
+                           dispatch_get_global_queue(0, 0), ^{
+                if (g_app_video_enabled)
+                    send_request_ui_command("new app decoder");
+            });
         });
-    } else if (g_video_config_lock) {
-        dispatch_semaphore_signal(g_video_config_lock);
     }
     return true;
 
 fail:
-    close(g_app_sock);
-    g_app_sock = -1;
+    app_drop_connection();
     return false;
 }
 
-static bool app_send_msg(uint8_t type, const uint8_t *data, uint32_t len) {
-    if (g_app_send_lock)
-        dispatch_semaphore_wait(g_app_send_lock, DISPATCH_TIME_FOREVER);
+/* Runs under g_app_send_lock right before the message is written, so a
+ * decision it makes is ordered against every other IPC message. Returning
+ * false skips the write. It may take g_audio_control_lock (lock order:
+ * g_app_send_lock, then g_audio_control_lock). */
+typedef bool (*app_send_guard_fn)(void *context);
+
+static bool app_send_msg_guarded(uint8_t type, const uint8_t *data,
+                                 uint32_t len, app_send_guard_fn guard,
+                                 void *guardContext) {
+    if (!app_send_lock_acquire()) {
+        app_note_send_lock_timeout(type);
+        return false;
+    }
     bool success = false;
-    if (!app_ensure_connected()) goto done;
+    if (guard && !guard(guardContext)) goto done;
+    uint64_t catchUpDeadline = app_ipc_deadline();
+    if (!app_ensure_connected(catchUpDeadline)) goto done;
+    if (!app_flush_pending_bootstrap(catchUpDeadline)) goto fail;
     if (!app_write_msg_to_socket(g_app_sock, type, data, len)) goto fail;
     success = true;
     goto done;
 fail:
-    close(g_app_sock);
-    g_app_sock = -1;
+    app_drop_connection();
 done:
     if (g_app_send_lock) dispatch_semaphore_signal(g_app_send_lock);
     return success;
+}
+
+static bool app_send_msg(uint8_t type, const uint8_t *data, uint32_t len) {
+    return app_send_msg_guarded(type, data, len, NULL, NULL);
 }
 
 static bool app_send_video_timing(void) {
@@ -3125,6 +4563,11 @@ static bool app_send_video_timing(void) {
  * authenticates and decrypts packets, then forwards codec frames to Showcase;
  * the app owns the system audio session and hardware codec.
  * ═══════════════════════════════════════════════════════════════ */
+
+/* Recent audio nonces remembered per stream, and how many consecutive
+ * counter steps make the "too old" check apply. */
+#define AUDIO_REPLAY_WINDOW 256
+#define AUDIO_REPLAY_COUNTER_RUNS 16
 
 typedef struct {
     uint32_t type;
@@ -3158,8 +4601,132 @@ typedef struct {
     uint16_t flushUntilSequence;
     uint32_t flushUntilTimestamp;
     uint64_t flushDropCount;
+    /* Deferred FLUSHBUFFERED (flushFromSeq present, AirPlay 2 Up Next /
+     * gapless transitions): packets before "from" keep playing, only the
+     * [from, until) range is dropped once it arrives and the app's queue is
+     * not reset. Guarded by g_audio_control_lock. deferredFlushChecked is
+     * set by the receiver thread once it has compared the request with the
+     * last packet it already forwarded to the app. */
+    bool deferredFlushPending;
+    bool deferredFlushChecked;
+    uint16_t deferredFlushFromSequence;
+    uint16_t deferredFlushUntilSequence;
+    uint32_t deferredFlushUntilTimestamp;
+    uint64_t deferredFlushDropCount;
+    /* Bumped (under g_audio_control_lock, while holding g_app_send_lock)
+     * by every FLUSHBUFFERED in the same critical section that sends the
+     * FLUSH to the app. A packet is written to the app only if the epoch
+     * it was judged against is still current under g_app_send_lock, so it
+     * can never land on the wrong side of the app's AudioQueueReset. */
+    uint64_t flushEpoch;
     bool usesTCP;
+    /* Accepted MainBuffered sender connection, owned by the receiver thread.
+     * Guarded by g_audio_control_lock; stop_audio_receiver only shuts it
+     * down, the receiver thread clears and closes it. */
+    int tcpClientFd;
+    /* Set (under g_audio_control_lock) once a receiver thread holds dataFd.
+     * stop_audio_receiver then only shuts the socket down and the thread
+     * closes it, so the fd number cannot be reused by the next SETUP's
+     * socket while the old thread may still poll/accept/recv on it. */
+    bool dataFdOwnedByThread;
+    /* Anti-replay state of the receiver thread, reset with haveSequence.
+     * The AEAD nonce travels in the packet and the sequence number is not
+     * authenticated, so a captured packet would otherwise decrypt again.
+     * Each ring entry is the nonce plus the authenticated RTP timestamp +
+     * SSRC (the AAD): a replay must repeat both, while a sender that
+     * restarts its nonce counter after a flush sends new timestamps. */
+    uint64_t replayNonces[AUDIO_REPLAY_WINDOW];
+    uint64_t replayAad[AUDIO_REPLAY_WINDOW];
+    unsigned replayCount;
+    uint64_t replayHighestNonce;
+    uint32_t replayCounterRuns;
+    /* Set at a flush boundary: the next nonce may restart the counter. */
+    bool replayNewEpoch;
+    uint64_t replayDropCount;
+    uint64_t rejectedSenderCount;
+    /* AUDIO_CONFIG for this stream has not reached the app yet; see
+     * g_app_audio_config_pending. */
+    volatile bool appConfigPending;
+    /* The latest AUDIO_CONTROL action (PAUSE/RESUME/STOP) for this stream
+     * has not reached the app yet; a newer action replaces an undelivered
+     * one. Guarded by g_audio_control_lock; see
+     * g_app_audio_control_pending. */
+    bool appControlPending;
+    uint8_t appControlAction;
 } carplay_audio_stream_t;
+
+/* Clears the anti-replay state when a stream (re)starts with a new key. */
+static void audio_replay_reset(carplay_audio_stream_t *stream) {
+    stream->replayCount = 0;
+    stream->replayHighestNonce = 0;
+    stream->replayCounterRuns = 0;
+    stream->replayNewEpoch = false;
+}
+
+/* A flush starts a new RTP epoch under the SAME key. The sender may restart
+ * its nonce counter, so the counter-mode lower bound must be re-learned, but
+ * the ring of already accepted (nonce, AAD) pairs is kept: a pre-flush packet
+ * captured or delayed on the network decrypts fine and would otherwise be
+ * replayed into the freshly flushed AudioQueue. Matching on the AAD as well
+ * keeps the restarted counter's genuine packets (new timestamps) from
+ * colliding with the old epoch's ring entries. */
+static void audio_replay_begin_epoch(carplay_audio_stream_t *stream) {
+    stream->replayNewEpoch = true;
+}
+
+/* Returns false for a (nonce, AAD) pair this stream already accepted or,
+ * once the sender has shown that its nonce is a little-endian packet counter,
+ * a nonce older than the replay window. Called only for packets that passed
+ * AEAD; aadBytes is the authenticated RTP timestamp + SSRC. */
+static bool audio_replay_accept(carplay_audio_stream_t *stream,
+                                const uint8_t nonceBytes[8],
+                                const uint8_t aadBytes[8],
+                                uint64_t *dropCount) {
+    uint64_t nonce = 0;
+    for (int i = 7; i >= 0; i--) nonce = (nonce << 8) | nonceBytes[i];
+    uint64_t aad = 0;
+    memcpy(&aad, aadBytes, sizeof(aad));
+    unsigned filled = stream->replayCount < AUDIO_REPLAY_WINDOW
+        ? stream->replayCount : AUDIO_REPLAY_WINDOW;
+    for (unsigned i = 0; i < filled; i++) {
+        if (stream->replayNonces[i] == nonce &&
+            stream->replayAad[i] == aad) {
+            *dropCount = ++stream->replayDropCount;
+            return false;
+        }
+    }
+    if (stream->replayNewEpoch) {
+        stream->replayNewEpoch = false;
+        if (filled > 0 && nonce < stream->replayHighestNonce) {
+            /* The counter restarted: track it from here. A replayed packet
+             * of the old epoch still in the ring was rejected above. */
+            stream->replayHighestNonce = nonce;
+            stream->replayCounterRuns = 0;
+            goto record;
+        }
+    }
+    if (filled > 0) {
+        bool counterMode =
+            stream->replayCounterRuns >= AUDIO_REPLAY_COUNTER_RUNS;
+        if (counterMode && nonce < stream->replayHighestNonce &&
+            stream->replayHighestNonce - nonce >= AUDIO_REPLAY_WINDOW) {
+            *dropCount = ++stream->replayDropCount;
+            return false;
+        }
+        if (nonce == stream->replayHighestNonce + 1 &&
+            stream->replayCounterRuns < AUDIO_REPLAY_COUNTER_RUNS)
+            stream->replayCounterRuns++;
+        if (nonce > stream->replayHighestNonce)
+            stream->replayHighestNonce = nonce;
+    } else {
+        stream->replayHighestNonce = nonce;
+    }
+record:
+    stream->replayNonces[stream->replayCount % AUDIO_REPLAY_WINDOW] = nonce;
+    stream->replayAad[stream->replayCount % AUDIO_REPLAY_WINDOW] = aad;
+    stream->replayCount++;
+    return true;
+}
 
 typedef struct {
     carplay_audio_stream_t *stream;
@@ -3173,10 +4740,11 @@ static pthread_mutex_t g_audio_feedback_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_audio_control_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static carplay_audio_stream_t g_audio_streams[4] = {
-    { .type = 100, .dataFd = -1, .controlFd = -1 },
-    { .type = 101, .dataFd = -1, .controlFd = -1 },
-    { .type = 102, .dataFd = -1, .controlFd = -1 },
-    { .type = 103, .dataFd = -1, .controlFd = -1 }   /* MainBufferedAudio */
+    { .type = 100, .dataFd = -1, .controlFd = -1, .tcpClientFd = -1 },
+    { .type = 101, .dataFd = -1, .controlFd = -1, .tcpClientFd = -1 },
+    { .type = 102, .dataFd = -1, .controlFd = -1, .tcpClientFd = -1 },
+    { .type = 103, .dataFd = -1, .controlFd = -1,
+      .tcpClientFd = -1 }   /* MainBufferedAudio */
 };
 
 static carplay_audio_stream_t *audio_stream_for_type(uint32_t type) {
@@ -3218,37 +4786,223 @@ static double audio_sample_rate(uint64_t formatMask) {
     }
 }
 
-static void app_send_audio_config(carplay_audio_stream_t *stream) {
-    uint8_t payload[20] = {0};
-    memcpy(payload, &stream->type, 4);
-    memcpy(payload + 4, &stream->formatMask, 8);
-    memcpy(payload + 12, &stream->framesPerPacket, 4);
-    memcpy(payload + 16, &stream->latencyMs, 4);
-    app_send_msg(MSG_AUDIO_CONFIG, payload, sizeof(payload));
+/* Caller holds g_app_send_lock and g_app_sock is connected. Writes
+ * AUDIO_CONFIG for every running stream (allActive: a new connection) or only
+ * for those still marked appConfigPending, all under one write deadline. A
+ * stream that is not running (stopped, or SETUP still filling it in) is
+ * skipped: its receiver sends the config when it starts. On failure the
+ * unsent streams stay pending and errno describes the write. */
+static bool app_write_audio_configs(bool allActive, uint64_t deadline) {
+    g_app_audio_config_pending = false;
+    size_t count = sizeof(g_audio_streams) / sizeof(g_audio_streams[0]);
+    for (size_t i = 0; i < count; i++) {
+        carplay_audio_stream_t *stream = &g_audio_streams[i];
+        if (!allActive && !stream->appConfigPending) continue;
+        uint8_t payload[20] = {0};
+        pthread_mutex_lock(&g_audio_control_lock);
+        bool active = stream->running && stream->formatMask != 0;
+        if (active) {
+            memcpy(payload, &stream->type, 4);
+            memcpy(payload + 4, &stream->formatMask, 8);
+            memcpy(payload + 12, &stream->framesPerPacket, 4);
+            memcpy(payload + 16, &stream->latencyMs, 4);
+        }
+        stream->appConfigPending = false;
+        pthread_mutex_unlock(&g_audio_control_lock);
+        if (!active) continue;
+        if (!app_write_msg_until(g_app_sock, MSG_AUDIO_CONFIG, payload,
+                                 sizeof(payload), deadline)) {
+            int writeErrno = errno;
+            /* Streams after this one were not reached: a new connection
+             * owes them their config too; otherwise their own pending flag
+             * is still set. */
+            stream->appConfigPending = true;
+            for (size_t j = i + 1; allActive && j < count; j++)
+                g_audio_streams[j].appConfigPending = true;
+            g_app_audio_config_pending = true;
+            errno = writeErrno;
+            return false;
+        }
+        printf("[AUDIO] stream=%u config sent to app%s\n", stream->type,
+               allActive ? " (new app connection)" : "");
+    }
+    return true;
 }
 
-static void app_send_audio_packet(carplay_audio_stream_t *stream,
+/* Caller holds g_app_send_lock and g_app_sock is connected. Writes every
+ * pending AUDIO_CONTROL (latest action per stream) and a pending BT
+ * hand-off under one deadline. On failure the unsent items stay pending and
+ * errno describes the write. */
+static bool app_write_pending_controls(uint64_t deadline) {
+    g_app_audio_control_pending = false;
+    size_t count = sizeof(g_audio_streams) / sizeof(g_audio_streams[0]);
+    for (size_t i = 0; i < count; i++) {
+        carplay_audio_stream_t *stream = &g_audio_streams[i];
+        pthread_mutex_lock(&g_audio_control_lock);
+        bool pending = stream->appControlPending;
+        uint8_t action = stream->appControlAction;
+        stream->appControlPending = false;
+        pthread_mutex_unlock(&g_audio_control_lock);
+        if (!pending) continue;
+        uint8_t payload[5] = {0};
+        memcpy(payload, &stream->type, 4);
+        payload[4] = action;
+        if (!app_write_msg_until(g_app_sock, MSG_AUDIO_CONTROL, payload,
+                                 sizeof(payload), deadline)) {
+            int writeErrno = errno;
+            /* A newer action queued meanwhile supersedes this one. */
+            pthread_mutex_lock(&g_audio_control_lock);
+            if (!stream->appControlPending) {
+                stream->appControlPending = true;
+                stream->appControlAction = action;
+            }
+            pthread_mutex_unlock(&g_audio_control_lock);
+            /* Streams after this one keep their own pending flag. */
+            g_app_audio_control_pending = true;
+            errno = writeErrno;
+            return false;
+        }
+        printf("[AUDIO] control stream=%u action=%u delivered to app\n",
+               stream->type, action);
+    }
+    if (g_app_bt_handoff_pending) {
+        g_app_bt_handoff_pending = false;
+        const uint8_t request = 1;
+        if (!app_write_msg_until(g_app_sock, MSG_BT_HANDOFF, &request,
+                                 sizeof(request), deadline)) {
+            int writeErrno = errno;
+            g_app_bt_handoff_pending = true;
+            errno = writeErrno;
+            return false;
+        }
+        printf("[HANDOFF] app teardown request delivered\n");
+    }
+    return true;
+}
+
+/* Delivers whatever is marked pending (bootstrap, configs, controls, BT
+ * hand-off) right now if the channel allows it. A failure (lock timeout,
+ * reconnect backoff, failed write) leaves it pending for the next IPC
+ * message or the next app connection. */
+static void app_deliver_pending(uint8_t type) {
+    if (!app_send_lock_acquire()) {
+        app_note_send_lock_timeout(type);
+        return;
+    }
+    uint64_t catchUpDeadline = app_ipc_deadline();
+    if (app_ensure_connected(catchUpDeadline) &&
+        !app_flush_pending_bootstrap(catchUpDeadline))
+        app_drop_connection();
+    if (g_app_send_lock) dispatch_semaphore_signal(g_app_send_lock);
+}
+
+/* AUDIO_CONFIG is the only thing that creates the app's player for a stream,
+ * so it is never just dropped: the stream is marked pending first, and a send
+ * that fails here (lock timeout, reconnect backoff, failed write) is retried
+ * before the next IPC message or on the next app connection. */
+static void app_send_audio_config(carplay_audio_stream_t *stream) {
+    /* A (re)started stream supersedes an undelivered STOP of its previous
+     * run, which would otherwise follow the new config and stop it. */
+    pthread_mutex_lock(&g_audio_control_lock);
+    if (stream->appControlPending &&
+        stream->appControlAction == AUDIO_CONTROL_STOP)
+        stream->appControlPending = false;
+    pthread_mutex_unlock(&g_audio_control_lock);
+    stream->appConfigPending = true;
+    g_app_audio_config_pending = true;
+    app_deliver_pending(MSG_AUDIO_CONFIG);
+    if (stream->appConfigPending)
+        printf("[AUDIO] stream=%u config not delivered to app; "
+               "will retry\n", stream->type);
+}
+
+typedef struct {
+    carplay_audio_stream_t *stream;
+    uint64_t expectedFlushEpoch;
+} audio_packet_send_guard_t;
+
+static bool audio_packet_epoch_current(void *context) {
+    audio_packet_send_guard_t *guard = context;
+    pthread_mutex_lock(&g_audio_control_lock);
+    bool current = guard->stream->flushEpoch == guard->expectedFlushEpoch;
+    pthread_mutex_unlock(&g_audio_control_lock);
+    return current;
+}
+
+/* Returns false when the packet was not written, including when a
+ * FLUSHBUFFERED arrived after the drop decision made at expectedFlushEpoch:
+ * such a packet was judged against a stale boundary and is dropped (had it
+ * been written just before the FLUSH, the app's reset would discard it). */
+static bool app_send_audio_packet(carplay_audio_stream_t *stream,
+                                  uint64_t expectedFlushEpoch,
                                   uint16_t sequence, uint32_t timestamp,
                                   const uint8_t *bytes, uint32_t length) {
     uint32_t msgLength = 12 + length;
     uint8_t *message = malloc(msgLength);
-    if (!message) return;
+    if (!message) return false;
     memset(message, 0, 12);
     memcpy(message, &stream->type, 4);
     memcpy(message + 4, &sequence, 2);
     memcpy(message + 8, &timestamp, 4);
     memcpy(message + 12, bytes, length);
-    app_send_msg(MSG_AUDIO_PACKET, message, msgLength);
+    audio_packet_send_guard_t guard = {
+        .stream = stream, .expectedFlushEpoch = expectedFlushEpoch };
+    bool sent = app_send_msg_guarded(MSG_AUDIO_PACKET, message, msgLength,
+                                     audio_packet_epoch_current, &guard);
     free(message);
+    return sent;
 }
 
+/* PAUSE/RESUME/STOP are the app player's only rate signal, so like
+ * AUDIO_CONFIG they are never just dropped: the stream records its latest
+ * action as pending first, and a send that fails here is retried before the
+ * next IPC message or on the next app connection. */
 static void app_send_audio_control(uint32_t streamType, uint8_t action) {
-    uint8_t payload[5] = {0};
-    memcpy(payload, &streamType, 4);
-    payload[4] = action;
-    bool sent = app_send_msg(MSG_AUDIO_CONTROL, payload, sizeof(payload));
-    printf("[AUDIO] control stream=%u action=%u app=%s\n",
-           streamType, action, sent ? "sent" : "failed");
+    carplay_audio_stream_t *stream = audio_stream_for_type(streamType);
+    if (!stream) {
+        uint8_t payload[5] = {0};
+        memcpy(payload, &streamType, 4);
+        payload[4] = action;
+        bool sent = app_send_msg(MSG_AUDIO_CONTROL, payload, sizeof(payload));
+        printf("[AUDIO] control stream=%u action=%u app=%s\n",
+               streamType, action, sent ? "sent" : "failed");
+        return;
+    }
+    pthread_mutex_lock(&g_audio_control_lock);
+    stream->appControlAction = action;
+    stream->appControlPending = true;
+    pthread_mutex_unlock(&g_audio_control_lock);
+    g_app_audio_control_pending = true;
+    app_deliver_pending(MSG_AUDIO_CONTROL);
+    pthread_mutex_lock(&g_audio_control_lock);
+    bool pending = stream->appControlPending;
+    pthread_mutex_unlock(&g_audio_control_lock);
+    if (pending)
+        printf("[AUDIO] control stream=%u action=%u not delivered to app; "
+               "will retry\n", streamType, action);
+}
+
+static void audio_flush_app_until(carplay_audio_stream_t *audio,
+                                  uint16_t untilSequence,
+                                  uint32_t untilTimestamp);
+
+/* Caller holds g_audio_control_lock. True for a packet inside the pending
+ * deferred flush range [from, until). */
+static bool audio_deferred_flush_covers(const carplay_audio_stream_t *stream,
+                                        uint16_t sequence,
+                                        uint32_t timestamp) {
+    return (int16_t)(sequence - stream->deferredFlushFromSequence) >= 0 &&
+           (int16_t)(sequence - stream->deferredFlushUntilSequence) < 0 &&
+           timestamp != stream->deferredFlushUntilTimestamp;
+}
+
+/* Caller holds g_audio_control_lock. True for the new epoch's first packet
+ * (or one modularly after it). */
+static bool audio_deferred_flush_reached(const carplay_audio_stream_t *stream,
+                                         uint16_t sequence,
+                                         uint32_t timestamp) {
+    return (int16_t)(sequence - stream->deferredFlushUntilSequence) >= 0 ||
+           timestamp == stream->deferredFlushUntilTimestamp;
 }
 
 static void audio_process_rtp_packet(carplay_audio_stream_t *stream,
@@ -3281,23 +5035,63 @@ static void audio_process_rtp_packet(carplay_audio_stream_t *stream,
      * an extended sequence number and timestamp. The RTP header carries only
      * the low 16 sequence bits. Drop the old epoch until that boundary (or the
      * first packet modularly after it) so it cannot refill the AudioQueue
-     * after the app has discarded its stale buffered media.
+     * after the app has discarded its stale buffered media. A deferred
+     * FLUSHBUFFERED (flushFromSeq) instead drops only [from, until) and
+     * leaves the app's queue, and the packets before "from", playing.
      */
+    /* The drop decision may use the unauthenticated header, but only a
+     * packet that passes AEAD below may close the flush window: a forged or
+     * corrupt packet must not let the stale epoch back in. */
+    /* A deferred flush whose "from" packet was already forwarded cannot be
+     * trimmed out of the app's AudioQueue: only a reset removes it, so fall
+     * back to the immediate flush for that request. lastSequence is owned by
+     * this receiver thread. */
+    bool convertDeferred = false;
+    uint16_t convertUntilSequence = 0;
+    uint32_t convertUntilTimestamp = 0;
+    pthread_mutex_lock(&g_audio_control_lock);
+    if (stream->deferredFlushPending && !stream->deferredFlushChecked) {
+        stream->deferredFlushChecked = true;
+        if (stream->haveSequence &&
+            (int16_t)(stream->lastSequence -
+                      stream->deferredFlushFromSequence) >= 0) {
+            convertDeferred = true;
+            convertUntilSequence = stream->deferredFlushUntilSequence;
+            convertUntilTimestamp = stream->deferredFlushUntilTimestamp;
+            stream->deferredFlushPending = false;
+        }
+    }
+    pthread_mutex_unlock(&g_audio_control_lock);
+    if (convertDeferred) {
+        printf("[AUDIO] stream=%u deferred flush start already forwarded "
+               "(last=%u); flushing app until rtp=%u\n",
+               stream->type, stream->lastSequence, convertUntilSequence);
+        audio_flush_app_until(stream, convertUntilSequence,
+                              convertUntilTimestamp);
+    }
+
     bool dropForFlush = false;
-    bool completedFlush = false;
+    bool flushWasPending = false;
+    bool deferredWasPending = false;
     uint64_t droppedForFlush = 0;
     pthread_mutex_lock(&g_audio_control_lock);
+    uint64_t flushEpoch = stream->flushEpoch;
     if (stream->flushPending) {
+        flushWasPending = true;
         int16_t relative =
             (int16_t)(sequence - stream->flushUntilSequence);
         if (relative < 0 && timestamp != stream->flushUntilTimestamp) {
             stream->flushDropCount++;
             droppedForFlush = stream->flushDropCount;
             dropForFlush = true;
-        } else {
-            stream->flushPending = false;
-            completedFlush = true;
-            droppedForFlush = stream->flushDropCount;
+        }
+    }
+    if (!dropForFlush && stream->deferredFlushPending) {
+        deferredWasPending = true;
+        if (audio_deferred_flush_covers(stream, sequence, timestamp)) {
+            stream->deferredFlushDropCount++;
+            droppedForFlush = stream->deferredFlushDropCount;
+            dropForFlush = true;
         }
     }
     pthread_mutex_unlock(&g_audio_control_lock);
@@ -3308,12 +5102,6 @@ static void audio_process_rtp_packet(carplay_audio_stream_t *stream,
                    sequence, timestamp);
         }
         return;
-    }
-    if (completedFlush) {
-        printf("[AUDIO] stream=%u flush boundary reached seq=%u ts=%u "
-               "dropped=%llu\n",
-               stream->type, sequence, timestamp,
-               (unsigned long long)droppedForFlush);
     }
 
     uint8_t *encrypted = packet + 12;
@@ -3344,6 +5132,71 @@ static void audio_process_rtp_packet(carplay_audio_stream_t *stream,
         return;
     }
 
+    if (flushWasPending) {
+        bool completedFlush = false;
+        pthread_mutex_lock(&g_audio_control_lock);
+        /* Re-evaluate: FLUSHBUFFERED may have moved the boundary meanwhile. */
+        flushEpoch = stream->flushEpoch;
+        if (stream->flushPending) {
+            int16_t relative =
+                (int16_t)(sequence - stream->flushUntilSequence);
+            if (relative < 0 && timestamp != stream->flushUntilTimestamp) {
+                stream->flushDropCount++;
+                pthread_mutex_unlock(&g_audio_control_lock);
+                return;
+            }
+            stream->flushPending = false;
+            completedFlush = true;
+            droppedForFlush = stream->flushDropCount;
+        }
+        pthread_mutex_unlock(&g_audio_control_lock);
+        if (completedFlush) {
+            printf("[AUDIO] stream=%u flush boundary reached seq=%u ts=%u "
+                   "dropped=%llu\n",
+                   stream->type, sequence, timestamp,
+                   (unsigned long long)droppedForFlush);
+            /* The new epoch may restart the sender's nonce counter; the
+             * key is unchanged, so keep rejecting replays of the old
+             * epoch's (nonce, AAD) pairs. */
+            audio_replay_begin_epoch(stream);
+        }
+    }
+
+    if (deferredWasPending) {
+        bool completedDeferred = false;
+        uint64_t droppedDeferred = 0;
+        pthread_mutex_lock(&g_audio_control_lock);
+        if (stream->deferredFlushPending) {
+            if (audio_deferred_flush_covers(stream, sequence, timestamp)) {
+                stream->deferredFlushDropCount++;
+                pthread_mutex_unlock(&g_audio_control_lock);
+                return;
+            }
+            if (audio_deferred_flush_reached(stream, sequence, timestamp)) {
+                stream->deferredFlushPending = false;
+                completedDeferred = true;
+                droppedDeferred = stream->deferredFlushDropCount;
+            }
+        }
+        pthread_mutex_unlock(&g_audio_control_lock);
+        if (completedDeferred) {
+            printf("[AUDIO] stream=%u deferred flush boundary reached "
+                   "seq=%u ts=%u dropped=%llu\n",
+                   stream->type, sequence, timestamp,
+                   (unsigned long long)droppedDeferred);
+            audio_replay_begin_epoch(stream);
+        }
+    }
+
+    uint64_t replayDrops = 0;
+    if (!audio_replay_accept(stream, nonce + 4, packet + 4, &replayDrops)) {
+        if (replayDrops <= 3 || (replayDrops % 100) == 0)
+            printf("[AUDIO] stream=%u dropped replayed packet #%llu "
+                   "seq=%u\n", stream->type,
+                   (unsigned long long)replayDrops, sequence);
+        return;
+    }
+
     if (stream->haveSequence &&
         sequence != (uint16_t)(stream->lastSequence + 1)) {
         stream->sequenceGaps++;
@@ -3361,14 +5214,98 @@ static void audio_process_rtp_packet(carplay_audio_stream_t *stream,
     stream->lastRtpTimestamp = timestamp;
     stream->lastHostNTP =
         ((uint64_t)hostSeconds << 32) | hostFraction;
-    app_send_audio_packet(stream, sequence, timestamp, encrypted,
-                          (uint32_t)ciphertextLength);
+    /* The epoch is re-checked under g_app_send_lock: a FLUSHBUFFERED that
+     * landed after the decision above drops this packet instead of letting
+     * it reach the AudioQueue after the app's flush. */
+    if (!app_send_audio_packet(stream, flushEpoch, sequence, timestamp,
+                               encrypted, (uint32_t)ciphertextLength)) {
+        pthread_mutex_lock(&g_audio_control_lock);
+        bool superseded = stream->flushEpoch != flushEpoch;
+        pthread_mutex_unlock(&g_audio_control_lock);
+        if (superseded)
+            printf("[AUDIO] stream=%u dropped packet superseded by flush "
+                   "seq=%u ts=%u\n", stream->type, sequence, timestamp);
+    }
     if (stream->packetCount <= 3 ||
         (stream->packetCount % 500) == 0) {
         printf("[AUDIO] stream=%u packet #%llu seq=%u ts=%u bytes=%zu\n",
                stream->type, (unsigned long long)stream->packetCount,
                sequence, timestamp, ciphertextLength);
     }
+}
+
+/* Polling interval of the MainBuffered TCP receiver: how quickly it notices
+ * that its stream was stopped or replaced while no data arrives. */
+#define AUDIO_TCP_POLL_MS 1000
+
+static bool audio_receiver_current(carplay_audio_stream_t *stream,
+                                   uint64_t generation) {
+    return stream->running && stream->generation == generation;
+}
+
+/* Like tcp_read_exact, but a receive timeout only ends the read when the
+ * stream was stopped or replaced: a paused sender legitimately sends nothing
+ * for a long time, and a vanished one is caught by TCP keepalive. */
+static bool audio_tcp_read_exact(carplay_audio_stream_t *stream,
+                                 uint64_t generation, int fd,
+                                 uint8_t *buf, size_t len) {
+    size_t got = 0;
+    while (got < len) {
+        ssize_t n = recv(fd, buf + got, len - got, 0);
+        if (n > 0) {
+            got += (size_t)n;
+            continue;
+        }
+        if (n < 0 && (errno == EINTR || errno == EAGAIN ||
+                      errno == EWOULDBLOCK) &&
+            audio_receiver_current(stream, generation))
+            continue;
+        return false;
+    }
+    return true;
+}
+
+/* Waits for the session iPhone to connect to the MainBuffered listener.
+ * Other LAN hosts are refused, so one cannot take the single sender slot.
+ * Returns -1 when the stream is stopped or the listener fails. */
+static int audio_accept_session_sender(carplay_audio_stream_t *stream,
+                                       uint64_t generation, int dataFd) {
+    while (audio_receiver_current(stream, generation)) {
+        struct pollfd listener = { .fd = dataFd, .events = POLLIN };
+        int ready = poll(&listener, 1, AUDIO_TCP_POLL_MS);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            printf("[AUDIO] stream=%u TCP poll failed: %s\n",
+                   stream->type, strerror(errno));
+            return -1;
+        }
+        if (ready == 0) continue;
+        if (!audio_receiver_current(stream, generation)) break;
+        if (listener.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
+        struct sockaddr_storage peer;
+        socklen_t peerLength = sizeof(peer);
+        int client = accept(dataFd, (struct sockaddr *)&peer, &peerLength);
+        if (client < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK ||
+                errno == ECONNABORTED)
+                continue;
+            printf("[AUDIO] stream=%u TCP accept failed: %s\n",
+                   stream->type, strerror(errno));
+            return -1;
+        }
+        if (!sockaddr_is_session_iphone((struct sockaddr *)&peer,
+                                        peerLength)) {
+            char host[NI_MAXHOST], serv[NI_MAXSERV];
+            sockaddr_to_numeric((struct sockaddr *)&peer, peerLength,
+                                host, sizeof(host), serv, sizeof(serv));
+            printf("[AUDIO] stream=%u rejecting TCP sender %s:%s "
+                   "(not the session iPhone)\n", stream->type, host, serv);
+            close(client);
+            continue;
+        }
+        return client;
+    }
+    return -1;
 }
 
 static void audio_receiver_func(void *arg) {
@@ -3386,21 +5323,43 @@ static void audio_receiver_func(void *arg) {
     app_send_audio_config(stream);
 
     if (context->usesTCP) {
-        int client = accept(dataFd, NULL, NULL);
-        if (client < 0) {
-            printf("[AUDIO] stream=%u TCP accept failed: %s\n",
-                   stream->type, strerror(errno));
-        } else {
+        int client = audio_accept_session_sender(stream, generation, dataFd);
+        if (client >= 0) {
+            /* Publish the connection so stop_audio_receiver can shut it
+             * down; a stop that already happened wins. */
+            pthread_mutex_lock(&g_audio_control_lock);
+            bool current = audio_receiver_current(stream, generation);
+            if (current) stream->tcpClientFd = client;
+            pthread_mutex_unlock(&g_audio_control_lock);
+            if (!current) {
+                close(client);
+                client = -1;
+            }
+        }
+        if (client >= 0) {
             int receiveBuffer = 2 * 1024 * 1024;
             setsockopt(client, SOL_SOCKET, SO_RCVBUF,
                        &receiveBuffer, sizeof(receiveBuffer));
+            struct timeval timeout = { .tv_sec = AUDIO_TCP_POLL_MS / 1000,
+                                       .tv_usec = 0 };
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                       &timeout, sizeof(timeout));
+            /* An iPhone that leaves Wi-Fi never closes the connection. */
+            int yes = 1, idle = 10, interval = 3, count = 3;
+            setsockopt(client, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+            setsockopt(client, IPPROTO_TCP, TCP_KEEPALIVE,
+                       &idle, sizeof(idle));
+            setsockopt(client, IPPROTO_TCP, TCP_KEEPINTVL,
+                       &interval, sizeof(interval));
+            setsockopt(client, IPPROTO_TCP, TCP_KEEPCNT,
+                       &count, sizeof(count));
             printf("[AUDIO] stream=%u TCP sender connected fd=%d\n",
                    stream->type, client);
-            while (stream->running &&
-                   stream->generation == generation) {
+            while (audio_receiver_current(stream, generation)) {
                 uint8_t lengthBytes[2];
-                if (!tcp_read_exact(client, lengthBytes,
-                                    sizeof(lengthBytes))) break;
+                if (!audio_tcp_read_exact(stream, generation, client,
+                                          lengthBytes,
+                                          sizeof(lengthBytes))) break;
                 uint16_t inclusiveLength =
                     ((uint16_t)lengthBytes[0] << 8) | lengthBytes[1];
                 if (inclusiveLength < 2 + 12 + 24) {
@@ -3409,17 +5368,24 @@ static void audio_receiver_func(void *arg) {
                     break;
                 }
                 size_t packetLength = (size_t)inclusiveLength - 2;
-                if (!tcp_read_exact(client, packet, packetLength)) break;
+                if (!audio_tcp_read_exact(stream, generation, client,
+                                          packet, packetLength)) break;
                 if (stream->generation != generation) break;
                 audio_process_rtp_packet(stream, packet, packetLength);
             }
+            pthread_mutex_lock(&g_audio_control_lock);
+            if (stream->tcpClientFd == client) stream->tcpClientFd = -1;
+            pthread_mutex_unlock(&g_audio_control_lock);
             close(client);
         }
     } else {
         while (stream->running &&
                stream->generation == generation) {
-            ssize_t received = recvfrom(dataFd, packet,
-                                        sizeof(packet), 0, NULL, NULL);
+            struct sockaddr_storage from;
+            socklen_t fromLength = sizeof(from);
+            ssize_t received = recvfrom(dataFd, packet, sizeof(packet), 0,
+                                        (struct sockaddr *)&from,
+                                        &fromLength);
             if (received < 0) {
                 if (errno == EINTR || errno == EAGAIN ||
                     errno == EWOULDBLOCK) continue;
@@ -3428,11 +5394,38 @@ static void audio_receiver_func(void *arg) {
                 break;
             }
             if (stream->generation != generation) break;
+            /* The socket is bound to the wildcard address and not
+             * connected: accept datagrams from the session iPhone only. */
+            if (!sockaddr_is_session_iphone((struct sockaddr *)&from,
+                                            fromLength)) {
+                stream->rejectedSenderCount++;
+                if (stream->rejectedSenderCount <= 3 ||
+                    (stream->rejectedSenderCount % 100) == 0) {
+                    char host[NI_MAXHOST], serv[NI_MAXSERV];
+                    sockaddr_to_numeric((struct sockaddr *)&from,
+                                        fromLength, host, sizeof(host),
+                                        serv, sizeof(serv));
+                    printf("[AUDIO] stream=%u ignoring UDP sender %s:%s "
+                           "(not the session iPhone) #%llu\n",
+                           stream->type, host, serv,
+                           (unsigned long long)stream->rejectedSenderCount);
+                }
+                continue;
+            }
             audio_process_rtp_packet(stream, packet, (size_t)received);
         }
     }
     if (stream->generation == generation)
         __sync_bool_compare_and_swap(&stream->running, 1, 0);
+    /* This thread owns the data socket (see dataFdOwnedByThread). If the
+     * stream still holds it (the receiver ended on its own), hand ownership
+     * back so stop_audio_receiver closes it as before; otherwise a stop has
+     * already detached it and only this thread may close it. */
+    pthread_mutex_lock(&g_audio_control_lock);
+    bool stillAttached = stream->dataFd == dataFd;
+    if (stillAttached) stream->dataFdOwnedByThread = false;
+    pthread_mutex_unlock(&g_audio_control_lock);
+    if (!stillAttached) close(dataFd);
     printf("[AUDIO] stream=%u receiver stopped generation=%llu "
            "packets=%llu gaps=%llu decryptErrors=%llu "
            "arrivalGaps=%llu maxArrival=%.1fms\n",
@@ -3459,6 +5452,9 @@ static void start_audio_receiver(carplay_audio_stream_t *stream) {
     context->dataFd = stream->dataFd;
     context->dataPort = stream->dataPort;
     context->usesTCP = stream->usesTCP;
+    pthread_mutex_lock(&g_audio_control_lock);
+    stream->dataFdOwnedByThread = true;
+    pthread_mutex_unlock(&g_audio_control_lock);
     if (!stream->usesTCP) {
         int receiveBuffer = 512 * 1024;
         setsockopt(stream->dataFd, SOL_SOCKET, SO_RCVBUF,
@@ -3474,24 +5470,37 @@ static void start_audio_receiver(carplay_audio_stream_t *stream) {
 static void stop_audio_receiver(carplay_audio_stream_t *stream,
                                 const char *reason) {
     if (!stream) return;
+    pthread_mutex_lock(&g_audio_control_lock);
+    bool hasClient = stream->tcpClientFd >= 0;
+    pthread_mutex_unlock(&g_audio_control_lock);
     bool wasActive =
         stream->running || stream->dataFd >= 0 || stream->controlFd >= 0 ||
-        stream->formatMask != 0;
+        stream->formatMask != 0 || hasClient;
     if (!wasActive) return;
 
     uint64_t oldGeneration = stream->generation;
+    pthread_mutex_lock(&g_audio_control_lock);
     __sync_add_and_fetch(&stream->generation, 1);
     stream->running = 0;
-
+    /* The receiver thread owns and closes the accepted sender connection;
+     * shutting it down here ends its blocking read at once. */
+    if (stream->tcpClientFd >= 0) shutdown(stream->tcpClientFd, SHUT_RDWR);
     int dataFd = stream->dataFd;
-    int controlFd = stream->controlFd;
+    bool threadOwnsData = stream->dataFdOwnedByThread;
+    stream->dataFdOwnedByThread = false;
     stream->dataFd = -1;
-    stream->controlFd = -1;
     stream->dataPort = 0;
+    pthread_mutex_unlock(&g_audio_control_lock);
+
+    int controlFd = stream->controlFd;
+    stream->controlFd = -1;
     stream->controlPort = 0;
     if (dataFd >= 0) {
+        /* A running receiver thread closes its own socket after it sees
+         * the new generation (within one poll/recv timeout); closing it
+         * here would let the next SETUP reuse the fd under that thread. */
         shutdown(dataFd, SHUT_RDWR);
-        close(dataFd);
+        if (!threadOwnsData) close(dataFd);
     }
     if (controlFd >= 0 && controlFd != dataFd) {
         shutdown(controlFd, SHUT_RDWR);
@@ -3501,6 +5510,7 @@ static void stop_audio_receiver(carplay_audio_stream_t *stream,
     stream->formatMask = 0;
     stream->keyValid = false;
     stream->haveSequence = false;
+    audio_replay_reset(stream);
     pthread_mutex_lock(&g_audio_feedback_lock);
     stream->renderedSampleTime = 0;
     stream->renderedHostNTP = 0;
@@ -3566,17 +5576,35 @@ static bool app_send_video_frame(uint64_t timestamp, bool isIDR,
     memcpy(metadata + 48, &decryptMicros, sizeof(decryptMicros));
 
     uint64_t lockStarted = monotonic_nanos_now();
-    if (g_app_send_lock)
-        dispatch_semaphore_wait(g_app_send_lock, DISPATCH_TIME_FOREVER);
+    if (!app_send_lock_acquire()) {
+        /* The connection stays open, so the frames after this one would
+         * reach the decoder without their reference: ask for an IDR. */
+        app_note_send_lock_timeout(MSG_VIDEO_FRAME);
+        return false;
+    }
     uint64_t lockAcquired = monotonic_nanos_now();
     bool success = false;
-    if (!app_ensure_connected()) goto done;
-    success = app_write_all(g_app_sock, header, sizeof(header)) &&
-              app_write_all(g_app_sock, metadata, sizeof(metadata)) &&
-              app_write_all(g_app_sock, bytes, length);
+    uint64_t catchUpDeadline = app_ipc_deadline();
+    if (!app_ensure_connected(catchUpDeadline)) goto done;
+    if (!app_flush_pending_bootstrap(catchUpDeadline)) {
+        app_drop_connection();
+        goto done;
+    }
+    uint64_t deadline = app_ipc_deadline();
+    success = app_write_all(g_app_sock, header, sizeof(header), deadline) &&
+              app_write_all(g_app_sock, metadata, sizeof(metadata),
+                            deadline) &&
+              app_write_all(g_app_sock, bytes, length, deadline);
     if (!success) {
-        close(g_app_sock);
-        g_app_sock = -1;
+        app_drop_connection();
+        g_app_needs_keyframe = true;
+        app_request_keyframe("app IPC write lost video");
+    } else if (isIDR) {
+        g_app_needs_keyframe = false;
+    } else if (g_app_needs_keyframe) {
+        /* Still decoding without the lost reference; repeat the request
+         * (throttled) in case the earlier one was not honoured. */
+        app_request_keyframe("app video chain awaiting keyframe");
     }
 done:
     ;
@@ -3855,12 +5883,26 @@ static void car_video_close_stream(uint32_t streamID) {
     pthread_mutex_unlock(&g_car_video_lock);
 }
 
-static void car_video_read_settings(int fd, encrypted_ctx_t *keys) {
+#define CAR_VIDEO_SETTINGS_ACCEPT_MS 30000
+#define CAR_VIDEO_SETTINGS_IDLE_SEC 5
+
+static void car_video_read_settings(int fd, encrypted_ctx_t *keys,
+                                    unsigned generation) {
     uint8_t data[ENCRYPTED_MAX_READ_SIZE];
     uint8_t header[32];
     size_t headerLength = 0, remaining = 0;
     for (;;) {
         int length = enc_recv_frame(fd, keys, data, sizeof(data));
+        if (length == -2) {
+            /* Idle between records (SO_RCVTIMEO): the sender may sync only
+             * occasionally, so silence is not an error while this channel
+             * is still the current one. */
+            pthread_mutex_lock(&g_car_video_lock);
+            bool current = generation == g_car_video_settings_generation;
+            pthread_mutex_unlock(&g_car_video_lock);
+            if (current) continue;
+            return;
+        }
         if (length <= 0) return;
         size_t offset = 0;
         while (offset < (size_t)length) {
@@ -3899,28 +5941,69 @@ static void car_video_start_settings(int listener, encrypted_ctx_t keys) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         int client = -1;
         /* The worker owns both descriptors. Teardown invalidates the pending
-         * accept and wakes an active read without closing a reused fd. */
-        struct pollfd pending = { .fd = listener, .events = POLLIN };
-        for (unsigned attempt = 0; attempt < 120; attempt++) {
+         * accept and wakes an active read without closing a reused fd.
+         *
+         * The port listens on every interface, so only the session iPhone may
+         * take the channel: anything else is closed and the wait continues
+         * until the original deadline. A wall-clock deadline (not a poll
+         * count) keeps a flood of rejected connects from ending it early. */
+        uint64_t acceptDeadline = monotonic_nanos_now() +
+            (uint64_t)CAR_VIDEO_SETTINGS_ACCEPT_MS * NSEC_PER_MSEC;
+        uint64_t rejected = 0;
+        for (;;) {
+            if (monotonic_nanos_now() >= acceptDeadline) break;
+            struct pollfd pending = { .fd = listener, .events = POLLIN };
             int result = poll(&pending, 1, 250);
             pthread_mutex_lock(&g_car_video_lock);
             bool current = generation == g_car_video_settings_generation;
             pthread_mutex_unlock(&g_car_video_lock);
-            if (!current || result < 0) break;
+            if (!current) break;
+            if (result < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
             if (result == 0) continue;
-            if (pending.revents & POLLIN) client = accept(listener, NULL, NULL);
+            if (!(pending.revents & POLLIN)) break;
+            struct sockaddr_storage peer;
+            socklen_t peerLen = sizeof(peer);
+            int accepted = accept(listener, (struct sockaddr *)&peer, &peerLen);
+            if (accepted < 0) {
+                if (errno == EINTR || errno == ECONNABORTED ||
+                    errno == EAGAIN || errno == EWOULDBLOCK)
+                    continue;
+                break;
+            }
+            if (!sockaddr_is_session_iphone((struct sockaddr *)&peer,
+                                            peerLen)) {
+                if (++rejected % 100 == 1) {
+                    printf("[CARVIDEO] Rejecting settings connection that "
+                           "is not from the session iPhone (%llu so far)\n",
+                           (unsigned long long)rejected);
+                    fflush(stdout);
+                }
+                close(accepted);
+                continue;
+            }
+            client = accepted;
             break;
         }
         close(listener);
         if (client >= 0) {
             int yes = 1;
             setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+            setsockopt(client, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+            /* Bounded reads let the reader notice teardown or a dead peer
+             * even if the wake-up shutdown is missed; see
+             * car_video_read_settings for how an idle period is handled. */
+            struct timeval tv = {
+                .tv_sec = CAR_VIDEO_SETTINGS_IDLE_SEC, .tv_usec = 0 };
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             pthread_mutex_lock(&g_car_video_lock);
             bool current = generation == g_car_video_settings_generation;
             if (current) g_car_video_settings_client = client;
             pthread_mutex_unlock(&g_car_video_lock);
             encrypted_ctx_t context = keys;
-            if (current) car_video_read_settings(client, &context);
+            if (current) car_video_read_settings(client, &context, generation);
             crypto_wipe(&context, sizeof(context));
             pthread_mutex_lock(&g_car_video_lock);
             if (g_car_video_settings_client == client) g_car_video_settings_client = -1;
@@ -3939,9 +6022,12 @@ static NSDictionary *car_video_setup_stream(NSDictionary *stream) {
     if ([uuid isEqualToString:@"BB493F61-A6B8-4769-8D74-80C23A9F71C4"]) {
         NSNumber *seed = stream[@"seed"];
         encrypted_ctx_t keys = {0};
-        if (![seed isKindOfClass:[NSNumber class]] ||
-            pair_derive_data_stream_keys(g_pair, seed.unsignedLongLongValue,
-                                        keys.readKey, keys.writeKey) != 0) return nil;
+        if (![seed isKindOfClass:[NSNumber class]]) return nil;
+        pthread_mutex_lock(&g_pair_lock);
+        int derived = pair_derive_data_stream_keys(
+            g_pair, seed.unsignedLongLongValue, keys.readKey, keys.writeKey);
+        pthread_mutex_unlock(&g_pair_lock);
+        if (derived != 0) return nil;
         uint16_t port = 0;
         int listener = bind_screen_tcp_port(&port, g_iphone_family);
         if (listener < 0) {
@@ -4012,9 +6098,11 @@ static void car_video_send_reply(NSData *body) {
                                      "videoPlayback", "player response", streamID);
 }
 
-/* ── Touch reader thread — reads touch events from iPadPlay app via IPC ── */
-static bool g_touch_reader_running = false;
-
+/* ── Touch reader thread — reads touch events from iPadPlay app via IPC ──
+ * Every app connection gets its own reader on its own dup() of the socket,
+ * so a reader still blocked in an event-channel send cannot keep the next
+ * connection unread, and its fd number cannot be reused under it.
+ * app_drop_connection shuts the socket down; the reader closes its copy. */
 static void touch_reader_func(void *arg) {
     int fd = (int)(intptr_t)arg;
     printf("[TOUCH] Reader started on fd=%d\n", fd);
@@ -4151,6 +6239,22 @@ static void touch_reader_func(void *arg) {
                 printf("[SCREEN] Renderer requested a fresh screen stream\n");
                 send_force_key_frame_command("decoder/stale-chain recovery");
             }
+        } else if (type == MSG_AUDIO_RESYNC && len == 4) {
+            uint8_t streamBytes[4];
+            if (!tcp_read_exact(fd, streamBytes, sizeof(streamBytes))) break;
+            uint32_t streamType = 0;
+            memcpy(&streamType, streamBytes, sizeof(streamType));
+            carplay_audio_stream_t *audio = audio_stream_for_type(streamType);
+            /* The app repeats this while packets keep arriving without a
+             * player; one re-send in flight is enough. Sent off this reader
+             * thread, which must keep draining the socket. */
+            if (audio && audio->running && !audio->appConfigPending) {
+                printf("[AUDIO] app has no player for stream=%u; "
+                       "re-sending config\n", streamType);
+                dispatch_async(dispatch_get_global_queue(0, 0), ^{
+                    app_send_audio_config(audio);
+                });
+            }
         } else if (type == MSG_AUDIO_RENDER && len == 20) {
             uint8_t payload[20];
             if (!tcp_read_exact(fd, payload, sizeof(payload))) break;
@@ -4193,42 +6297,112 @@ static void touch_reader_func(void *arg) {
         }
     }
 
-    printf("[TOUCH] Reader exiting (%d events processed)\n", touchCount);
+    printf("[TOUCH] Reader exiting on fd=%d (%d events processed)\n",
+           fd, touchCount);
     fflush(stdout);
-    g_touch_reader_running = false;
+    close(fd);
 }
 
-static void start_touch_reader(int fd) {
-    if (g_touch_reader_running) return;
-    g_touch_reader_running = true;
-    intptr_t fdArg = fd;
+static bool start_touch_reader(int fd) {
+    int readerFd = dup(fd);
+    if (readerFd < 0) {
+        int dupErrno = errno;
+        printf("[TOUCH] dup(fd=%d) failed: %s; touch reader not started\n",
+               fd, strerror(dupErrno));
+        fflush(stdout);
+        errno = dupErrno;
+        return false;
+    }
+    intptr_t fdArg = readerFd;
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
         touch_reader_func((void *)fdArg);
     });
+    return true;
+}
+
+static bool screen_generation_is_current(uint32_t generation) {
+    pthread_mutex_lock(&g_screen_lock);
+    bool current = g_screen_generation == generation;
+    pthread_mutex_unlock(&g_screen_lock);
+    return current;
 }
 
 static void *screen_thread_func(void *arg) {
     (void)arg;
+    pthread_mutex_lock(&g_screen_lock);
     int listenFd = g_screen_listen_fd;
+    uint32_t generation = g_screen_generation;
+    g_screen_thread_listen_fd = listenFd;
+    pthread_mutex_unlock(&g_screen_lock);
     printf("[SCREEN] Waiting for iPhone to connect on port %u (fd=%d)...\n",
            g_screen_data_port, listenFd);
     fflush(stdout);
 
+    /* Poll instead of blocking in accept() so TEARDOWN or a replacement
+     * SETUP (a new generation) and a sender that never connects all release
+     * this thread; otherwise every later screen stream would queue behind it. */
     struct sockaddr_storage peer;
     socklen_t peerLen = sizeof(peer);
-    int clientFd = accept(listenFd, (struct sockaddr *)&peer, &peerLen);
+    int clientFd = -1;
+    uint64_t acceptDeadline = monotonic_nanos_now() +
+        (uint64_t)SCREEN_ACCEPT_TIMEOUT_SECONDS * NSEC_PER_SEC;
+    uint64_t rejected = 0;
+    while (listenFd >= 0) {
+        if (!screen_generation_is_current(generation)) {
+            printf("[SCREEN] Listener superseded before the iPhone connected\n");
+            break;
+        }
+        if (monotonic_nanos_now() >= acceptDeadline) {
+            printf("[SCREEN] ERROR: iPhone did not connect within %d s\n",
+                   SCREEN_ACCEPT_TIMEOUT_SECONDS);
+            break;
+        }
+        struct pollfd pending = { .fd = listenFd, .events = POLLIN };
+        int ready = poll(&pending, 1, 250);
+        if (ready < 0 && errno != EINTR) {
+            printf("[SCREEN] ERROR: poll failed: %s\n", strerror(errno));
+            break;
+        }
+        if (ready <= 0) continue;
+        peerLen = sizeof(peer);
+        int accepted = accept(listenFd, (struct sockaddr *)&peer, &peerLen);
+        if (accepted < 0) {
+            if (errno == EINTR || errno == ECONNABORTED ||
+                errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
+            printf("[SCREEN] ERROR: accept failed: %s\n", strerror(errno));
+            break;
+        }
+        if (!sockaddr_is_session_iphone((struct sockaddr *)&peer, peerLen)) {
+            if (++rejected % 100 == 1) {
+                printf("[SCREEN] Rejecting connection that is not from the "
+                       "session iPhone (%llu so far)\n",
+                       (unsigned long long)rejected);
+                fflush(stdout);
+            }
+            close(accepted);
+            continue;
+        }
+        clientFd = accepted;
+        break;
+    }
+    fflush(stdout);
+
+    pthread_mutex_lock(&g_screen_lock);
+    if (listenFd >= 0) close(listenFd);
+    if (g_screen_listen_fd == listenFd)
+        g_screen_listen_fd = -1;
+    g_screen_thread_listen_fd = -1;
+    if (clientFd >= 0 && g_screen_generation != generation) {
+        close(clientFd);
+        clientFd = -1;
+    }
+    if (clientFd >= 0) g_screen_client_fd = clientFd;
+    pthread_mutex_unlock(&g_screen_lock);
     if (clientFd < 0) {
-        printf("[SCREEN] ERROR: accept failed: %s\n", strerror(errno));
-        fflush(stdout);
-        close(listenFd);
-        if (g_screen_listen_fd == listenFd)
-            g_screen_listen_fd = -1;
         __sync_lock_release(&g_screen_thread_running);
         return NULL;
     }
-    close(listenFd);
-    if (g_screen_listen_fd == listenFd)
-        g_screen_listen_fd = -1;
 
     char peerIP[NI_MAXHOST] = {0};
     char peerPort[NI_MAXSERV] = {0};
@@ -4298,11 +6472,33 @@ static void *screen_thread_func(void *arg) {
         uint32_t bodySize = header[0] | (header[1] << 8) | (header[2] << 8*2) | (header[3] << 8*3);
         uint8_t opcode = header[4];
 
+        /*
+         * Bound the length before it is used for arithmetic. bodySize is a
+         * 32-bit plaintext field, so `bodySize + 4096` used to wrap for
+         * anything at or above 0xFFFFF000: the buffer was reallocated to a
+         * few kilobytes (or zero) and the next read then filled it with up
+         * to 4 GiB of socket data. Rejecting the frame here keeps the growth
+         * arithmetic and the later `8 + bodySize` message length in range.
+         */
+        if (bodySize > SCREEN_MAX_BODY_BYTES) {
+            printf("[SCREEN] Rejecting oversized body: %u bytes (max %u)\n",
+                   bodySize, SCREEN_MAX_BODY_BYTES);
+            fflush(stdout);
+            break;
+        }
+
         /* Ensure body buffer is big enough */
         if (bodySize > 0) {
             if (bodySize > bodyAlloc) {
-                bodyAlloc = bodySize + 4096;
-                body = realloc(body, bodyAlloc);
+                size_t grown = (size_t)bodySize + 4096;
+                uint8_t *resized = realloc(body, grown);
+                if (!resized) {
+                    printf("[SCREEN] ERROR: body realloc %zu failed\n", grown);
+                    fflush(stdout);
+                    break;
+                }
+                body = resized;
+                bodyAlloc = grown;
             }
             if (!screen_read_exact(clientFd, body, bodySize, "body")) {
                 printf("[SCREEN] Connection closed (body read, expected %u)\n", bodySize);
@@ -4337,6 +6533,11 @@ static void *screen_thread_func(void *arg) {
                 /* Send config to iPadPlay app: [float width][float height][AVCC] */
                 uint32_t msgLen = 8 + bodySize;
                 uint8_t *msg = malloc(msgLen);
+                if (!msg) {
+                    printf("[SCREEN] ERROR: VideoConfig alloc %u failed\n", msgLen);
+                    fflush(stdout);
+                    break;
+                }
                 memcpy(msg, &width, 4);
                 memcpy(msg + 4, &height, 4);
                 memcpy(msg + 8, body, bodySize);
@@ -4516,11 +6717,9 @@ static void *screen_thread_func(void *arg) {
                                                       length:plistLength];
                     dispatch_async(statsQueue, ^{
                         @autoreleasepool {
-                            id stats = [NSPropertyListSerialization
-                                propertyListWithData:snapshot
-                                             options:NSPropertyListImmutable
-                                              format:NULL
-                                               error:NULL];
+                            id stats = network_plist_parse(
+                                snapshot.bytes, snapshot.length,
+                                NETWORK_PLIST_MAX_DEPTH);
                             if (stats)
                                 printf("[SCREEN] Sender performance: %s\n",
                                        [[stats description] UTF8String]);
@@ -4550,9 +6749,33 @@ static void *screen_thread_func(void *arg) {
            msgCount, videoFrameCount, totalBytes);
     fflush(stdout);
     free(body);
+    /* Clear the shared descriptor before closing so screen_stream_stop can
+     * never shut down a number that has been reused. */
+    pthread_mutex_lock(&g_screen_lock);
+    if (g_screen_client_fd == clientFd) g_screen_client_fd = -1;
+    pthread_mutex_unlock(&g_screen_lock);
     close(clientFd);
     __sync_lock_release(&g_screen_thread_running);
     return NULL;
+}
+
+/* Ends the current screen stream (connected or still listening) so TEARDOWN
+ * of type 110 or a replacement SETUP never leaves a thread holding it. */
+static void screen_stream_stop(const char *reason) {
+    pthread_mutex_lock(&g_screen_lock);
+    g_screen_generation++;
+    if (g_screen_client_fd >= 0) {
+        printf("[SCREEN] Stopping stream (%s)\n", reason);
+        shutdown(g_screen_client_fd, SHUT_RDWR);
+    }
+    /* A listener no thread has taken yet belongs to nobody else. */
+    if (g_screen_listen_fd >= 0 &&
+        g_screen_listen_fd != g_screen_thread_listen_fd) {
+        close(g_screen_listen_fd);
+        g_screen_listen_fd = -1;
+    }
+    pthread_mutex_unlock(&g_screen_lock);
+    fflush(stdout);
 }
 
 static void start_screen_thread(void) {
@@ -4596,6 +6819,7 @@ static ssize_t send_timing_request(int fd,
     packet[29] = (fraction >> 16) & 0xFF;
     packet[30] = (fraction >> 8) & 0xFF;
     packet[31] = fraction & 0xFF;
+    timing_remember_request(packet + 24);
     return sendto(fd, packet, sizeof(packet), 0,
                   destination, destinationLength);
 }
@@ -4647,6 +6871,7 @@ static bool timing_negotiate_blocking(void) {
     g_timing_best_rtt = DBL_MAX;
     g_timing_remote_minus_local = 0.0;
     g_timing_offset_valid = 0;
+    g_timing_samples_reset = 1;
     app_send_video_timing();
 
     /* Send 5 NTP requests with 100ms spacing, then wait for responses */
@@ -4706,6 +6931,65 @@ static bool timing_negotiate_blocking(void) {
     return (g_timing_sync_count >= 3);
 }
 
+/* Ports opened for stream types this receiver does not process (and a type
+ * 130 SETUP that the car video path declined). Nothing reads them, but the
+ * sender is given their numbers, so they stay open until the stream or the
+ * session is torn down or the same type is set up again. */
+#define AUX_STREAM_SLOTS 8
+typedef struct {
+    bool used;
+    int type;
+    int dataFd;
+    int ctrlFd;
+} aux_stream_fds_t;
+static pthread_mutex_t g_aux_streams_lock = PTHREAD_MUTEX_INITIALIZER;
+static aux_stream_fds_t g_aux_streams[AUX_STREAM_SLOTS];
+static unsigned g_aux_streams_next = 0;
+
+static void aux_stream_close_slot_locked(aux_stream_fds_t *slot) {
+    if (!slot->used) return;
+    if (slot->dataFd >= 0) close(slot->dataFd);
+    if (slot->ctrlFd >= 0) close(slot->ctrlFd);
+    printf("[NET] auxiliary stream=%d closed (data fd=%d control fd=%d)\n",
+           slot->type, slot->dataFd, slot->ctrlFd);
+    slot->used = false;
+    slot->dataFd = -1;
+    slot->ctrlFd = -1;
+}
+
+/* Closes the auxiliary ports of one stream type, or of every type when
+ * allTypes is set. */
+static void aux_stream_close(int type, bool allTypes) {
+    pthread_mutex_lock(&g_aux_streams_lock);
+    for (size_t i = 0; i < AUX_STREAM_SLOTS; i++) {
+        if (g_aux_streams[i].used &&
+            (allTypes || g_aux_streams[i].type == type))
+            aux_stream_close_slot_locked(&g_aux_streams[i]);
+    }
+    pthread_mutex_unlock(&g_aux_streams_lock);
+}
+
+static void aux_stream_remember(int type, int dataFd, int ctrlFd) {
+    if (dataFd < 0 && ctrlFd < 0) return;
+    pthread_mutex_lock(&g_aux_streams_lock);
+    aux_stream_fds_t *slot = NULL;
+    for (size_t i = 0; i < AUX_STREAM_SLOTS; i++) {
+        if (g_aux_streams[i].used && g_aux_streams[i].type == type)
+            aux_stream_close_slot_locked(&g_aux_streams[i]);
+        if (!slot && !g_aux_streams[i].used) slot = &g_aux_streams[i];
+    }
+    if (!slot) {
+        slot = &g_aux_streams[g_aux_streams_next % AUX_STREAM_SLOTS];
+        g_aux_streams_next++;
+        aux_stream_close_slot_locked(slot);
+    }
+    slot->used = true;
+    slot->type = type;
+    slot->dataFd = dataFd;
+    slot->ctrlFd = ctrlFd;
+    pthread_mutex_unlock(&g_aux_streams_lock);
+}
+
 static void handle_rtsp_setup(int sock, const HTTPReq *r) {
     printf("[AP] -> SETUP %s (CSeq=%d, bodyLen=%zu)\n",
            r->path, r->cseq, r->bodyLen);
@@ -4713,11 +6997,8 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
     NSDictionary *reqDict = nil;
     if (r->body && r->bodyLen > 0) {
         @autoreleasepool {
-            NSData *d = [NSData dataWithBytesNoCopy:(void *)r->body
-                                             length:r->bodyLen
-                                       freeWhenDone:NO];
-            id obj = [NSPropertyListSerialization
-                propertyListWithData:d options:0 format:NULL error:NULL];
+            id obj = network_plist_parse(r->body, r->bodyLen,
+                                         NETWORK_PLIST_MAX_DEPTH);
             if ([obj isKindOfClass:[NSDictionary class]]) {
                 reqDict = (NSDictionary *)obj;
             }
@@ -4738,7 +7019,7 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
             printf("[AP] SETUP: initial session setup (no streams)\n");
 
             /* Extract iPhone's timing port from request */
-            NSNumber *iphoneTimingPort = reqDict[@"timingPort"];
+            NSNumber *iphoneTimingPort = plist_number(reqDict[@"timingPort"]);
             if (iphoneTimingPort) {
                 g_iphone_timing_port = [iphoneTimingPort unsignedShortValue];
                 printf("[AP] iPhone's timing port: %u\n", g_iphone_timing_port);
@@ -4808,7 +7089,7 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
             }
 
             /* iPhone sent keepAliveLowPower=1 */
-            if ([reqDict[@"keepAliveLowPower"] boolValue]) {
+            if ([plist_number(reqDict[@"keepAliveLowPower"]) boolValue]) {
                 respDict[@"keepAlivePort"] = @(g_keepalive_port);
             }
 
@@ -4846,12 +7127,13 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
                 /* Screen is H.264/TCP. CarPlay audio types 100/101/102 are
                  * encrypted RTP/UDP and are handled by dedicated receivers. */
                 if (type == 110) {
+                    screen_stream_stop("replaced by a new SETUP");
                     dataFd = bind_screen_tcp_port(&dataPort, g_iphone_family);
                     printf("[NET] screen/video dataPort=%u fd=%d family=%s\n",
                            dataPort, dataFd,
                            addr_family_name(socket_bound_family(dataFd)));
 
-                    NSNumber *latency = stream[@"latencyMs"];
+                    NSNumber *latency = plist_number(stream[@"latencyMs"]);
                     if (latency) {
                         uint32_t requestedLatency =
                             (uint32_t)[latency unsignedIntValue];
@@ -4865,17 +7147,23 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
                     app_send_video_timing();
 
                     /* Save screen stream state for screen thread */
+                    pthread_mutex_lock(&g_screen_lock);
                     g_screen_listen_fd = dataFd;
+                    pthread_mutex_unlock(&g_screen_lock);
                     g_screen_data_port = dataPort;
 
                     /* Get streamConnectionID for key derivation */
-                    NSNumber *connID = stream[@"streamConnectionID"];
+                    NSNumber *connID = plist_number(stream[@"streamConnectionID"]);
                     if (connID) {
                         g_screen_conn_id = [connID unsignedLongLongValue];
                         printf("[AP] Screen streamConnectionID: %llu\n", g_screen_conn_id);
 
                         /* Derive ChaCha20-Poly1305 key via pair context */
-                        if (pair_derive_stream_key(g_pair, g_screen_conn_id, g_screen_key) == 0) {
+                        pthread_mutex_lock(&g_pair_lock);
+                        int derived = pair_derive_stream_key(
+                            g_pair, g_screen_conn_id, g_screen_key);
+                        pthread_mutex_unlock(&g_pair_lock);
+                        if (derived == 0) {
                             g_screen_key_valid = true;
                             printf("[AP] Screen decryption key ready\n");
                         }
@@ -4914,11 +7202,16 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
                         audio->maxArrivalGapNanos = 0;
                         audio->longArrivalGaps = 0;
                         audio->haveSequence = false;
+                        audio_replay_reset(audio);
+                        audio->rejectedSenderCount = 0;
                         pthread_mutex_lock(&g_audio_control_lock);
                         audio->flushPending = false;
                         audio->flushUntilSequence = 0;
                         audio->flushUntilTimestamp = 0;
                         audio->flushDropCount = 0;
+                        audio->deferredFlushPending = false;
+                        audio->deferredFlushChecked = false;
+                        audio->deferredFlushDropCount = 0;
                         pthread_mutex_unlock(&g_audio_control_lock);
                         pthread_mutex_lock(&g_audio_feedback_lock);
                         audio->renderedSampleTime = 0;
@@ -4928,10 +7221,10 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
                         pthread_mutex_unlock(&g_audio_feedback_lock);
 
                         NSNumber *connectionID =
-                            stream[@"streamConnectionID"];
+                            plist_number(stream[@"streamConnectionID"]);
                         audio->connectionID = connectionID
                             ? connectionID.unsignedLongLongValue : 0;
-                        NSNumber *format = stream[@"audioFormat"];
+                        NSNumber *format = plist_number(stream[@"audioFormat"]);
                         if (format) {
                             audio->formatMask =
                                 format.unsignedLongLongValue;
@@ -4939,12 +7232,12 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
                             /* SDK fallback: uncompressed stereo output. */
                             audio->formatMask = 0x00008000ULL;
                         }
-                        NSNumber *samplesPerFrame = stream[@"spf"];
+                        NSNumber *samplesPerFrame = plist_number(stream[@"spf"]);
                         audio->framesPerPacket = samplesPerFrame
                             ? samplesPerFrame.unsignedIntValue
                             : audio_default_frames_per_packet(
                                   audio->formatMask);
-                        NSNumber *audioLatency = stream[@"audioLatencyMs"];
+                        NSNumber *audioLatency = plist_number(stream[@"audioLatencyMs"]);
                         audio->latencyMs = audioLatency
                             ? audioLatency.unsignedIntValue : 100;
                         /* MainBuffered carries its own 32-byte key in the
@@ -4962,30 +7255,33 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
                             printf("[AUDIO] stream=%d key supplied in SETUP "
                                    "(shk, %u bytes)\n", type,
                                    (unsigned)sharedKey.length);
-                        } else if (audio->connectionID &&
-                                   pair_derive_stream_key(
-                                       g_pair, audio->connectionID,
-                                       audio->key) == 0) {
-                            audio->keyValid = true;
-                            printf("[AUDIO] stream=%d key derived from "
-                                   "connID\n", type);
+                        } else if (audio->connectionID) {
+                            pthread_mutex_lock(&g_pair_lock);
+                            int derived = pair_derive_stream_key(
+                                g_pair, audio->connectionID, audio->key);
+                            pthread_mutex_unlock(&g_pair_lock);
+                            if (derived == 0) {
+                                audio->keyValid = true;
+                                printf("[AUDIO] stream=%d key derived from "
+                                       "connID\n", type);
+                            }
                         }
 
                         /* Recorded for the renderer and for diagnosis: the
                          * compression type and mode select the decoder, and
                          * clientID identifies which app is playing. */
-                        NSNumber *compression = stream[@"ct"];
-                        NSString *audioMode = stream[@"audioMode"];
-                        NSString *audioTypeStr = stream[@"audioType"];
-                        NSString *clientID = stream[@"clientID"];
+                        NSNumber *compression = plist_number(stream[@"ct"]);
+                        NSString *audioMode = plist_string(stream[@"audioMode"]);
+                        NSString *audioTypeStr = plist_string(stream[@"audioType"]);
+                        NSString *clientID = plist_string(stream[@"clientID"]);
                         printf("[AUDIO] stream=%d ct=%s mode=%s audioType=%s "
                                "client=%s formatIndex=%s\n", type,
                                compression ? compression.stringValue.UTF8String : "-",
                                audioMode ? audioMode.UTF8String : "-",
                                audioTypeStr ? audioTypeStr.UTF8String : "-",
                                clientID ? clientID.UTF8String : "-",
-                               stream[@"audioFormatIndex"]
-                                   ? [stream[@"audioFormatIndex"] stringValue].UTF8String
+                               plist_number(stream[@"audioFormatIndex"])
+                                   ? [plist_number(stream[@"audioFormatIndex"]) stringValue].UTF8String
                                    : "-");
                         if (audio->connectionID)
                             rs[@"streamConnectionID"] =
@@ -5031,11 +7327,12 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
                     uint16_t ctrlPort = 0;
                     int ctrlFd = bind_udp_port(&ctrlPort);
                     rs[@"controlPort"] = @(ctrlPort);
-                    /* Keep control fd alive — just log for now */
+                    /* Keep control fd alive until this stream is torn down */
                     if (ctrlFd >= 0) {
                         printf("[AP] SETUP stream type=%d controlPort=%u (fd=%d, kept open, dual-stack when available)\n",
                                type, ctrlPort, ctrlFd);
                     }
+                    aux_stream_remember(type, dataFd, ctrlFd);
                 }
 
                 printf("[AP] SETUP stream type=%d → dataPort=%u (fd=%d, kept open)\n",
@@ -5130,11 +7427,8 @@ static void handle_teardown(int sock, const HTTPReq *r) {
     bool hadStreamTargets = false;
     if (r->body && r->bodyLen > 0) {
         @autoreleasepool {
-            NSData *d = [NSData dataWithBytesNoCopy:(void *)r->body
-                                             length:r->bodyLen
-                                       freeWhenDone:NO];
-            id obj = [NSPropertyListSerialization
-                propertyListWithData:d options:0 format:NULL error:NULL];
+            id obj = network_plist_parse(r->body, r->bodyLen,
+                                         NETWORK_PLIST_MAX_DEPTH);
             if (obj) {
                 if ([obj isKindOfClass:[NSDictionary class]]) {
                     NSArray *streams = obj[@"streams"];
@@ -5146,6 +7440,10 @@ static void handle_teardown(int sock, const HTTPReq *r) {
                                     [NSDictionary class]]) continue;
                             NSNumber *type = entry[@"type"];
                             if (![type isKindOfClass:[NSNumber class]]) continue;
+                            if (type.intValue == 110) {
+                                screen_stream_stop("sender stream TEARDOWN");
+                                continue;
+                            }
                             if (type.intValue == 130 && atomic_load(&g_car_video_negotiated)) {
                                 NSNumber *streamID = entry[@"streamID"];
                                 if ([streamID isKindOfClass:[NSNumber class]] &&
@@ -5159,6 +7457,8 @@ static void handle_teardown(int sock, const HTTPReq *r) {
                             if (audio)
                                 stop_audio_receiver(
                                     audio, "sender stream TEARDOWN");
+                            else
+                                aux_stream_close(type.intValue, false);
                         }
                     }
                 }
@@ -5179,6 +7479,7 @@ static void handle_teardown(int sock, const HTTPReq *r) {
             stop_audio_receiver(
                 &g_audio_streams[index], "full session TEARDOWN");
         }
+        aux_stream_close(0, true);
     }
 
     send_response(sock, "RTSP/1.0", 200, "OK", NULL, NULL, 0, r->cseq);
@@ -5191,17 +7492,14 @@ static void handle_setrate(int sock, const HTTPReq *r) {
     @autoreleasepool {
         NSDictionary *request = nil;
         if (r->body && r->bodyLen > 0) {
-            NSData *data = [NSData dataWithBytesNoCopy:(void *)r->body
-                                                length:r->bodyLen
-                                          freeWhenDone:NO];
-            id object = [NSPropertyListSerialization
-                propertyListWithData:data options:0 format:NULL error:NULL];
+            id object = network_plist_parse(r->body, r->bodyLen,
+                                         NETWORK_PLIST_MAX_DEPTH);
             if ([object isKindOfClass:[NSDictionary class]])
                 request = object;
         }
 
-        NSNumber *rtpTime = request[@"rtpTime"];
-        NSNumber *rate = request[@"rate"];
+        NSNumber *rtpTime = plist_number(request[@"rtpTime"]);
+        NSNumber *rate = plist_number(request[@"rate"]);
         if (!rtpTime || !rate) {
             printf("[AUDIO] SETRATE missing rtpTime/rate\n");
             send_response(sock, "RTSP/1.0", 400, "Bad Request",
@@ -5251,16 +7549,13 @@ static void handle_setrate_anchor_time(int sock, const HTTPReq *r) {
     @autoreleasepool {
         NSDictionary *request = nil;
         if (r->body && r->bodyLen > 0) {
-            NSData *data = [NSData dataWithBytesNoCopy:(void *)r->body
-                                                length:r->bodyLen
-                                          freeWhenDone:NO];
-            id object = [NSPropertyListSerialization
-                propertyListWithData:data options:0 format:NULL error:NULL];
+            id object = network_plist_parse(r->body, r->bodyLen,
+                                         NETWORK_PLIST_MAX_DEPTH);
             if ([object isKindOfClass:[NSDictionary class]])
                 request = object;
         }
 
-        NSNumber *rate = request[@"rate"];
+        NSNumber *rate = plist_number(request[@"rate"]);
         if (!rate) {
             printf("[AUDIO] SETRATEANCHORTIME missing rate\n");
             send_response(sock, "RTSP/1.0", 400, "Bad Request",
@@ -5280,55 +7575,135 @@ static void handle_setrate_anchor_time(int sock, const HTTPReq *r) {
     }
 }
 
+typedef struct {
+    carplay_audio_stream_t *stream;
+    uint16_t untilSequence;
+    uint32_t untilTimestamp;
+    bool applied;
+} audio_flush_request_t;
+
+/* app_send_guard_fn for FLUSHBUFFERED: starts the new flush epoch. */
+static bool audio_flush_apply(void *context) {
+    audio_flush_request_t *flush = context;
+    flush->applied = true;
+    carplay_audio_stream_t *audio = flush->stream;
+    if (!audio) return true;
+    pthread_mutex_lock(&g_audio_control_lock);
+    audio->flushPending = true;
+    audio->flushUntilSequence = flush->untilSequence;
+    audio->flushUntilTimestamp = flush->untilTimestamp;
+    audio->flushDropCount = 0;
+    /* An immediate flush supersedes any deferred one. */
+    audio->deferredFlushPending = false;
+    audio->flushEpoch++;
+    pthread_mutex_unlock(&g_audio_control_lock);
+    return true;
+}
+
+/* Immediate flush: resets the app's AudioQueue and drops the old epoch
+ * until untilSequence/untilTimestamp. Callable from the RTSP handler and the
+ * audio receiver thread. */
+static void audio_flush_app_until(carplay_audio_stream_t *audio,
+                                  uint16_t untilSequence,
+                                  uint32_t untilTimestamp) {
+    audio_flush_request_t flush = {
+        .stream = audio,
+        .untilSequence = untilSequence,
+        .untilTimestamp = untilTimestamp,
+        .applied = false,
+    };
+    if (audio) {
+        /* Old render coordinates no longer describe the media epoch. */
+        pthread_mutex_lock(&g_audio_feedback_lock);
+        audio->renderedSampleTime = 0;
+        audio->renderedHostNTP = 0;
+        audio->renderedHostRawNanos = 0;
+        audio->renderUpdateCount = 0;
+        pthread_mutex_unlock(&g_audio_feedback_lock);
+    }
+
+    /* The new boundary and epoch are published under g_app_send_lock,
+     * in the same critical section that writes the FLUSH, so every
+     * audio packet the app receives is ordered against its reset. */
+    uint8_t payload[5] = {0};
+    uint32_t streamType = 103;
+    memcpy(payload, &streamType, 4);
+    payload[4] = AUDIO_CONTROL_FLUSH;
+    bool sent = app_send_msg_guarded(MSG_AUDIO_CONTROL, payload,
+                                     sizeof(payload),
+                                     audio_flush_apply, &flush);
+    /* If the send lock timed out the FLUSH never reached the app, but
+     * the stale epoch must still be dropped from now on. */
+    if (!flush.applied) audio_flush_apply(&flush);
+    printf("[AUDIO] control stream=%u action=%u app=%s\n",
+           streamType, (unsigned)AUDIO_CONTROL_FLUSH,
+           sent ? "sent" : "failed");
+}
+
 static void handle_flush_buffered(int sock, const HTTPReq *r) {
     @autoreleasepool {
         NSDictionary *request = nil;
         if (r->body && r->bodyLen > 0) {
-            NSData *data = [NSData dataWithBytesNoCopy:(void *)r->body
-                                                length:r->bodyLen
-                                          freeWhenDone:NO];
-            id object = [NSPropertyListSerialization
-                propertyListWithData:data options:0 format:NULL error:NULL];
+            id object = network_plist_parse(r->body, r->bodyLen,
+                                         NETWORK_PLIST_MAX_DEPTH);
             if ([object isKindOfClass:[NSDictionary class]])
                 request = object;
         }
 
-        NSNumber *flushUntilSeq = request[@"flushUntilSeq"];
-        NSNumber *flushUntilTS = request[@"flushUntilTS"];
+        NSNumber *flushUntilSeq = plist_number(request[@"flushUntilSeq"]);
+        NSNumber *flushUntilTS = plist_number(request[@"flushUntilTS"]);
         if (!flushUntilSeq || !flushUntilTS) {
             printf("[AUDIO] FLUSHBUFFERED missing sequence/timestamp\n");
             send_response(sock, "RTSP/1.0", 400, "Bad Request",
                           NULL, NULL, 0, r->cseq);
             return;
         }
+        /* Optional: a deferred flush that starts at a future packet. */
+        NSNumber *flushFromSeq = plist_number(request[@"flushFromSeq"]);
+        NSNumber *flushFromTS = plist_number(request[@"flushFromTS"]);
 
         carplay_audio_stream_t *audio = audio_stream_for_type(103);
         uint64_t extendedSequence =
             flushUntilSeq.unsignedLongLongValue;
         uint32_t timestamp = flushUntilTS.unsignedIntValue;
-        if (audio) {
-            pthread_mutex_lock(&g_audio_control_lock);
-            audio->flushPending = true;
-            audio->flushUntilSequence =
-                (uint16_t)(extendedSequence & 0xffff);
-            audio->flushUntilTimestamp = timestamp;
-            audio->flushDropCount = 0;
-            pthread_mutex_unlock(&g_audio_control_lock);
+        uint16_t untilSequence = (uint16_t)(extendedSequence & 0xffff);
 
-            /* Old render coordinates no longer describe the media epoch. */
-            pthread_mutex_lock(&g_audio_feedback_lock);
-            audio->renderedSampleTime = 0;
-            audio->renderedHostNTP = 0;
-            audio->renderedHostRawNanos = 0;
-            audio->renderUpdateCount = 0;
-            pthread_mutex_unlock(&g_audio_feedback_lock);
+        if (flushFromSeq) {
+            uint64_t extendedFrom = flushFromSeq.unsignedLongLongValue;
+            uint16_t fromSequence = (uint16_t)(extendedFrom & 0xffff);
+            printf("[AUDIO] FLUSHBUFFERED fromSeq=%llu (rtp=%u) fromTS=%s "
+                   "untilSeq=%llu (rtp=%u) untilTS=%u\n",
+                   (unsigned long long)extendedFrom, (unsigned)fromSequence,
+                   flushFromTS ? flushFromTS.stringValue.UTF8String : "-",
+                   (unsigned long long)extendedSequence,
+                   (unsigned)untilSequence, timestamp);
+            /* A range that does not run forward has nothing to defer;
+             * treat it as the immediate flush below. */
+            if ((int16_t)(untilSequence - fromSequence) > 0) {
+                if (audio) {
+                    /* Packets before "from" keep playing and the app's
+                     * queue is not reset; the receiver drops
+                     * [from, until) as it arrives. */
+                    pthread_mutex_lock(&g_audio_control_lock);
+                    audio->deferredFlushPending = true;
+                    audio->deferredFlushChecked = false;
+                    audio->deferredFlushFromSequence = fromSequence;
+                    audio->deferredFlushUntilSequence = untilSequence;
+                    audio->deferredFlushUntilTimestamp = timestamp;
+                    audio->deferredFlushDropCount = 0;
+                    pthread_mutex_unlock(&g_audio_control_lock);
+                }
+                send_response(sock, "RTSP/1.0", 200, "OK",
+                              NULL, NULL, 0, r->cseq);
+                return;
+            }
+        } else {
+            printf("[AUDIO] FLUSHBUFFERED untilSeq=%llu (rtp=%u) "
+                   "untilTS=%u\n",
+                   (unsigned long long)extendedSequence,
+                   (unsigned)untilSequence, timestamp);
         }
-
-        printf("[AUDIO] FLUSHBUFFERED untilSeq=%llu (rtp=%u) "
-               "untilTS=%u\n",
-               (unsigned long long)extendedSequence,
-               (unsigned)(extendedSequence & 0xffff), timestamp);
-        app_send_audio_control(103, AUDIO_CONTROL_FLUSH);
+        audio_flush_app_until(audio, untilSequence, timestamp);
         send_response(sock, "RTSP/1.0", 200, "OK",
                       NULL, NULL, 0, r->cseq);
     }
@@ -5347,9 +7722,6 @@ static void handle_rtsp_generic(int sock, const HTTPReq *r) {
  * Endpoint: POST /command, /feedback
  * ═══════════════════════════════════════════════════════════════ */
 
-static NSDictionary *g_modes_state = nil;
-
-
 static void handle_command_dictionary(NSDictionary *command, bool authenticated) {
     NSString *type = command[@"type"];
     if (![type isKindOfClass:[NSString class]]) return;
@@ -5357,9 +7729,11 @@ static void handle_command_dictionary(NSDictionary *command, bool authenticated)
     if ([type isEqualToString:@"modesChanged"]) {
         NSDictionary *params = command[@"params"];
         if ([params isKindOfClass:[NSDictionary class]]) {
-            g_modes_state = [params copy];
+            /* Log the local value: this runs on both the event-channel and
+             * per-connection control threads, so an unlocked global strong
+             * store here raced (double release / use-after-free). */
             printf("[CONTROL] modesChanged state updated: %s\n",
-                   g_modes_state.description.UTF8String);
+                   params.description.UTF8String);
         }
     } else if ([type isEqualToString:@"requestUI"]) {
         NSDictionary *params = command[@"params"];
@@ -5372,10 +7746,19 @@ static void handle_command_dictionary(NSDictionary *command, bool authenticated)
             app_send_status(STATUS_HOST_UI_REQUESTED);
         }
     } else if ([type isEqualToString:@"disableBluetooth"]) {
-        const uint8_t request = 1;
-        bool sent = app_send_msg(MSG_BT_HANDOFF, &request, sizeof(request));
+        /* Tears down the Bluetooth helper: only the pair-verified iPhone
+         * may ask for it. */
+        if (!authenticated) {
+            printf("[HANDOFF] ignoring unauthenticated disableBluetooth\n");
+            return;
+        }
+        /* The iPhone asks only once, so the request stays pending until
+         * it reaches the app (retried before the next IPC message or on the
+         * next app connection). */
+        g_app_bt_handoff_pending = true;
+        app_deliver_pending(MSG_BT_HANDOFF);
         printf("[HANDOFF] disableBluetooth honored; app teardown request %s\n",
-               sent ? "sent" : "failed");
+               g_app_bt_handoff_pending ? "pending (will retry)" : "sent");
     } else if ([type isEqualToString:@"duckAudio"] ||
                [type isEqualToString:@"unduckAudio"]) {
         printf("[CONTROL] %s received\n", type.UTF8String);
@@ -5394,11 +7777,8 @@ static bool process_event_command_frame(const uint8_t *bytes, size_t length) {
         request.bodyLen < request.contentLength) return false;
 
     @autoreleasepool {
-        NSData *data = [NSData dataWithBytesNoCopy:(void *)request.body
-                                            length:request.bodyLen
-                                      freeWhenDone:NO];
-        id object = [NSPropertyListSerialization
-            propertyListWithData:data options:0 format:NULL error:NULL];
+        id object = network_plist_parse(request.body, request.bodyLen,
+                                        NETWORK_PLIST_MAX_DEPTH);
         if ([object isKindOfClass:[NSDictionary class]]) {
             if (request.appleStreamID)
                 car_video_forward_command(request.appleStreamID, object);
@@ -5476,6 +7856,8 @@ static void handle_feedback(int sock, const HTTPReq *request) {
     }
 }
 
+static bool request_path_is(const char *target, const char *expected);
+
 static void handle_post_generic(int sock, const HTTPReq *r) {
     printf("[AP] -> POST %s (bodyLen=%zu, ct=%s)\n",
            r->path, r->bodyLen,
@@ -5484,21 +7866,17 @@ static void handle_post_generic(int sock, const HTTPReq *r) {
     if (r->body && r->bodyLen > 0) {
         /* Try binary plist */
         @autoreleasepool {
-            NSData *d = [NSData dataWithBytesNoCopy:(void *)r->body
-                                             length:r->bodyLen
-                                       freeWhenDone:NO];
-            id obj = [NSPropertyListSerialization
-                propertyListWithData:d options:0 format:NULL error:NULL];
-            if (obj) {
-                if (strstr(r->path, "/command") &&
-                    [obj isKindOfClass:[NSDictionary class]]) {
-                    if (r->appleStreamID) {
-                        if (control_is_encrypted(sock))
-                            car_video_forward_command(r->appleStreamID, obj);
-                    } else {
-                        handle_command_dictionary(obj, control_is_encrypted(sock));
-                    }
-                }
+            id obj = network_plist_parse(r->body, r->bodyLen,
+                                         NETWORK_PLIST_MAX_DEPTH);
+            /* Commands change session state and are accepted only on the
+             * pair-verified, encrypted control channel. */
+            if (obj && request_path_is(r->path, "/command") &&
+                [obj isKindOfClass:[NSDictionary class]] &&
+                control_is_encrypted(sock)) {
+                if (r->appleStreamID)
+                    car_video_forward_command(r->appleStreamID, obj);
+                else
+                    handle_command_dictionary(obj, control_is_encrypted(sock));
             }
         }
     }
@@ -5514,11 +7892,13 @@ static void handle_post_generic(int sock, const HTTPReq *r) {
  * ═══════════════════════════════════════════════════════════════ */
 
 static void route_request(int sock, const HTTPReq *r) {
-    printf("\n[AP] ── %s %s %s ──\n", r->method, r->path, r->protocol);
-    fflush(stdout);
+    if (!t_quiet_request_log) {
+        printf("\n[AP] ── %s %s %s ──\n", r->method, r->path, r->protocol);
+        fflush(stdout);
+    }
 
     if (strcasecmp(r->method, "GET") == 0) {
-        if (strstr(r->path, "/info"))
+        if (request_path_is(r->path, "/info"))
             handle_info(sock, r);
         else {
             printf("[AP] -> GET %s (unknown)\n", r->path);
@@ -5526,15 +7906,25 @@ static void route_request(int sock, const HTTPReq *r) {
         }
     }
     else if (strcasecmp(r->method, "POST") == 0) {
-        if (strstr(r->path, "/pair-setup"))
+        if (request_path_is(r->path, "/pair-setup"))
             handle_pair_setup(sock, r);
-        else if (strstr(r->path, "/pair-verify"))
+        else if (request_path_is(r->path, "/pair-verify"))
             handle_pair_verify(sock, r);
-        else if (strstr(r->path, "/fp-setup"))
+        else if (request_path_is(r->path, "/fp-setup"))
             handle_fp_setup(sock, r);
-        else if (strstr(r->path, "/auth-setup"))
+        else if (request_path_is(r->path, "/auth-setup"))
             handle_auth_setup(sock, r);
-        else if (strstr(r->path, "/feedback"))
+        else if (request_path_is(r->path, "/pair-pin-start")) {
+            /* The PIN is fixed; there is nothing to start. Acknowledge it
+             * without treating the body as anything else. */
+            if (!t_quiet_request_log)
+                printf("[AP] -> POST /pair-pin-start\n");
+            send_response(sock, strncmp(r->protocol, "RTSP", 4) == 0
+                                     ? "RTSP/1.0" : "HTTP/1.1",
+                          200, "OK", "application/x-apple-binary-plist",
+                          NULL, 0, r->cseq);
+        }
+        else if (request_path_is(r->path, "/feedback"))
             handle_feedback(sock, r);
         else
             handle_post_generic(sock, r);
@@ -5571,16 +7961,224 @@ static void route_request(int sock, const HTTPReq *r) {
  * TCP Listener — port 7000 with keep-alive
  * ═══════════════════════════════════════════════════════════════ */
 
+static bool request_allowed_before_pair_verify(const HTTPReq *r);
+
+/* True when the request target names exactly this path. An absolute
+ * "rtsp://host" / "http://host" prefix and any query or fragment are
+ * ignored, so "/command/pair-pin-start" is not "/pair-pin-start" and
+ * "/pair-setup?x" is "/pair-setup". */
+static bool request_path_is(const char *target, const char *expected) {
+    const char *path = target;
+    if (path[0] != '/') {
+        const char *scheme = strstr(path, "://");
+        if (!scheme) return false;
+        path = strchr(scheme + 3, '/');
+        if (!path) path = "/";
+    }
+    size_t length = strcspn(path, "?#");
+    return length == strlen(expected) && strncmp(path, expected, length) == 0;
+}
+
+/* Requests an unauthenticated connection may make. Everything else mutates
+ * session state (SETUP, RECORD, TEARDOWN, POST /command, ...) and requires the
+ * pair-verified, encrypted control channel. */
+static bool request_allowed_before_pair_verify(const HTTPReq *r) {
+    if (strcasecmp(r->method, "OPTIONS") == 0) return true;
+    if (strcasecmp(r->method, "GET") == 0)
+        return request_path_is(r->path, "/info");
+    if (strcasecmp(r->method, "POST") == 0)
+        return request_path_is(r->path, "/pair-setup") ||
+               request_path_is(r->path, "/pair-pin-start") ||
+               request_path_is(r->path, "/pair-verify") ||
+               request_path_is(r->path, "/auth-setup") ||
+               request_path_is(r->path, "/fp-setup");
+    return false;
+}
+
+/*
+ * Log budget for requests that arrive before pair-verify. Any LAN host can
+ * reach port 7000, reconnect freely and pipeline many small requests in one
+ * read, so their log lines pass a per-connection budget and a process-wide
+ * per-second budget. Suppressed lines are only counted and reported with the
+ * next line that is allowed.
+ */
+#define PREAUTH_LOG_PER_CONNECTION 16
+#define PREAUTH_LOG_PER_SECOND     20
+static pthread_mutex_t g_preauth_log_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_preauth_log_second = 0;
+static unsigned g_preauth_log_in_second = 0;
+static unsigned long g_preauth_log_suppressed = 0;
+
+static bool preauth_log_allowed(unsigned *connectionLines) {
+    bool allowed = *connectionLines < PREAUTH_LOG_PER_CONNECTION;
+    if (allowed) (*connectionLines)++;
+    unsigned long reportSuppressed = 0;
+    uint64_t second = control_monotonic_nanos() / CONTROL_NANOS_PER_SECOND;
+    pthread_mutex_lock(&g_preauth_log_lock);
+    if (second != g_preauth_log_second) {
+        g_preauth_log_second = second;
+        g_preauth_log_in_second = 0;
+    }
+    if (allowed && g_preauth_log_in_second >= PREAUTH_LOG_PER_SECOND)
+        allowed = false;
+    if (allowed) {
+        g_preauth_log_in_second++;
+        reportSuppressed = g_preauth_log_suppressed;
+        g_preauth_log_suppressed = 0;
+    } else if (g_preauth_log_suppressed < ULONG_MAX) {
+        g_preauth_log_suppressed++;
+    }
+    pthread_mutex_unlock(&g_preauth_log_lock);
+    if (reportSuppressed > 0)
+        printf("[AP] Suppressed %lu log lines for requests before "
+               "pair-verify\n", reportSuppressed);
+    return allowed;
+}
+
+static void handle_client(int);
+/* The iPhone uses one control connection plus short discovery probes. */
+#define CONTROL_MAX_CLIENTS 6
+/* Connections from one address that do not own the session. */
+#define CONTROL_MAX_UNCLAIMED_PER_ADDRESS 2
+/* Absolute lifetime of a connection that never claims the session, counted
+ * from accept. Unlike SO_RCVTIMEO it is not renewed by traffic, so a peer
+ * that trickles bytes or repeats GET /info cannot hold a slot. */
+#define CONTROL_UNCLAIMED_DEADLINE_SECONDS 15
+#define CONTROL_CLIENT_STACK_BYTES (512 * 1024)
+
+typedef struct {
+    bool used;
+    int fd;
+    uint64_t acceptedNanos;
+    char host[NI_MAXHOST];
+} control_client_slot_t;
+static pthread_mutex_t g_control_clients_lock = PTHREAD_MUTEX_INITIALIZER;
+static control_client_slot_t g_control_clients[CONTROL_MAX_CLIENTS];
+
+/* Numeric peer address with an IPv4-mapped prefix removed, so IPv4 and
+ * mapped connections from one host compare equal. */
+static void control_peer_host(const struct sockaddr *sa, socklen_t length,
+                              char *host, size_t hostLength) {
+    char serv[NI_MAXSERV];
+    host[0] = '\0';
+    if (!sockaddr_to_numeric(sa, length, host, hostLength,
+                             serv, sizeof(serv)))
+        return;
+    if (strncmp(host, "::ffff:", 7) == 0)
+        memmove(host, host + 7, strlen(host + 7) + 1);
+}
+
+/* Drops a connection that does not own the session to make room. The slot is
+ * released now; the handler thread sees EOF and exits. Called with
+ * g_control_clients_lock and g_control_owner_lock held, so the victim cannot
+ * have claimed the session since it was chosen, and its descriptor cannot
+ * have been closed and reused yet (handlers leave the table before they
+ * close). */
+static void control_client_evict_locked(control_client_slot_t *slot,
+                                        const char *why) {
+    /* Any LAN host can force evictions by reconnecting in a loop, so this
+     * line shares the process-wide pre-auth log budget. */
+    unsigned evictLogLines = 0;
+    if (preauth_log_allowed(&evictLogLines))
+        printf("[AP] Dropping control connection fd=%d from %s (%s)\n",
+               slot->fd, slot->host, why);
+    shutdown(slot->fd, SHUT_RDWR);
+    slot->used = false;
+}
+
+/* Admits a new control connection. The session owner is never displaced; a
+ * full table or a busy address makes room by dropping the oldest connection
+ * that does not own the session, preferring ones that are not from the
+ * session iPhone. Returns false when no room can be made. */
+static bool control_client_admit(int c, const char *host) {
+    bool fromSessionIphone = g_iphone_ip[0] && strcmp(host, g_iphone_ip) == 0;
+    uint64_t now = control_monotonic_nanos();
+    pthread_mutex_lock(&g_control_clients_lock);
+    /* Held until the evictions are done (lock order: clients, then owner;
+     * control_claim takes only the owner lock), so a connection cannot claim
+     * the session between the owner check and its shutdown. */
+    pthread_mutex_lock(&g_control_owner_lock);
+    int owner = g_control_owner;
+
+    control_client_slot_t *oldestSameHost = NULL;
+    size_t sameHost = 0;
+    for (size_t i = 0; i < CONTROL_MAX_CLIENTS; i++) {
+        control_client_slot_t *slot = &g_control_clients[i];
+        if (!slot->used || slot->fd == owner || strcmp(slot->host, host) != 0)
+            continue;
+        sameHost++;
+        if (!oldestSameHost ||
+            slot->acceptedNanos < oldestSameHost->acceptedNanos)
+            oldestSameHost = slot;
+    }
+    if (sameHost >= CONTROL_MAX_UNCLAIMED_PER_ADDRESS && oldestSameHost)
+        control_client_evict_locked(oldestSameHost,
+                                    "too many connections from one address");
+
+    control_client_slot_t *room = NULL;
+    control_client_slot_t *victim = NULL;
+    control_client_slot_t *iphoneVictim = NULL;
+    for (size_t i = 0; i < CONTROL_MAX_CLIENTS; i++) {
+        control_client_slot_t *slot = &g_control_clients[i];
+        if (!slot->used) {
+            if (!room) room = slot;
+            continue;
+        }
+        if (slot->fd == owner) continue;
+        bool isIphone = g_iphone_ip[0] && strcmp(slot->host, g_iphone_ip) == 0;
+        control_client_slot_t **pick = isIphone ? &iphoneVictim : &victim;
+        if (!*pick || slot->acceptedNanos < (*pick)->acceptedNanos)
+            *pick = slot;
+    }
+    if (!room) {
+        if (!victim && fromSessionIphone) victim = iphoneVictim;
+        if (victim) {
+            control_client_evict_locked(victim, "connection table full");
+            room = victim;
+        }
+    }
+    if (room) {
+        room->used = true;
+        room->fd = c;
+        room->acceptedNanos = now;
+        snprintf(room->host, sizeof(room->host), "%s", host);
+    }
+    pthread_mutex_unlock(&g_control_owner_lock);
+    pthread_mutex_unlock(&g_control_clients_lock);
+    return room != NULL;
+}
+
+/* Must run before the descriptor is closed (see control_client_evict_locked). */
+static void control_client_release(int c) {
+    pthread_mutex_lock(&g_control_clients_lock);
+    for (size_t i = 0; i < CONTROL_MAX_CLIENTS; i++) {
+        if (g_control_clients[i].used && g_control_clients[i].fd == c)
+            g_control_clients[i].used = false;
+    }
+    pthread_mutex_unlock(&g_control_clients_lock);
+}
+
+static void *control_client_thread(void *arg) {
+    handle_client((int)(intptr_t)arg);
+    return NULL;
+}
+
 static void handle_client(int c) {
     /* Room for one final encrypted record containing the end of a maximal
      * request and the beginning of the next pipelined request. */
     uint8_t buf[HTTP_STREAM_LIMIT + ENCRYPTED_MAX_READ_SIZE];
     size_t bufUsed = 0;
+    http_progress_t progress = {0};
+    bool infoLogged = false;
+    unsigned preauthLogLines = 0;
+    bool sessionConnection = false;
 
-    /* Set recv timeout — must be long enough for iPhone to send SETUP Phase 2
-     * after RECORD. Keepalive channel handles liveness detection. */
-    struct timeval tv = { .tv_sec = 600, .tv_usec = 0 };
+    struct timeval tv = { .tv_sec = CONTROL_IDLE_SECONDS_UNCLAIMED,
+                          .tv_usec = 0 };
     setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    uint64_t unclaimedDeadline = control_monotonic_nanos() +
+        (uint64_t)CONTROL_UNCLAIMED_DEADLINE_SECONDS *
+            CONTROL_NANOS_PER_SECOND;
 
     /* TCP keepalive. An iPhone that leaves Wi-Fi never closes the
      * connection, so probe after 10 s of silence and give up after 3 misses.
@@ -5606,9 +8204,26 @@ static void handle_client(int c) {
         } else {
             /* Peek so the final plaintext pair-verify request cannot consume
              * bytes belonging to the first encrypted transport record. */
+            bool owner = control_is_owner(c);
             if (bufUsed == sizeof(buf)) {
-                printf("[AP] Request exceeds stream limit\n");
+                if (owner || preauth_log_allowed(&preauthLogLines))
+                    printf("[AP] Request exceeds stream limit\n");
                 break;
+            }
+            if (!owner) {
+                uint64_t now = control_monotonic_nanos();
+                int waitMs = now >= unclaimedDeadline ? 0 :
+                    (int)((unclaimedDeadline - now) / 1000000ULL) + 1;
+                struct pollfd readable = { .fd = c, .events = POLLIN };
+                int ready = waitMs > 0 ? poll(&readable, 1, waitMs) : 0;
+                if (ready < 0 && errno == EINTR) continue;
+                if (ready <= 0) {
+                    if (preauth_log_allowed(&preauthLogLines))
+                        printf("[AP] Connection did not start pairing within "
+                               "%d s; closing\n",
+                               CONTROL_UNCLAIMED_DEADLINE_SECONDS);
+                    break;
+                }
             }
             ssize_t n = recv(c, buf + bufUsed, sizeof(buf) - bufUsed, MSG_PEEK);
             if (n <= 0) {
@@ -5616,9 +8231,14 @@ static void handle_client(int c) {
                 break;
             }
             HTTPReq preview;
-            bool complete = parse_http(buf, bufUsed + (size_t)n, &preview);
+            size_t headerLimit = owner ? HTTP_STREAM_LIMIT :
+                                         HTTP_PREAUTH_HEADER_LIMIT;
+            bool complete = parse_http_incremental(buf, bufUsed + (size_t)n,
+                                                   headerLimit, &progress,
+                                                   &preview);
             if (preview.invalid) {
-                printf("[AP] Invalid or oversized request\n");
+                if (owner || preauth_log_allowed(&preauthLogLines))
+                    printf("[AP] Invalid or oversized request\n");
                 break;
             }
             size_t take = (size_t)n;
@@ -5638,23 +8258,64 @@ static void handle_client(int c) {
          * multiple requests. Route only complete bounded messages. */
         while (bufUsed > 0) {
             HTTPReq r;
-            if (!parse_http(buf, bufUsed, &r)) {
+            size_t headerLimit = control_is_encrypted(c) || control_is_owner(c) ?
+                HTTP_STREAM_LIMIT : HTTP_PREAUTH_HEADER_LIMIT;
+            if (!parse_http_incremental(buf, bufUsed, headerLimit,
+                                        &progress, &r)) {
                 if (r.invalid || bufUsed == sizeof(buf)) goto client_done;
                 break;
             }
             size_t total = (size_t)(r.body - buf) + r.contentLength;
+            bool rtsp = strncmp(r.protocol, "RTSP", 4) == 0;
+            const char *proto = rtsp ? "RTSP/1.0" : "HTTP/1.1";
+            bool encrypted = control_is_encrypted(c);
             bool readOnly = strcasecmp(r.method, "GET") == 0 ||
                             strcasecmp(r.method, "OPTIONS") == 0;
-            if (!readOnly && !control_claim(c)) {
-                const char *proto = strncmp(r.protocol, "RTSP", 4) == 0 ?
-                                    "RTSP/1.0" : "HTTP/1.1";
+            bool newlyClaimed = false;
+            if (!encrypted && !request_allowed_before_pair_verify(&r)) {
+                if (preauth_log_allowed(&preauthLogLines))
+                    printf("[AP] Rejecting %s %s before pair-verify\n",
+                           r.method, r.path);
+                if (rtsp)
+                    send_response(c, proto, 470,
+                                  "Connection Authorization Required",
+                                  NULL, NULL, 0, r.cseq);
+                else
+                    send_response(c, proto, 403, "Forbidden",
+                                  NULL, NULL, 0, r.cseq);
+            } else if (!readOnly && !control_claim(c, &newlyClaimed)) {
                 send_response(c, proto, 503, "Service Unavailable",
                               NULL, NULL, 0, r.cseq);
             } else {
+                if (newlyClaimed) {
+                    /* Only the connection that starts pairing is the
+                     * iPhone joining; discovery probes are not. */
+                    app_send_status(STATUS_IPHONE_CONNECTED);
+                    struct timeval ownerTv = {
+                        .tv_sec = CONTROL_IDLE_SECONDS_UNVERIFIED_OWNER,
+                        .tv_usec = 0 };
+                    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO,
+                               &ownerTv, sizeof(ownerTv));
+                }
+                /* Log unauthenticated /info once per connection, and every
+                 * other unauthenticated request (read-only probes and the
+                 * pre-auth POSTs of an unverified owner alike) within the
+                 * pre-auth log budget. */
+                bool unverifiedInfo = !encrypted &&
+                    strcasecmp(r.method, "GET") == 0 &&
+                    request_path_is(r.path, "/info");
+                bool quiet = unverifiedInfo && infoLogged;
+                if (!quiet && !encrypted)
+                    quiet = !preauth_log_allowed(&preauthLogLines);
+                t_quiet_request_log = quiet;
+                if (unverifiedInfo) infoLogged = true;
                 route_request(c, &r);
+                t_quiet_request_log = false;
             }
+            if (encrypted || control_is_owner(c)) sessionConnection = true;
             memmove(buf, buf + total, bufUsed - total);
             bufUsed -= total;
+            progress = (http_progress_t){0};
         }
     }
 client_done:
@@ -5662,8 +8323,11 @@ client_done:
     bool endedSession = g_control_owner == c && g_enc.active;
     if (g_control_owner == c && !endedSession) g_control_owner = -1;
     pthread_mutex_unlock(&g_control_owner_lock);
+    control_client_release(c);
     close(c);
-    printf("[AP] Connection closed\n");
+    if (sessionConnection || endedSession ||
+        preauth_log_allowed(&preauthLogLines))
+        printf("[AP] Connection closed\n");
     if (endedSession) {
         printf("[AP] CarPlay session ended; exiting\n");
         fflush(stdout);
@@ -5694,24 +8358,80 @@ static bool start_airplay_server(uint16_t port) {
     printf("[AP] AirPlay server listening on port %d (IPv4+IPv6)\n", port);
 
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        unsigned long acceptFailures = 0;
         while (1) {
             struct sockaddr_storage ca;
             socklen_t cl = sizeof(ca);
             int c = accept(sock, (struct sockaddr *)&ca, &cl);
-            if (c < 0) { perror("[AP] accept"); continue; }
+            if (c < 0) {
+                int acceptErr = errno;
+                /* Same classification as the event acceptor: a per-connection
+                 * failure retries at once; resource exhaustion leaves the
+                 * connection in the backlog, so accept() would fail again
+                 * immediately -- back off instead of spinning a core and
+                 * flooding the log (only the first and every 100th failure
+                 * is logged). Anything else means the listener itself is
+                 * unusable, and retrying would spin forever. */
+                if (acceptErr == EINTR || acceptErr == ECONNABORTED)
+                    continue;
+                if (acceptErr == EAGAIN || acceptErr == EWOULDBLOCK ||
+                    acceptErr == EMFILE || acceptErr == ENFILE ||
+                    acceptErr == ENOBUFS || acceptErr == ENOMEM) {
+                    if (acceptFailures++ % 100 == 0)
+                        printf("[AP] accept error (retrying, %lu so far): %s\n",
+                               acceptFailures, strerror(acceptErr));
+                    usleep(100000);
+                    continue;
+                }
+                printf("[AP] accept error, AirPlay listener stopped: %s\n",
+                       strerror(acceptErr));
+                fflush(stdout);
+                close(sock);
+                break;
+            }
+            acceptFailures = 0;
 
             char host[NI_MAXHOST], serv[NI_MAXSERV];
             sockaddr_to_numeric((struct sockaddr *)&ca, cl,
                                 host, sizeof(host), serv, sizeof(serv));
-            printf("\n[AP] *** NEW CONNECTION from %s:%s family=%s ***\n",
-                   host, serv, addr_family_name(ca.ss_family));
-            fflush(stdout);
-            app_send_status(STATUS_IPHONE_CONNECTED);
+            /* Any LAN host can reconnect in a loop: these lines share the
+             * process-wide pre-auth log budget. */
+            unsigned acceptLogLines = 0;
+            bool logAccept = preauth_log_allowed(&acceptLogLines);
+            if (logAccept) {
+                printf("\n[AP] *** NEW CONNECTION from %s:%s family=%s ***\n",
+                       host, serv, addr_family_name(ca.ss_family));
+                fflush(stdout);
+            }
 
-            /* Handle each connection in its own dispatch queue */
-            dispatch_async(dispatch_get_global_queue(0, 0), ^{
-                handle_client(c);
-            });
+            char peer[NI_MAXHOST];
+            control_peer_host((struct sockaddr *)&ca, cl, peer, sizeof(peer));
+            if (!control_client_admit(c, peer)) {
+                if (logAccept)
+                    printf("[AP] Too many control connections; closing %s:%s\n",
+                           host, serv);
+                close(c);
+                continue;
+            }
+
+            /* Each connection blocks in recv for up to its idle limit, so it
+             * gets its own thread instead of a shared GCD worker: a burst of
+             * connections must not starve the audio, screen, touch and
+             * timing work that runs on the global queues. */
+            pthread_t thread;
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+            pthread_attr_setstacksize(&attr, CONTROL_CLIENT_STACK_BYTES);
+            int rc = pthread_create(&thread, &attr, control_client_thread,
+                                    (void *)(intptr_t)c);
+            pthread_attr_destroy(&attr);
+            if (rc != 0) {
+                printf("[AP] Could not start client thread: %s\n",
+                       strerror(rc));
+                control_client_release(c);
+                close(c);
+            }
         }
     });
     return true;
@@ -5830,6 +8550,39 @@ static char g_ctrlDomain[256]  = {0};
 static uint32_t g_ctrlIfIndex  = 0;
 static volatile bool g_ctrlFound = false;
 static volatile bool g_ctrlConnected = false;
+/* Set while a ctrl_connect_thread runs; cleared when it returns so a later
+ * browse result or the retry timer can try again (g_ctrlFound only records
+ * that the service is known). */
+static atomic_bool g_ctrlThreadRunning = false;
+#define CTRL_RESTART_DELAY_SEC 5
+/* Idle recv timeout on the open ctrl-int channel, and how many consecutive
+ * idle periods without an authenticated session end it so a fresh connect
+ * can be sent. */
+#define CTRL_IDLE_RECV_SEC 120
+#define CTRL_IDLE_LIMIT_WITHOUT_SESSION 2
+/* A browse Add for an already-open channel only replaces it once the channel
+ * has had this long to produce a pairing attempt. */
+#define CTRL_REPLACE_MIN_AGE_SEC 10
+/* Descriptor of the open ctrl-int channel, or -1. Guarded by g_ctrlSockLock
+ * so a shutdown from another thread never hits a reused descriptor. */
+static pthread_mutex_t g_ctrlSockLock = PTHREAD_MUTEX_INITIALIZER;
+static int g_ctrlSock = -1;
+static uint64_t g_ctrlSockOpenedNanos = 0;
+
+/* Wakes ctrl_send_connect's recv so the ctrl thread returns and a retry can
+ * be scheduled. minAgeSec skips a channel opened more recently than that. */
+static bool ctrl_abort_channel(unsigned minAgeSec) {
+    bool aborted = false;
+    pthread_mutex_lock(&g_ctrlSockLock);
+    if (g_ctrlSock >= 0 &&
+        control_monotonic_nanos() - g_ctrlSockOpenedNanos >=
+            (uint64_t)minAgeSec * CONTROL_NANOS_PER_SECOND) {
+        shutdown(g_ctrlSock, SHUT_RDWR);
+        aborted = true;
+    }
+    pthread_mutex_unlock(&g_ctrlSockLock);
+    return aborted;
+}
 
 /* Synchronous re-resolve: returns fresh port, or 0 on failure */
 typedef struct { char host[256]; uint16_t port; bool resolved; } ResolveResult;
@@ -5876,9 +8629,45 @@ static bool resolve_ctrl_port(ResolveResult *out) {
  * Ctrl Channel — smart connect with re-resolve on failure
  * ═══════════════════════════════════════════════════════════════ */
 
+/*
+ * The ctrl channel peer is whatever answered the last _carplay-ctrl._tcp
+ * browse result, so its traffic is unauthenticated: cap each dump and log
+ * only the first CTRL_RECV_LOG_FULL receives in full, then a byte count on
+ * every CTRL_RECV_LOG_EVERY-th. Output goes through printf (the locked,
+ * size-capped service log) so a flood cannot interleave with other lines or
+ * push the real session's diagnostics past the log cap.
+ */
+#define CTRL_RECV_LOG_FULL   16
+#define CTRL_RECV_LOG_EVERY  100
+#define CTRL_RECV_DUMP_BYTES 256
+
+static void ctrl_log_received(const char *label, const uint8_t *buf,
+                              ssize_t n, bool printable) {
+    printf("[CTRL] %s (%zd bytes):\n", label, n);
+    int shown = n < CTRL_RECV_DUMP_BYTES ? (int)n : CTRL_RECV_DUMP_BYTES;
+    if (printable) {
+        char text[CTRL_RECV_DUMP_BYTES + 1];
+        for (int i = 0; i < shown; i++) {
+            uint8_t c = buf[i];
+            text[i] = (c == '\r' || c == '\n' || c == '\t' ||
+                       (c >= 0x20 && c < 0x7f)) ? (char)c : '.';
+        }
+        text[shown] = '\0';
+        printf("%s%s\n", text, n > shown ? " ..." : "");
+    }
+    printf("[CTRL] Hex (%zd):", n);
+    for (int i = 0; i < shown; i++) printf(" %02X", buf[i]);
+    if (n > shown) printf(" ...");
+    printf("\n");
+}
+
 static void ctrl_send_connect(int sock, const char *host) {
     printf("[CTRL] *** Connected to CarPlay control channel ***\n");
     g_ctrlConnected = true;
+    pthread_mutex_lock(&g_ctrlSockLock);
+    g_ctrlSock = sock;
+    g_ctrlSockOpenedNanos = control_monotonic_nanos();
+    pthread_mutex_unlock(&g_ctrlSockLock);
 
     /* Send GET /ctrl-int/1/connect
      * CRITICAL: AirPlay-Receiver-Device-ID must be DECIMAL INTEGER,
@@ -5895,11 +8684,17 @@ static void ctrl_send_connect(int sock, const char *host) {
     printf("[CTRL] Sending:\n%s", request);
     ssize_t sent = send(sock, request, reqlen, 0);
     printf("[CTRL] Sent %zd bytes\n", sent);
-    if (sent <= 0) { close(sock); goto done; }
+    if (sent <= 0) goto done;  /* done: is the single close */
 
-    /* TCP keepalive to prevent idle timeout */
-    int yes = 1;
+    /* TCP keepalive. An iPhone that leaves Wi-Fi (bridge rebuilt on the
+     * BT-to-Wi-Fi handoff, Wi-Fi toggled, out of range) never closes the
+     * channel, so probe after 10 s of silence and give up after 3 misses,
+     * as handle_client does; recv then fails and a retry is scheduled. */
+    int yes = 1, idle = 10, interval = 3, count = 3;
     setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
 
     /* Read the initial 200 OK response, then keep channel open
      * and read any further commands the iPhone sends. */
@@ -5910,15 +8705,8 @@ static void ctrl_send_connect(int sock, const char *host) {
     ssize_t n = recv(sock, buf, sizeof(buf) - 1, 0);
     if (n > 0) {
         buf[n] = '\0';
-        printf("[CTRL] Response (%zd bytes):\n", n);
-        if (n > 4 && (buf[0] == 'H' || buf[0] == 'R')) {
-            fwrite(buf, 1, (size_t)n, stdout);
-            printf("\n");
-        }
-        printf("[CTRL] Hex (%zd):", n);
-        for (int i = 0; i < n && i < 256; i++) printf(" %02X", buf[i]);
-        if (n > 256) printf(" ...");
-        printf("\n");
+        ctrl_log_received("Response", buf, n,
+                          n > 4 && (buf[0] == 'H' || buf[0] == 'R'));
 
         if (strstr((char *)buf, "200") || strstr((char *)buf, "OK"))
             printf("[CTRL] *** ctrl-int connect SUCCEEDED — keeping channel open ***\n");
@@ -5937,30 +8725,32 @@ static void ctrl_send_connect(int sock, const char *host) {
 
     /* Keep channel open — read any commands iPhone sends.
      * Use a long recv timeout so we stay alive but don't block forever. */
-    tv.tv_sec = 120;
+    tv.tv_sec = CTRL_IDLE_RECV_SEC;
     tv.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+    int idleWithoutSession = 0;
+    unsigned long recvCount = 0;
     while (1) {
         n = recv(sock, buf, sizeof(buf) - 1, 0);
         if (n > 0) {
+            idleWithoutSession = 0;
             buf[n] = '\0';
-            printf("[CTRL] Received (%zd bytes):\n", n);
-            if (n > 4 && (buf[0] >= 0x20 && buf[0] < 0x7f)) {
-                fwrite(buf, 1, (size_t)n, stdout);
-                printf("\n");
+            if (recvCount < ULONG_MAX) recvCount++;
+            bool logFull = recvCount <= CTRL_RECV_LOG_FULL;
+            if (logFull) {
+                ctrl_log_received("Received", buf, n,
+                                  n > 4 && (buf[0] >= 0x20 && buf[0] < 0x7f));
+            } else if (recvCount % CTRL_RECV_LOG_EVERY == 0) {
+                printf("[CTRL] Received %zd bytes (receive #%lu; "
+                       "per-receive logging suppressed)\n", n, recvCount);
             }
-            printf("[CTRL] Hex (%zd):", n);
-            for (int i = 0; i < n && i < 512; i++) printf(" %02X", buf[i]);
-            if (n > 512) printf(" ...");
-            printf("\n");
-            fflush(stdout);
 
             /* Echo back 200 OK for any HTTP-looking request */
             if (buf[0] == 'G' || buf[0] == 'P' || buf[0] == 'H') {
                 const char *resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
                 send(sock, resp, strlen(resp), 0);
-                printf("[CTRL] Sent 200 OK reply\n");
+                if (logFull) printf("[CTRL] Sent 200 OK reply\n");
             }
             fflush(stdout);
         } else if (n == 0) {
@@ -5968,7 +8758,20 @@ static void ctrl_send_connect(int sock, const char *host) {
             break;
         } else {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                printf("[CTRL] Ctrl channel idle (120s), still alive\n");
+                /* A channel that never led to an authenticated session is
+                 * half-open or abandoned; drop it so the retry path sends a
+                 * fresh connect instead of waiting here forever. */
+                if (control_has_encrypted_session()) {
+                    idleWithoutSession = 0;
+                } else if (++idleWithoutSession >=
+                           CTRL_IDLE_LIMIT_WITHOUT_SESSION) {
+                    printf("[CTRL] Ctrl channel idle %ds without a session; "
+                           "reconnecting\n",
+                           CTRL_IDLE_RECV_SEC * idleWithoutSession);
+                    break;
+                }
+                printf("[CTRL] Ctrl channel idle (%ds), still alive\n",
+                       CTRL_IDLE_RECV_SEC);
                 fflush(stdout);
                 continue;
             }
@@ -5978,7 +8781,10 @@ static void ctrl_send_connect(int sock, const char *host) {
     }
 
 done:
+    pthread_mutex_lock(&g_ctrlSockLock);
+    g_ctrlSock = -1;
     close(sock);
+    pthread_mutex_unlock(&g_ctrlSockLock);
     g_ctrlConnected = false;
     printf("[CTRL] Control channel closed\n");
     fflush(stdout);
@@ -6078,6 +8884,47 @@ static void ctrl_connect_thread(void *ctx) {
     printf("[CTRL] *** ALL RESOLVE ROUNDS EXHAUSTED ***\n");
 }
 
+static void start_ctrl_connect_thread(void);
+
+/* Without an authenticated session the iPhone is still expected, and mDNS
+ * does not repeat Add for a service it already reported, so retry after a
+ * pause. While some connection is mid-pairing, wait rather than send a second
+ * connect request. Once a session exists, its end terminates this process. */
+static void schedule_ctrl_restart(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)CTRL_RESTART_DELAY_SEC *
+                                     NSEC_PER_SEC),
+                   dispatch_get_global_queue(0, 0), ^{
+        if (control_has_encrypted_session()) return;
+        if (control_has_live_owner()) {
+            schedule_ctrl_restart();
+            return;
+        }
+        start_ctrl_connect_thread();
+    });
+}
+
+static void ctrl_connect_thread_main(void) {
+    ctrl_connect_thread(NULL);
+    atomic_store(&g_ctrlThreadRunning, false);
+    if (!control_has_encrypted_session()) {
+        printf("[CTRL] Control channel ended without a session; retrying "
+               "in %ds\n", CTRL_RESTART_DELAY_SEC);
+        fflush(stdout);
+        schedule_ctrl_restart();
+    }
+}
+
+static void start_ctrl_connect_thread(void) {
+    if (!g_ctrlFound) return;
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&g_ctrlThreadRunning, &expected, true))
+        return;
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        ctrl_connect_thread_main();
+    });
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * mDNS Callbacks
  * ═══════════════════════════════════════════════════════════════ */
@@ -6111,12 +8958,19 @@ static void browse_callback(DNSServiceRef ref, DNSServiceFlags flags,
         snprintf(g_ctrlDomain, sizeof(g_ctrlDomain), "%s", domain);
         g_ctrlIfIndex = ifIndex;
 
-        /* Only spawn ctrl thread once */
-        if (!g_ctrlFound) {
-            g_ctrlFound = true;
-            dispatch_async(dispatch_get_global_queue(0, 0), ^{
-                ctrl_connect_thread(NULL);
-            });
+        /* One ctrl thread at a time; a new Add after it gave up (non-200,
+         * FIN, exhausted rounds) starts another. */
+        g_ctrlFound = true;
+        if (!control_has_encrypted_session()) {
+            /* A new Add while an older channel is still open and nobody is
+             * pairing means that channel is stale (e.g. bridge rebuilt);
+             * end it so the exiting thread schedules a fresh connect. */
+            if (atomic_load(&g_ctrlThreadRunning) && !control_has_live_owner() &&
+                ctrl_abort_channel(CTRL_REPLACE_MIN_AGE_SEC)) {
+                printf("[CTRL] New browse result; replacing open ctrl "
+                       "channel\n");
+            }
+            start_ctrl_connect_thread();
         }
     } else {
         printf("[MDNS] Removed: %s.%s%s\n", name, regtype, domain);
@@ -6139,8 +8993,8 @@ static TXTRecordRef build_airplay_txt(void) {
     TXTRecordSetValue(&txt, "flags",       strlen("0x4"),          "0x4");
     TXTRecordSetValue(&txt, "model",       strlen(MODEL_NAME),    MODEL_NAME);
     TXTRecordSetValue(&txt, "protovers",   3,                      "1.1");
-    TXTRecordSetValue(&txt, "pi",          strlen(HK_PI),         HK_PI);
-    TXTRecordSetValue(&txt, "pk",          strlen(HK_PK),         HK_PK);
+    TXTRecordSetValue(&txt, "pi",          strlen(g_hk_pi),       g_hk_pi);
+    TXTRecordSetValue(&txt, "pk",          strlen(g_hk_pk_hex),   g_hk_pk_hex);
     TXTRecordSetValue(&txt, "srcvers",     strlen(SOURCE_VERSION), SOURCE_VERSION);
     return txt;
 }
@@ -6174,7 +9028,7 @@ static TXTRecordRef build_raop_txt(void) {
     TXTRecordSetValue(&txt, "am",       strlen(MODEL_NAME),     MODEL_NAME);
     TXTRecordSetValue(&txt, "sf",       3,                      "0x0");
     TXTRecordSetValue(&txt, "ft",       strlen(ft),             ft);
-    TXTRecordSetValue(&txt, "pk",       strlen(HK_PK),          HK_PK);
+    TXTRecordSetValue(&txt, "pk",       strlen(g_hk_pk_hex),    g_hk_pk_hex);
     return txt;
 }
 
@@ -6213,13 +9067,15 @@ static bool mdns_put_bytes(uint8_t *buf, size_t cap, size_t *off,
     return true;
 }
 
+/* Dotted name made only of fixed labels (service type, host). Must never be
+ * given a user-chosen instance name: use mdns_put_instance_name for that. */
 static bool mdns_put_name(uint8_t *buf, size_t cap, size_t *off,
                           const char *name) {
     const char *p = name;
     while (*p) {
         const char *dot = strchr(p, '.');
         size_t len = dot ? (size_t)(dot - p) : strlen(p);
-        if (len > 63 || *off + 1 + len > cap) return false;
+        if (len == 0 || len > 63 || *off + 1 + len > cap) return false;
         buf[(*off)++] = (uint8_t)len;
         memcpy(buf + *off, p, len);
         *off += len;
@@ -6231,16 +9087,31 @@ static bool mdns_put_name(uint8_t *buf, size_t cap, size_t *off,
     return true;
 }
 
+/* <instance>.<service>: the instance (the free-text car name) is ONE label,
+ * exactly as DNSServiceRegister publishes it, so a '.' inside it ("Golf 1.6",
+ * "Araba.") stays part of the name instead of splitting or ending it. */
+static bool mdns_put_instance_name(uint8_t *buf, size_t cap, size_t *off,
+                                   const char *instance, const char *service) {
+    size_t len = strlen(instance);
+    if (len == 0 || len > 63 || *off + 1 + len > cap) return false;
+    buf[(*off)++] = (uint8_t)len;
+    memcpy(buf + *off, instance, len);
+    *off += len;
+    return mdns_put_name(buf, cap, off, service);
+}
+
 static bool mdns_put_ptr(uint8_t *buf, size_t cap, size_t *off,
-                         const char *name, const char *target, uint32_t ttl) {
-    if (!mdns_put_name(buf, cap, off, name)) return false;
+                         const char *service, const char *instance,
+                         uint32_t ttl) {
+    if (!mdns_put_name(buf, cap, off, service)) return false;
     if (!mdns_put_u16(buf, cap, off, 12)) return false;      /* PTR */
     if (!mdns_put_u16(buf, cap, off, 1)) return false;       /* IN */
     if (!mdns_put_u32(buf, cap, off, ttl)) return false;
     size_t rdlen_at = *off;
     if (!mdns_put_u16(buf, cap, off, 0)) return false;
     size_t rstart = *off;
-    if (!mdns_put_name(buf, cap, off, target)) return false;
+    if (!mdns_put_instance_name(buf, cap, off, instance, service))
+        return false;
     uint16_t rdlen = (uint16_t)(*off - rstart);
     buf[rdlen_at] = (uint8_t)(rdlen >> 8);
     buf[rdlen_at + 1] = (uint8_t)(rdlen & 0xff);
@@ -6248,9 +9119,10 @@ static bool mdns_put_ptr(uint8_t *buf, size_t cap, size_t *off,
 }
 
 static bool mdns_put_srv(uint8_t *buf, size_t cap, size_t *off,
-                         const char *name, const char *target,
-                         uint16_t port, uint32_t ttl) {
-    if (!mdns_put_name(buf, cap, off, name)) return false;
+                         const char *instance, const char *service,
+                         const char *target, uint16_t port, uint32_t ttl) {
+    if (!mdns_put_instance_name(buf, cap, off, instance, service))
+        return false;
     if (!mdns_put_u16(buf, cap, off, 33)) return false;      /* SRV */
     if (!mdns_put_u16(buf, cap, off, 0x8001)) return false;  /* cache flush + IN */
     if (!mdns_put_u32(buf, cap, off, ttl)) return false;
@@ -6268,9 +9140,11 @@ static bool mdns_put_srv(uint8_t *buf, size_t cap, size_t *off,
 }
 
 static bool mdns_put_txt_bytes(uint8_t *buf, size_t cap, size_t *off,
-                               const char *name, const void *txt,
-                               uint16_t txt_len, uint32_t ttl) {
-    if (!mdns_put_name(buf, cap, off, name)) return false;
+                               const char *instance, const char *service,
+                               const void *txt, uint16_t txt_len,
+                               uint32_t ttl) {
+    if (!mdns_put_instance_name(buf, cap, off, instance, service))
+        return false;
     if (!mdns_put_u16(buf, cap, off, 16)) return false;      /* TXT */
     if (!mdns_put_u16(buf, cap, off, 0x8001)) return false;  /* cache flush + IN */
     if (!mdns_put_u32(buf, cap, off, ttl)) return false;
@@ -6323,11 +9197,7 @@ static int send_unsolicited_mdns_airplay_announcement(void) {
         printf("[MDNS] No IPv4 address on %s; skipping wire announcement\n", g_wifi_interface);
         return -1;
     }
-    char airplay_inst[128];
-    char raop_inst[160];
     char target[160];
-    snprintf(airplay_inst, sizeof(airplay_inst), "%s._airplay._tcp.local", g_instance_name);
-    snprintf(raop_inst, sizeof(raop_inst), "%s._raop._tcp.local", g_raop_name);
     local_mdns_target_name(target, sizeof(target));
 
     TXTRecordRef apTxt = build_airplay_txt();
@@ -6345,14 +9215,16 @@ static int send_unsolicited_mdns_airplay_announcement(void) {
     ok &= mdns_put_u16(pkt, sizeof(pkt), &off, 0);
     ok &= mdns_put_u16(pkt, sizeof(pkt), &off, 0);
 
-    ok &= mdns_put_ptr(pkt, sizeof(pkt), &off, "_airplay._tcp.local", airplay_inst, 4500);
-    ok &= mdns_put_srv(pkt, sizeof(pkt), &off, airplay_inst, target, AIRPLAY_PORT, 120);
-    ok &= mdns_put_txt_bytes(pkt, sizeof(pkt), &off, airplay_inst,
+    ok &= mdns_put_ptr(pkt, sizeof(pkt), &off, "_airplay._tcp.local", g_instance_name, 4500);
+    ok &= mdns_put_srv(pkt, sizeof(pkt), &off, g_instance_name, "_airplay._tcp.local",
+                       target, AIRPLAY_PORT, 120);
+    ok &= mdns_put_txt_bytes(pkt, sizeof(pkt), &off, g_instance_name, "_airplay._tcp.local",
                              TXTRecordGetBytesPtr(&apTxt),
                              TXTRecordGetLength(&apTxt), 4500);
-    ok &= mdns_put_ptr(pkt, sizeof(pkt), &off, "_raop._tcp.local", raop_inst, 4500);
-    ok &= mdns_put_srv(pkt, sizeof(pkt), &off, raop_inst, target, AIRPLAY_PORT, 120);
-    ok &= mdns_put_txt_bytes(pkt, sizeof(pkt), &off, raop_inst,
+    ok &= mdns_put_ptr(pkt, sizeof(pkt), &off, "_raop._tcp.local", g_raop_name, 4500);
+    ok &= mdns_put_srv(pkt, sizeof(pkt), &off, g_raop_name, "_raop._tcp.local",
+                       target, AIRPLAY_PORT, 120);
+    ok &= mdns_put_txt_bytes(pkt, sizeof(pkt), &off, g_raop_name, "_raop._tcp.local",
                              TXTRecordGetBytesPtr(&raopTxt),
                              TXTRecordGetLength(&raopTxt), 4500);
     ok &= mdns_put_a(pkt, sizeof(pkt), &off, target, wifiAddress, 120);
@@ -6511,8 +9383,8 @@ int main(int argc, char *argv[]) {
     printf("[SVC] RAOP name: %s\n", g_raop_name);
     printf("[SVC] Display:   %ux%u @ %u FPS\n",
            g_display_width, g_display_height, g_display_fps);
-    printf("[SVC] pi:        %s\n", HK_PI);
-    printf("[SVC] pk:        %s\n", HK_PK);
+    printf("[SVC] pi:        %s\n", g_hk_pi);
+    printf("[SVC] pk:        %s\n", g_hk_pk_hex);
     printf("[SVC] Ed25519:   REAL keypair (sk stored for pair-verify)\n");
 
     /* Load the certificate preheated by the long-lived broker helper. */

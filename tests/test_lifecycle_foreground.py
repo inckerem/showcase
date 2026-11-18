@@ -4,7 +4,10 @@ import subprocess
 import tempfile
 
 source = (Path(__file__).resolve().parents[1] / 'source/Showcase.m').read_text()
-method = source[source.index('- (void)handleForeground {'):source.index('- (void)applicationWillTerminate:', source.index('- (void)handleForeground {'))]
+# The shared resync helper sits right before handleForeground; test both.
+start = source.index('- (void)resyncCarPlayVideo {')
+foreground = source.index('- (void)handleForeground {')
+method = source[start:source.index('\n- (void)', foreground + 1)] + '\n'
 code = r'''
 #import <Foundation/Foundation.h>
 #include <assert.h>
@@ -15,6 +18,8 @@ static int visibility, polls, renders;
 #define ip_log(...) ((void)0)
 #define dispatch_async(q, block) (block)()
 static void send_app_visibility(int n) { visibility = n; }
+static int wifiRestores;
+static void showcase_restore_wifi_power_after_cycle(const char *reason) { (void)reason; wifiRestores++; }
 @interface AVSampleBufferDisplayLayer : NSObject
 - (void)flush;
 @end
@@ -29,10 +34,14 @@ static void send_app_visibility(int n) { visibility = n; }
 @property (assign) ShowcaseState state;
 @property (nonatomic, strong) FakeView *videoView;
 @property (assign) void *videoQueue;
+@property (assign) void *bgQueue;
 - (void)endBackgroundTask;
 - (void)pollAP;
 - (void)renderState;
 - (void)presentPendingBluetoothCompatibilityError;
+- (void)presentPendingWifiSetupError;
+- (void)presentPendingServicesSetupError;
+- (void)resyncCarPlayVideo;
 - (void)handleForeground;
 @end
 @implementation Subject
@@ -40,6 +49,8 @@ static void send_app_visibility(int n) { visibility = n; }
 - (void)pollAP { polls++; }
 - (void)renderState { renders++; }
 - (void)presentPendingBluetoothCompatibilityError {}
+- (void)presentPendingWifiSetupError {}
+- (void)presentPendingServicesSetupError {}
 ''' + method + r'''
 @end
 int main(void) { @autoreleasepool {
@@ -51,6 +62,7 @@ int main(void) { @autoreleasepool {
         assert(!g_video_suspended && g_video_needs_resync && visibility == 1);
     }
     assert(polls == 1 && renders == 5);
+    assert(wifiRestores == 5); /* every foreground checks for an interrupted Wi-Fi power cycle */
     puts("PASS: foreground resumes video during every connection phase");
 } }
 '''

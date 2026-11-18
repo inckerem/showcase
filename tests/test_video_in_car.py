@@ -78,22 +78,59 @@ static void expect_no_app_message(int fd) {
     assert(errno == EAGAIN || errno == EWOULDBLOCK);
 }
 
+static int loopback_listener(uint16_t *port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    struct sockaddr_in addr = { .sin_len = sizeof(addr), .sin_family = AF_INET,
+                                .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    assert(bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    socklen_t length = sizeof(addr);
+    assert(getsockname(fd, (struct sockaddr *)&addr, &length) == 0);
+    assert(listen(fd, 4) == 0);
+    *port = ntohs(addr.sin_port);
+    return fd;
+}
+
+static int loopback_connect(uint16_t port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    struct sockaddr_in addr = { .sin_len = sizeof(addr), .sin_family = AF_INET,
+                                .sin_port = htons(port),
+                                .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    assert(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    struct timeval timeout = { .tv_sec = 3 };
+    assert(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+    int yes = 1;
+    assert(setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes)) == 0);
+    return fd;
+}
+
+/* Drives the real settings worker (accept + peer check + encrypted reader). */
 static void settings_roundtrip(void) {
-    int sockets[2];
-    make_pair(sockets);
-    int receiver = sockets[0], peer = sockets[1];
+    uint16_t port = 0;
+    int listener = loopback_listener(&port);
+    encrypted_ctx_t keys = {0};
+    memset(keys.readKey, 0x17, sizeof(keys.readKey));
+    memset(keys.writeKey, 0x81, sizeof(keys.writeKey));
+
+    /* A host that is not the session iPhone is closed without a reply. */
+    snprintf(g_iphone_ip, sizeof(g_iphone_ip), "%s", "192.0.2.1");
+    car_video_start_settings(listener, keys);
+    int stranger = loopback_connect(port);
+    uint8_t byte;
+    ssize_t got = recv(stranger, &byte, 1, 0);
+    assert(got == 0 || (got < 0 && errno == ECONNRESET));
+    close(stranger);
+    pthread_mutex_lock(&g_car_video_lock);
+    assert(g_car_video_settings_client < 0);
+    pthread_mutex_unlock(&g_car_video_lock);
+
+    /* The session iPhone (loopback here) still gets the channel afterwards. */
+    snprintf(g_iphone_ip, sizeof(g_iphone_ip), "%s", "127.0.0.1");
+    int peer = loopback_connect(port);
     encrypted_ctx_t client = {0};
     memset(client.writeKey, 0x17, sizeof(client.writeKey));
     memset(client.readKey, 0x81, sizeof(client.readKey));
-    dispatch_semaphore_t done = dispatch_semaphore_create(0);
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        encrypted_ctx_t keys = {0};
-        memset(keys.readKey, 0x17, sizeof(keys.readKey));
-        memset(keys.writeKey, 0x81, sizeof(keys.writeKey));
-        car_video_read_settings(receiver, &keys);
-        close(receiver);
-        dispatch_semaphore_signal(done);
-    });
     uint8_t packet[68] = {0, 0, 0, 36, 's', 'y', 'n', 'c'};
     packet[27] = 0x25;
     packet[39] = 32;
@@ -107,7 +144,16 @@ static void settings_roundtrip(void) {
     assert(enc_recv_frame(peer, &client, reply, sizeof(reply)) == sizeof(reply));
     assert(reply[27] == 0x48);
     close(peer);
-    assert(dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0);
+    /* The worker releases the channel once the peer goes away. */
+    bool released = false;
+    for (int i = 0; i < 200 && !released; ++i) {
+        pthread_mutex_lock(&g_car_video_lock);
+        released = g_car_video_settings_client < 0;
+        pthread_mutex_unlock(&g_car_video_lock);
+        if (!released) usleep(10000);
+    }
+    assert(released);
+    g_iphone_ip[0] = '\0';
 }
 
 int main(void) {

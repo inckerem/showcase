@@ -3,12 +3,24 @@ set -e
 wasEnabled=0
 if [ -e /var/lib/showcase-power/enabled ]; then wasEnabled=1; fi
 restore_marker() {
+  # prerm itself restores the state here, so postinst abort-* must not redo it.
+  rm -f /var/lib/showcase-power/was-enabled
   if [ "$wasEnabled" -eq 1 ]; then
     (umask 022; : > /var/lib/showcase-power/enabled)
     chown 0:0 /var/lib/showcase-power/enabled
     chmod 0644 /var/lib/showcase-power/enabled
   fi
 }
+# Record the pre-removal state for the old postinst's abort-* recovery: dpkg
+# calls it after a failed upgrade/removal, when enabled is already gone.
+if [ -d /var/lib/showcase-power ] && [ ! -L /var/lib/showcase-power ]; then
+  rm -f /var/lib/showcase-power/was-enabled
+  if [ "$wasEnabled" -eq 1 ]; then
+    (umask 022; : > /var/lib/showcase-power/was-enabled)
+    chown 0:0 /var/lib/showcase-power/was-enabled
+    chmod 0644 /var/lib/showcase-power/was-enabled
+  fi
+fi
 rm -f /var/lib/showcase-power/enabled
 if [ -x /usr/libexec/showcase-powerd ]; then /usr/libexec/showcase-powerd --disable || true; fi
 if ! jobs=$(/bin/launchctl list 2>/dev/null); then

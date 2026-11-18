@@ -2,8 +2,8 @@
 
 "Wi-Fi network is required." = "需要 Wi-Fi 网络。";
 "Wi-Fi name must be at least 6 characters. iOS rejects shorter names for CarPlay." = "Wi-Fi 名称至少需要 6 个字符。iOS 不接受更短的 CarPlay 网络名称。";
-"Wi-Fi name cannot contain \"%@\". Rename this %@ in Settings › General › About › Name." = "Wi-Fi 名称不能包含“%@”。请在“设置 › 通用 › 关于本机 › 名称”中重命名这台 %@。";
 "Wi-Fi name must be at most 32 bytes." = "Wi-Fi 名称不能超过 32 字节。";
+"Wi-Fi name cannot contain \"%@\". Rename this %@ in Settings › General › About › Name." = "Wi-Fi 名称不能包含“%@”。请在“设置 › 通用 › 关于本机 › 名称”中重命名这台 %@。";
 "Wi-Fi password must be 8 to 63 UTF-8 bytes." = "Wi-Fi 密码必须为 8 至 63 个 UTF-8 字节。";
 "Hotspot passwords must be at least 8 characters." = "热点密码至少需要 8 个字符。";
 "Copy Diagnostic" = "拷贝诊断信息";
@@ -12,7 +12,12 @@
 "Give us a star on GitHub!" = "在 GitHub 上给我们点个 Star！";
 "Copy Link" = "拷贝链接";
 "Open GitHub" = "打开 GitHub";
-"Safe travels" = "一路平安";
+"CarPlay Could Not Start" = "无法启动 CarPlay";
+"Showcase's CarPlay services could not start. Try again; if it keeps happening, reinstall Showcase or send logs to KCS from Settings." = "Showcase 的 CarPlay 服务无法启动。请重试；如果问题持续出现，请重新安装 Showcase，或在设置中将日志发送给 KCS。";
+"OK" = "好";
+"CarPlay disconnected" = "CarPlay 已断开";
+"Wireless CarPlay" = "无线 CarPlay";
+"Mirror iPhone Screen" = "镜像 iPhone 屏幕";
 "Settings" = "设置";
 "CarPlay services" = "CarPlay 服务";
 "Verification" = "验证";
@@ -25,9 +30,9 @@
 "Set Up Wi-Fi" = "设置 Wi-Fi";
 "Preparing" = "正在准备";
 "Preparing…" = "正在准备…";
-"Connect to the Internet" = "请连接互联网";
+"Reinstall Showcase" = "请重新安装 Showcase";
 "Try Again" = "重试";
-"Wireless CarPlay" = "无线 CarPlay";
+"Connect to the Internet" = "请连接互联网";
 "Start CarPlay" = "启动 CarPlay";
 "Starting Personal Hotspot" = "正在打开个人热点";
 "Turn On Personal Hotspot" = "请打开个人热点";
@@ -42,7 +47,8 @@
 "Could not read the connected Wi-Fi name. Check Wi-Fi in Settings and try again." = "无法读取已连接的 Wi-Fi 名称。请在设置中检查 Wi-Fi 后重试。";
 "This device is connected to “%@”, but Showcase is configured for “%@”. Connect both devices to the same network and update Wi-Fi settings." = "此设备连接到“%@”，但 Showcase 配置为“%@”。请将两个设备连接到同一网络并更新 Wi-Fi 设置。";
 "Wi-Fi Setup" = "Wi-Fi 设置";
-"OK" = "好";
+"This %1$@'s hotspot is called “%2$@”. Your iPhone joins the name you enter here, so it has to match. To use “%3$@”, rename the %1$@ in Settings > General > About > Name." = "此 %1$@ 的热点名为“%2$@”。你的 iPhone 会加入你在此输入的名称，因此两者必须一致。若要使用“%3$@”，请在“设置 > 通用 > 关于本机 > 名称”中重命名 %1$@。";
+"The Personal Hotspot password is different from the one saved in Showcase. Update the hotspot details and try again." = "个人热点密码与 Showcase 中保存的密码不同。请更新热点信息后重试。";
 "Bluetooth Hardware Not Supported" = "不支持此蓝牙硬件";
 "Bluetooth Setup Failed" = "蓝牙设置失败";
 "Showcase could not take over this device's Bluetooth controller. Tell the developer or community that this model is not yet supported and include the diagnostic below." = "Showcase 无法接管此设备的蓝牙控制器。请告知开发者或社区此机型尚不受支持，并附上下方的诊断信息。";
@@ -55,7 +61,6 @@
 "Password" = "密码";
 "Save" = "存储";
 "Different Name" = "名称不一致";
-"This iPad's hotspot is called “%@”. Your iPhone joins the name you enter here, so it has to match. To use “%@”, rename the iPad in Settings > General > About > Name." = "此 iPad 的热点名为“%@”。你的 iPhone 会加入你在此输入的名称，因此两者必须一致。若要使用“%@”，请在“设置 > 通用 > 关于本机 > 名称”中重命名 iPad。";
 "Use “%@”" = "使用“%@”";
 "Keep" = "保留";
 "%@\n\nSaved to:\n%@" = "%@\n\n已存储到：\n%@";
@@ -88,11 +93,12 @@
 "Stop CarPlay" = "停止 CarPlay";
 "Edit" = "编辑";
 "Add Car" = "添加车辆";
+"Stop CarPlay to change these settings." = "请先停止 CarPlay，再更改这些设置。";
 "Use This Car" = "使用此车辆";
 "Tap Again to Delete" = "再次轻点以删除";
 "Delete Car" = "删除车辆";
 "Enter a name for the car." = "请输入车辆名称。";
-"Use a shorter name. CarPlay allows up to 31 characters." = "请使用更短的名称。CarPlay 最多允许 31 个字符。";
+"Use a shorter name. CarPlay allows up to 31 bytes (fewer characters for non-Latin letters)." = "请使用更短的名称。CarPlay 最多允许 31 个字节（非拉丁字母可用的字符数更少）。";
 "Another car already uses this name." = "已有其他车辆使用此名称。";
 "Existing Wi-Fi network" = "现有 Wi-Fi 网络";
 "Personal Hotspot" = "个人热点";
@@ -102,7 +108,7 @@
 "Connected to “%@”. To use this network, enter its name and password below, then tap Save." = "已连接到“%@”。要使用此网络，请在下方输入其名称和密码，然后轻点保存。";
 "8 characters or more" = "至少 8 个字符";
 "Rename This %@" = "重命名这台 %@";
-"Saved, but this iPad's hotspot is called “%@”. Your iPhone can't join until the names match." = "已存储，但此 iPad 的热点名为“%@”。名称一致之前，你的 iPhone 无法加入。";
+"Saved, but this %1$@'s hotspot is called “%2$@”. Your iPhone can't join until the names match." = "已存储，但此 %1$@ 的热点名为“%2$@”。名称一致之前，你的 iPhone 无法加入。";
 "Saved." = "已存储。";
 "Play Sound on This %@" = "在这台 %@ 上播放声音";
 "%u × %u at %u fps" = "%u × %u，%u 帧/秒";
@@ -131,6 +137,7 @@
 "Stop and Send Network Capture" = "停止并发送网络抓包";
 "Start Network Capture" = "开始网络抓包";
 "Capturing" = "正在抓包";
+"Network capture could not start. Turn on Personal Hotspot or join the Wi-Fi network first, then try again." = "无法开始网络抓包。请先打开个人热点或加入 Wi-Fi 网络，然后重试。";
 "Send Last Network Capture" = "发送上次网络抓包";
 "Tap Again to Clear" = "再次轻点以清除";
 "Clear Logs and Captures" = "清除日志和抓包";
@@ -152,3 +159,11 @@
 "2.  Enter Hotspot Details" = "2.  输入热点信息";
 "Enter Details" = "输入信息";
 "Copy" = "拷贝";
+"Waiting for a new frame…\nShowing the last frame received." = "正在等待新画面…\n显示最后收到的画面。";
+"Showcase pairing QR code" = "Showcase 配对二维码";
+"Could not create the QR code. Close this screen and open it again." = "无法生成二维码。请关闭此屏幕后重新打开。";
+"Scan the QR code in Showcase Mirror.\nBoth devices must be on the same Wi-Fi network." = "在 Showcase Mirror 中扫描二维码。\n两个设备必须连接到同一 Wi-Fi 网络。";
+"Connect the iPad to the same Wi-Fi network as the iPhone." = "请将 iPad 连接到与 iPhone 相同的 Wi-Fi 网络。";
+"Could not create the pairing code." = "无法生成配对码。";
+"Could not start the Wi-Fi receiver." = "无法启动 Wi-Fi 接收器。";
+"Starting the Wi-Fi receiver…" = "正在启动 Wi-Fi 接收器…";

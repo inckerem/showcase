@@ -2,7 +2,10 @@
 from pathlib import Path
 import re
 
-SOURCE = Path(__file__).resolve().parents[2] / 'source/Showcase.m'
+ROOT = Path(__file__).resolve().parents[2] / 'source'
+SOURCE = ROOT / 'Showcase.m'
+# screen_mirror_receiver.h is #imported by Showcase.m and uses L() too.
+SOURCES = (SOURCE, ROOT / 'screen_mirror_receiver.h')
 LITERAL = re.compile(r'@?"((?:[^"\\]|\\.)*)"')
 
 
@@ -12,7 +15,7 @@ def unescape(text):
 
 
 def keys(source=None):
-    text = (source or SOURCE).read_text()
+    text = source.read_text() if source else '\n'.join(p.read_text() for p in SOURCES)
     found = []
     for match in re.finditer(r'\bL\(\s*@"', text):
         at, parts = match.end() - 2, []

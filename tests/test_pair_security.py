@@ -19,7 +19,8 @@ class PairSecurityTests(unittest.TestCase):
                 str(ROOT/'source/vendor/libtommath/tommath.c'),
                 '-framework', 'Security', '-o', str(binary),
             ], check=True)
-            for case in ('tlv', 'signature', 'state', 'valid', 'corrupt'):
+            for case in ('tlv', 'signature', 'state', 'valid', 'corrupt', 'flow', 'bad_a',
+                         'wrong_pin', 'm3_replay', 'verify_unpaired', 'verify_corrupt'):
                 with self.subTest(case=case):
                     subprocess.run([str(binary), case], check=True)
 

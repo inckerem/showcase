@@ -2,8 +2,8 @@
 
 "Wi-Fi network is required." = "Wi-Fi ağı gerekli.";
 "Wi-Fi name must be at least 6 characters. iOS rejects shorter names for CarPlay." = "Wi-Fi adı en az 6 karakter olmalı. iOS, CarPlay için daha kısa adları kabul etmez.";
-"Wi-Fi name cannot contain \"%@\". Rename this %@ in Settings › General › About › Name." = "Wi-Fi adı \"%@\" içeremez. Bu %@ aygıtının adını Ayarlar › Genel › Hakkında › Ad bölümünden değiştirin.";
 "Wi-Fi name must be at most 32 bytes." = "Wi-Fi adı en fazla 32 bayt olabilir.";
+"Wi-Fi name cannot contain \"%@\". Rename this %@ in Settings › General › About › Name." = "Wi-Fi adı \"%@\" içeremez. Bu %@ aygıtının adını Ayarlar › Genel › Hakkında › Ad bölümünden değiştirin.";
 "Wi-Fi password must be 8 to 63 UTF-8 bytes." = "Wi-Fi şifresi UTF-8 olarak 8 ila 63 bayt arasında olmalı.";
 "Hotspot passwords must be at least 8 characters." = "Erişim noktası parolası en az 8 karakter olmalı.";
 "Copy Diagnostic" = "Tanılama Bilgilerini Kopyala";
@@ -12,7 +12,12 @@
 "Give us a star on GitHub!" = "GitHub’da bize yıldız verin!";
 "Copy Link" = "Bağlantıyı Kopyala";
 "Open GitHub" = "GitHub’ı Aç";
-"Safe travels" = "Güvenli yolculuklar";
+"CarPlay Could Not Start" = "CarPlay Başlatılamadı";
+"Showcase's CarPlay services could not start. Try again; if it keeps happening, reinstall Showcase or send logs to KCS from Settings." = "Showcase’in CarPlay hizmetleri başlatılamadı. Yeniden deneyin; sorun sürerse Showcase’i yeniden yükleyin ya da Ayarlar’dan günlükleri KCS’ye gönderin.";
+"OK" = "Tamam";
+"CarPlay disconnected" = "CarPlay kapatıldı";
+"Wireless CarPlay" = "Kablosuz CarPlay";
+"Mirror iPhone Screen" = "iPhone Ekranını Yansıt";
 "Settings" = "Ayarlar";
 "CarPlay services" = "CarPlay servisleri";
 "Verification" = "Doğrulama";
@@ -25,9 +30,9 @@
 "Set Up Wi-Fi" = "Wi-Fi’yi Ayarla";
 "Preparing" = "Hazırlanıyor";
 "Preparing…" = "Hazırlanıyor…";
-"Connect to the Internet" = "İnternete Bağlanın";
+"Reinstall Showcase" = "Showcase’i Yeniden Yükleyin";
 "Try Again" = "Tekrar Dene";
-"Wireless CarPlay" = "Kablosuz CarPlay";
+"Connect to the Internet" = "İnternete Bağlanın";
 "Start CarPlay" = "CarPlay’i Başlat";
 "Starting Personal Hotspot" = "Kişisel Erişim Noktası açılıyor";
 "Turn On Personal Hotspot" = "Kişisel Erişim Noktası’nı Açın";
@@ -36,13 +41,14 @@
 "Getting Ready" = "Hazırlanıyor";
 "Connecting" = "Bağlanıyor";
 "Choose %@ in CarPlay on your iPhone" = "iPhone’unuzda CarPlay bölümünden %@ seçeneğini seçin";
-"See you soon" = "Hoşça kal";
+"See you soon" = "Görüşmek üzere";
 "Stopping" = "Durduruluyor";
 "Connect this device to the Wi-Fi network first." = "Önce bu aygıtı Wi-Fi ağına bağlayın.";
 "Could not read the connected Wi-Fi name. Check Wi-Fi in Settings and try again." = "Bağlı olunan Wi-Fi ağının adı okunamadı. Ayarlar’dan Wi-Fi bağlantısını kontrol edip tekrar deneyin.";
 "This device is connected to “%@”, but Showcase is configured for “%@”. Connect both devices to the same network and update Wi-Fi settings." = "Bu aygıt “%@” ağına bağlı, ancak Showcase için “%@” ayarlanmış. İki aygıtı aynı ağa bağlayın ve Wi-Fi ayarlarını güncelleyin.";
 "Wi-Fi Setup" = "Wi-Fi Kurulumu";
-"OK" = "Tamam";
+"This %1$@'s hotspot is called “%2$@”. Your iPhone joins the name you enter here, so it has to match. To use “%3$@”, rename the %1$@ in Settings > General > About > Name." = "Bu %1$@ cihazının erişim noktasının adı “%2$@”. iPhone’unuz burada girdiğiniz ağa bağlanır; bu nedenle adlar eşleşmeli. “%3$@” kullanmak için %1$@ cihazının adını Ayarlar > Genel > Hakkında > Ad bölümünden değiştirin.";
+"The Personal Hotspot password is different from the one saved in Showcase. Update the hotspot details and try again." = "Kişisel Erişim Noktası parolası Showcase’te kayıtlı olandan farklı. Erişim noktası bilgilerini güncelleyip yeniden deneyin.";
 "Bluetooth Hardware Not Supported" = "Bluetooth Donanımı Desteklenmiyor";
 "Bluetooth Setup Failed" = "Bluetooth Kurulumu Başarısız";
 "Showcase could not take over this device's Bluetooth controller. Tell the developer or community that this model is not yet supported and include the diagnostic below." = "Showcase bu aygıtın Bluetooth denetleyicisini kullanamadı. Bu modelin henüz desteklenmediğini geliştiriciye veya topluluğa bildirin ve aşağıdaki tanılama bilgilerini ekleyin.";
@@ -55,7 +61,6 @@
 "Password" = "Parola";
 "Save" = "Kaydet";
 "Different Name" = "Farklı Ad";
-"This iPad's hotspot is called “%@”. Your iPhone joins the name you enter here, so it has to match. To use “%@”, rename the iPad in Settings > General > About > Name." = "Bu iPad’in erişim noktasının adı “%@”. iPhone’unuz burada girdiğiniz ağa bağlanır; bu nedenle adlar eşleşmeli. “%@” kullanmak için iPad’in adını Ayarlar > Genel > Hakkında > Ad bölümünden değiştirin.";
 "Use “%@”" = "“%@” Kullan";
 "Keep" = "Olduğu Gibi Bırak";
 "%@\n\nSaved to:\n%@" = "%@\n\nKaydedildiği yer:\n%@";
@@ -88,11 +93,12 @@
 "Stop CarPlay" = "CarPlay’i Durdur";
 "Edit" = "Düzenle";
 "Add Car" = "Araç Ekle";
+"Stop CarPlay to change these settings." = "Bu ayarları değiştirmek için CarPlay’i durdurun.";
 "Use This Car" = "Bu Aracı Kullan";
 "Tap Again to Delete" = "Silmek İçin Tekrar Dokunun";
 "Delete Car" = "Aracı Sil";
 "Enter a name for the car." = "Araç için bir ad girin.";
-"Use a shorter name. CarPlay allows up to 31 characters." = "Daha kısa bir ad kullanın. CarPlay en fazla 31 karaktere izin verir.";
+"Use a shorter name. CarPlay allows up to 31 bytes (fewer characters for non-Latin letters)." = "Daha kısa bir ad kullanın. CarPlay en fazla 31 bayta izin verir (Latin dışı harflerde sığan karakter sayısı daha azdır).";
 "Another car already uses this name." = "Başka bir araç zaten bu adı kullanıyor.";
 "Existing Wi-Fi network" = "Mevcut Wi-Fi ağı";
 "Personal Hotspot" = "Kişisel Erişim Noktası";
@@ -102,7 +108,7 @@
 "Connected to “%@”. To use this network, enter its name and password below, then tap Save." = "“%@” ağına bağlısınız. Bu ağı kullanmak için aşağıya ağ adını ve şifresini girip Kaydet’e dokunun.";
 "8 characters or more" = "En az 8 karakter";
 "Rename This %@" = "Bu %@ Adını Değiştir";
-"Saved, but this iPad's hotspot is called “%@”. Your iPhone can't join until the names match." = "Kaydedildi, ancak bu iPad’in erişim noktasının adı “%@”. Adlar eşleşene kadar iPhone’unuz bağlanamaz.";
+"Saved, but this %1$@'s hotspot is called “%2$@”. Your iPhone can't join until the names match." = "Kaydedildi, ancak bu %1$@ cihazının erişim noktasının adı “%2$@”. Adlar eşleşene kadar iPhone’unuz bağlanamaz.";
 "Saved." = "Kaydedildi.";
 "Play Sound on This %@" = "Sesi Bu %@ Üzerinde Çal";
 "%u × %u at %u fps" = "%u × %u, %u fps";
@@ -131,6 +137,7 @@
 "Stop and Send Network Capture" = "Ağ Kaydını Durdur ve Gönder";
 "Start Network Capture" = "Ağ Kaydını Başlat";
 "Capturing" = "Kaydediliyor";
+"Network capture could not start. Turn on Personal Hotspot or join the Wi-Fi network first, then try again." = "Ağ kaydı başlatılamadı. Önce Kişisel Erişim Noktası’nı açın ya da Wi-Fi ağına katılın, sonra yeniden deneyin.";
 "Send Last Network Capture" = "Son Ağ Kaydını Gönder";
 "Tap Again to Clear" = "Temizlemek İçin Tekrar Dokunun";
 "Clear Logs and Captures" = "Günlükleri ve Kayıtları Temizle";
@@ -152,3 +159,11 @@
 "2.  Enter Hotspot Details" = "2.  Erişim Noktası Bilgilerini Girin";
 "Enter Details" = "Bilgileri Gir";
 "Copy" = "Kopyala";
+"Waiting for a new frame…\nShowing the last frame received." = "Yeni görüntü karesi bekleniyor…\nSon alınan kare gösteriliyor.";
+"Showcase pairing QR code" = "Showcase eşleştirme QR kodu";
+"Could not create the QR code. Close this screen and open it again." = "QR kodu oluşturulamadı. Bu ekranı kapatıp yeniden açın.";
+"Scan the QR code in Showcase Mirror.\nBoth devices must be on the same Wi-Fi network." = "QR kodunu Showcase Mirror’da okutun.\nİki aygıt da aynı Wi-Fi ağında olmalı.";
+"Connect the iPad to the same Wi-Fi network as the iPhone." = "iPad’i iPhone ile aynı Wi-Fi ağına bağlayın.";
+"Could not create the pairing code." = "Eşleştirme kodu oluşturulamadı.";
+"Could not start the Wi-Fi receiver." = "Wi-Fi alıcısı başlatılamadı.";
+"Starting the Wi-Fi receiver…" = "Wi-Fi alıcısı başlatılıyor…";

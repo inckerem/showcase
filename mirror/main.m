@@ -144,6 +144,10 @@
 @property (nonatomic) BOOL sending;
 @property (nonatomic) BOOL needsKeyframe;
 @property (nonatomic) CFTimeInterval lastSend;
+// When the in-flight write started; a write that never completes means the iPad is gone.
+@property (nonatomic) CFTimeInterval sendStarted;
+// When the connection path became non-viable (0 while viable).
+@property (nonatomic) CFTimeInterval nonViableSince;
 @property (nonatomic) CFTimeInterval nextFrameTime;
 @property (nonatomic, strong) NSData *pendingVideo;
 @property (nonatomic) VTPixelRotationSessionRef rotationSession;
@@ -152,14 +156,49 @@
 @property (nonatomic) size_t rotationHeight;
 @property (nonatomic) OSType rotationFormat;
 @property (nonatomic) CGImagePropertyOrientation frameOrientation;
+// Last sample whose status proves capture is alive (Complete/Started/Idle). Suspended and Blank samples
+// are recorded separately so a dead capture is not mistaken for a static screen.
 @property (nonatomic) CFTimeInterval lastCapturedFrame;
+@property (nonatomic) CFTimeInterval lastUnavailableFrame;
 @property (nonatomic) CFTimeInterval lastVideoSent;
+// When the last keyframe was handed to the connection. The low-latency hardware encoder may produce an
+// infinite GOP, so periodic IDR frames are forced explicitly (see encodeHeldImageAt:).
+@property (nonatomic) CFTimeInterval lastKeyframeSent;
 @property (nonatomic) CFTimeInterval encoderRetryAfter;
 @property (nonatomic) BOOL softwareEncoder;
+@property (nonatomic) CFTimeInterval softwareEncoderSince;
+// Consecutive encoder resets without a successfully encoded frame; drives the retry backoff.
+@property (nonatomic) NSUInteger encoderFailures;
 @property (nonatomic) BOOL videoStalled;
+@property (nonatomic) CFTimeInterval lastStallRecovery;
 @property (nonatomic) CFTimeInterval encodeStarted;
 @property (nonatomic) NSUInteger encoderGeneration;
+// Latest captured frame (retained). Kept after encoding so a frame skipped by the rate limiter is
+// sent once the encoder frees up, and so a static screen is periodically re-sent as a keyframe.
+@property (nonatomic) CVPixelBufferRef heldImage;
+@property (nonatomic) CGImagePropertyOrientation heldOrientation;
+@property (nonatomic) BOOL heldFresh;
+@property (nonatomic) BOOL pumpScheduled;
 @end
+
+static const CFTimeInterval MirrorFrameInterval = 1.0 / 30.0;
+static const CFTimeInterval MirrorStaticResendInterval = 1.0;
+// A static screen is re-sent only while ScreenCaptureKit keeps reporting a live capture this recently;
+// otherwise the stall warnings on both devices must be allowed to appear instead of a frozen frame.
+static const CFTimeInterval MirrorCaptureLiveWindow = 2.0;
+// The iPad drops every P frame after it loses one and has no way to ask for a keyframe, so a keyframe is
+// forced at least this often even while the screen keeps changing.
+static const CFTimeInterval MirrorKeyframeInterval = 1.0;
+static const CFTimeInterval MirrorVideoStallTimeout = 5.0;
+static const CFTimeInterval MirrorSoftwareEncoderRetryHardware = 30.0;
+static const CFTimeInterval MirrorRotationRetryDelay = 0.25;
+// Encoder retry delays for consecutive failures (the last one repeats). Indexed by the failure count, so
+// a persistently failing encoder is not rebuilt several times a second.
+static const CFTimeInterval MirrorEncoderRetryDelays[] = {0.25, 1.0, 2.0};
+static const NSUInteger MirrorEncoderRetryDelayCount =
+    sizeof(MirrorEncoderRetryDelays) / sizeof(MirrorEncoderRetryDelays[0]);
+// Matches the iPad receiver's idle cutoff: a write or path stuck longer than this is a dead peer.
+static const CFTimeInterval MirrorPeerTimeout = 8.0;
 
 @implementation MirrorController
 
@@ -205,22 +244,53 @@
     if (!self.stream) return;
     // A suspended hardware session can keep returning errors after the app changes state.
     [self closeEncoder];
+    // The pixel rotation session is a VideoToolbox session too; rebuild it with the encoder.
+    [self closeRotation];
     self.encoding = NO;
     self.needsKeyframe = YES;
     self.softwareEncoder = NO;
+    self.encoderFailures = 0;
     self.encoderRetryAfter = 0;
     self.nextFrameTime = 0;
     self.pendingVideo = nil;
+    // Screen lock also lands here: re-send the held frame only while capture is still live.
+    [self rearmHeldImage];
     NSLog(@"[Showcase Mirror] Capture app transition: %@", notification.name);
+    [self pumpVideo];
 }
 
 - (void)recoverEncoderFromError:(OSStatus)error {
     NSLog(@"[Showcase Mirror] Encoder reset (%d, software=%d)", (int)error, self.softwareEncoder);
+    CFTimeInterval now = NSProcessInfo.processInfo.systemUptime;
     [self closeEncoder];
     self.encoding = NO;
     self.needsKeyframe = YES;
-    self.encoderRetryAfter = NSProcessInfo.processInfo.systemUptime + (self.softwareEncoder ? 1.0 : 0.25);
-    self.softwareEncoder = YES;
+    // Back off across consecutive failures: openEncoderWidth may silently drop a software request back to
+    // hardware, so the software/hardware flag alone cannot tell a first failure from a repeated one.
+    CFTimeInterval delay = MirrorEncoderRetryDelays[MIN(self.encoderFailures, MirrorEncoderRetryDelayCount - 1)];
+    if (self.softwareEncoder) delay = MAX(delay, 1.0);
+    self.encoderFailures++;
+    self.encoderRetryAfter = now + delay;
+    // Alternate instead of latching software: if the software encoder also fails, go back to hardware.
+    self.softwareEncoder = !self.softwareEncoder;
+    if (self.softwareEncoder) self.softwareEncoderSince = now;
+    // The frame that was being encoded is lost; re-encode the held one once the retry delay passes.
+    [self rearmHeldImage];
+    [self pumpVideo];
+}
+
+// Marks the held frame for (re-)encoding only while ScreenCaptureKit still reports a live capture;
+// the last frame of a suspended or blank capture must surface as a stall, never as a live frame.
+- (void)rearmHeldImage {
+    CFTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    self.heldFresh = self.heldImage != NULL && now - self.lastCapturedFrame < MirrorCaptureLiveWindow;
+}
+
+- (void)setHeldImage:(CVPixelBufferRef)image {
+    if (image == _heldImage) return;
+    if (image) CVPixelBufferRetain(image);
+    if (_heldImage) CVPixelBufferRelease(_heldImage);
+    _heldImage = image;
 }
 
 - (void)scanPairing {
@@ -267,6 +337,11 @@
             [controller stop:@"Bağlantı kapandı. Wi-Fi’yi kontrol edip QR kodunu tekrar okut."];
         }
     });
+    nw_connection_set_viability_changed_handler(peer, ^(bool viable) {
+        MirrorController *controller = weakSelf;
+        if (controller.peer != peer) return;
+        controller.nonViableSince = viable ? 0 : NSProcessInfo.processInfo.systemUptime;
+    });
     nw_connection_start(peer);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 12 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         MirrorController *controller = weakSelf;
@@ -287,18 +362,64 @@
         MirrorController *controller = weakSelf;
         if (!controller) return;
         CFTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+        // A peer that vanished without RST/FIN never completes the write (or keeps the path
+        // non-viable) until the TCP retransmission timeout, minutes later; end the session instead.
+        if ((controller.sending && now - controller.sendStarted > MirrorPeerTimeout) ||
+            (controller.nonViableSince && now - controller.nonViableSince > MirrorPeerTimeout)) {
+            NSLog(@"[Showcase Mirror] Peer unresponsive (write pending=%d for %.1fs, non-viable for %.1fs)",
+                  controller.sending, controller.sending ? now - controller.sendStarted : 0.0,
+                  controller.nonViableSince ? now - controller.nonViableSince : 0.0);
+            [controller stop:@"Yansıtma bağlantısı kesildi. Wi-Fi’yi kontrol edip QR kodunu tekrar okut."];
+            return;
+        }
         if (controller.encoding && now - controller.encodeStarted > 1.0) {
             [controller recoverEncoderFromError:kVTVideoEncoderNotAvailableNowErr];
         }
-        if (controller.stream && !controller.videoStalled && now - controller.lastVideoSent > 5.0) {
-            BOOL receiving = now - controller.lastCapturedFrame < 2.0;
-            controller.videoStalled = YES;
-            NSLog(@"[Showcase Mirror] Video stalled (capture age %.1fs, write pending=%d)",
-                  now - controller.lastCapturedFrame, controller.sending);
-            controller.status.text = receiving
-                ? @"Ekran yakalanıyor. Görüntü aktarımı yeniden başlatılıyor…"
-                : @"iOS’tan yeni ekran karesi bekleniyor…";
+        if (controller.stream && controller.softwareEncoder && !controller.encoding &&
+            now - controller.softwareEncoderSince > MirrorSoftwareEncoderRetryHardware &&
+            UIApplication.sharedApplication.applicationState == UIApplicationStateActive) {
+            // Software was a fallback for a transient hardware failure; try hardware again.
+            [controller closeEncoder];
+            controller.softwareEncoder = NO;
+            controller.needsKeyframe = YES;
+            [controller rearmHeldImage];
         }
+        if (controller.stream && now - controller.lastVideoSent > MirrorVideoStallTimeout &&
+            now - controller.lastStallRecovery > MirrorVideoStallTimeout) {
+            BOOL receiving = now - controller.lastCapturedFrame < MirrorCaptureLiveWindow;
+            NSLog(@"[Showcase Mirror] Video stalled (capture age %.1fs, suspended/blank age %.1fs, "
+                  "write pending=%d, software=%d)",
+                  now - controller.lastCapturedFrame,
+                  controller.lastUnavailableFrame ? now - controller.lastUnavailableFrame : -1.0,
+                  controller.sending, controller.softwareEncoder);
+            if (!controller.videoStalled) {
+                controller.videoStalled = YES;
+                controller.status.text = receiving
+                    ? @"Ekran yakalanıyor. Görüntü aktarımı yeniden başlatılıyor…"
+                    : @"iOS’tan yeni ekran karesi bekleniyor…";
+            }
+            // Actually restart the video path from a fresh hardware session and a keyframe.
+            controller.lastStallRecovery = now;
+            [controller closeEncoder];
+            [controller closeRotation];
+            controller.encoding = NO;
+            controller.needsKeyframe = YES;
+            controller.softwareEncoder = NO;
+            controller.encoderRetryAfter = 0;
+            controller.nextFrameTime = 0;
+            // Re-encoding a held frame from a dead capture would only refresh the iPad with a frozen image.
+            [controller rearmHeldImage];
+        }
+        if (controller.heldImage && !controller.heldFresh && !controller.encoding && !controller.pendingVideo &&
+            now - controller.lastVideoSent > MirrorStaticResendInterval &&
+            now - controller.lastCapturedFrame < MirrorCaptureLiveWindow) {
+            // Static screen: ScreenCaptureKit sends no new image, so re-send the last one as a keyframe
+            // to keep the receiver fresh and let it recover from a lost frame. Only while capture is
+            // still alive: a suspended or blank capture must surface as a stall, not as a live frame.
+            controller.needsKeyframe = YES;
+            controller.heldFresh = YES;
+        }
+        [controller pumpVideo];
         if (!controller.sending && !controller.encoding && now - controller.lastSend > 2.0) {
             uint32_t zero = 0;
             [controller send:[NSData dataWithBytes:&zero length:sizeof(zero)]];
@@ -320,6 +441,7 @@
     self.timer = nil;
     if (self.peer) {
         nw_connection_set_state_changed_handler(self.peer, nil);
+        nw_connection_set_viability_changed_handler(self.peer, nil);
         nw_connection_cancel(self.peer);
         self.peer = nil;
     }
@@ -333,20 +455,18 @@
     [self closeEncoder];
     self.encoding = NO;
     self.sending = NO;
+    self.nonViableSince = 0;
     self.softwareEncoder = NO;
+    self.encoderFailures = 0;
     self.videoStalled = NO;
+    self.lastStallRecovery = 0;
     self.encoderRetryAfter = 0;
     self.nextFrameTime = 0;
     self.pendingVideo = nil;
+    self.heldImage = NULL;
+    self.heldFresh = NO;
     self.frameOrientation = kCGImagePropertyOrientationUp;
-    if (self.rotationPool) {
-        CVPixelBufferPoolRelease(self.rotationPool);
-        self.rotationPool = NULL;
-    }
-    if (self.rotationSession) {
-        CFRelease(self.rotationSession);
-        self.rotationSession = NULL;
-    }
+    [self closeRotation];
     self.action.hidden = YES;
     self.scan.hidden = NO;
     self.status.text = status;
@@ -370,7 +490,7 @@
         if (!self.peer || !self.awaitingPicker) return;
         self.awaitingPicker = NO;
         NSLog(@"[Showcase Mirror] Capture filter style: %ld", (long)filter.style);
-        if (filter.style == SCShareableContentStyleWindow) {
+        if (filter.style != SCShareableContentStyleDisplay) {
             [self stop:@"Diğer uygulamaları yansıtmak için tam ekran paylaşımını seç."];
             return;
         }
@@ -384,6 +504,7 @@
         self.stream = stream;
         self.lastVideoSent = NSProcessInfo.processInfo.systemUptime;
         self.lastCapturedFrame = self.lastVideoSent;
+        self.lastUnavailableFrame = 0;
         NSError *error;
         if (![stream addStreamOutput:self type:SCStreamOutputTypeScreen
                  sampleHandlerQueue:dispatch_get_main_queue() error:&error]) {
@@ -418,6 +539,18 @@
     self.encoder = NULL;
 }
 
+- (void)closeRotation {
+    if (self.rotationPool) {
+        CVPixelBufferPoolRelease(self.rotationPool);
+        self.rotationPool = NULL;
+    }
+    if (self.rotationSession) {
+        VTPixelRotationSessionInvalidate(self.rotationSession);
+        CFRelease(self.rotationSession);
+        self.rotationSession = NULL;
+    }
+}
+
 - (BOOL)openEncoderWidth:(int)width height:(int)height {
     [self closeEncoder];
     VTCompressionSessionRef encoder = NULL;
@@ -428,9 +561,15 @@
     };
     OSStatus status = VTCompressionSessionCreate(NULL, width, height, kCMVideoCodecType_H264,
         (__bridge CFDictionaryRef)specification, NULL, NULL, NULL, NULL, &encoder);
-    if (status && !self.softwareEncoder) {
+    if (status) {
+        // Let VideoToolbox pick any encoder (hardware included) when the requested one is unavailable.
+        encoder = NULL;
         status = VTCompressionSessionCreate(NULL, width, height, kCMVideoCodecType_H264,
             NULL, NULL, NULL, NULL, NULL, &encoder);
+        if (!status && self.softwareEncoder) {
+            NSLog(@"[Showcase Mirror] Software encoder unavailable; using default encoder");
+            self.softwareEncoder = NO;
+        }
     }
     if (status) return NO;
     self.encoder = encoder;
@@ -448,12 +587,15 @@
     return VTCompressionSessionPrepareToEncodeFrames(encoder) == noErr;
 }
 
-static CGImagePropertyOrientation mirrorFrameOrientation(CMSampleBufferRef sample) {
+static NSNumber *mirrorFrameInfo(CMSampleBufferRef sample, SCStreamFrameInfo key) {
     NSArray *attachments = (__bridge NSArray *)CMSampleBufferGetSampleAttachmentsArray(sample, false);
-    NSNumber *value = attachments.firstObject[SCStreamFrameInfoVideoOrientation];
-    if (!value) value = (__bridge NSNumber *)CMGetAttachment(sample,
-        (__bridge CFStringRef)SCStreamFrameInfoVideoOrientation, NULL);
-    NSInteger orientation = value.integerValue;
+    NSNumber *value = attachments.firstObject[key];
+    if (!value) value = (__bridge NSNumber *)CMGetAttachment(sample, (__bridge CFStringRef)key, NULL);
+    return [value isKindOfClass:NSNumber.class] ? value : nil;
+}
+
+static CGImagePropertyOrientation mirrorFrameOrientation(CMSampleBufferRef sample) {
+    NSInteger orientation = mirrorFrameInfo(sample, SCStreamFrameInfoVideoOrientation).integerValue;
     return orientation >= 1 && orientation <= 8 ? (CGImagePropertyOrientation)orientation
                                                 : kCGImagePropertyOrientationUp;
 }
@@ -478,7 +620,11 @@ static CGImagePropertyOrientation mirrorFrameOrientation(CMSampleBufferRef sampl
     size_t width = swap ? CVPixelBufferGetHeight(image) : CVPixelBufferGetWidth(image);
     size_t height = swap ? CVPixelBufferGetWidth(image) : CVPixelBufferGetHeight(image);
     OSType format = CVPixelBufferGetPixelFormatType(image);
-    if (!self.rotationSession && VTPixelRotationSessionCreate(NULL, &_rotationSession) != noErr) return NULL;
+    OSStatus status = noErr;
+    if (!self.rotationSession && (status = VTPixelRotationSessionCreate(NULL, &_rotationSession)) != noErr) {
+        NSLog(@"[Showcase Mirror] Rotation session create failed (%d)", (int)status);
+        return NULL;
+    }
     if (!self.rotationPool || self.rotationWidth != width || self.rotationHeight != height ||
         self.rotationFormat != format) {
         if (self.rotationPool) CVPixelBufferPoolRelease(self.rotationPool);
@@ -489,19 +635,30 @@ static CGImagePropertyOrientation mirrorFrameOrientation(CMSampleBufferRef sampl
             (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(format),
             (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
         };
-        if (CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)attributes, &_rotationPool) != kCVReturnSuccess)
+        CVReturn poolStatus = CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)attributes, &_rotationPool);
+        if (poolStatus != kCVReturnSuccess) {
+            NSLog(@"[Showcase Mirror] Rotation pool create failed (%d, %zux%zu)", (int)poolStatus, width, height);
             return NULL;
+        }
         self.rotationWidth = width;
         self.rotationHeight = height;
         self.rotationFormat = format;
     }
-    if (VTSessionSetProperty(self.rotationSession, kVTPixelRotationPropertyKey_Rotation, rotation) != noErr ||
-        VTSessionSetProperty(self.rotationSession, kVTPixelRotationPropertyKey_FlipHorizontalOrientation,
-                             flip ? kCFBooleanTrue : kCFBooleanFalse) != noErr) return NULL;
+    if ((status = VTSessionSetProperty(self.rotationSession, kVTPixelRotationPropertyKey_Rotation, rotation)) != noErr ||
+        (status = VTSessionSetProperty(self.rotationSession, kVTPixelRotationPropertyKey_FlipHorizontalOrientation,
+                                       flip ? kCFBooleanTrue : kCFBooleanFalse)) != noErr) {
+        NSLog(@"[Showcase Mirror] Rotation configure failed (%d)", (int)status);
+        return NULL;
+    }
 
     CVPixelBufferRef output = NULL;
-    if (CVPixelBufferPoolCreatePixelBuffer(NULL, self.rotationPool, &output) != kCVReturnSuccess) return NULL;
-    if (VTPixelRotationSessionRotateImage(self.rotationSession, image, output) != noErr) {
+    CVReturn bufferStatus = CVPixelBufferPoolCreatePixelBuffer(NULL, self.rotationPool, &output);
+    if (bufferStatus != kCVReturnSuccess) {
+        NSLog(@"[Showcase Mirror] Rotation buffer allocation failed (%d)", (int)bufferStatus);
+        return NULL;
+    }
+    if ((status = VTPixelRotationSessionRotateImage(self.rotationSession, image, output)) != noErr) {
+        NSLog(@"[Showcase Mirror] Rotation failed (%d, orientation=%d)", (int)status, (int)orientation);
         CVPixelBufferRelease(output);
         return NULL;
     }
@@ -511,19 +668,67 @@ static CGImagePropertyOrientation mirrorFrameOrientation(CMSampleBufferRef sampl
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sample
         ofType:(SCStreamOutputType)type {
     if (type != SCStreamOutputTypeScreen || stream != self.stream || !self.peer) return;
+    CFTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    NSNumber *statusValue = mirrorFrameInfo(sample, SCStreamFrameInfoStatus);
+    SCFrameStatus status = statusValue ? (SCFrameStatus)statusValue.integerValue : SCFrameStatusComplete;
+    if (status != SCFrameStatusComplete && status != SCFrameStatusStarted && status != SCFrameStatusIdle) {
+        // Suspended (screen locked, capture paused) or Blank: not proof of a live capture, and any
+        // image it carries is not real screen content.
+        self.lastUnavailableFrame = now;
+        return;
+    }
+    // Idle samples carry no image but still prove that capture is alive.
+    self.lastCapturedFrame = now;
+    if (status == SCFrameStatusIdle) return;
     CVImageBufferRef image = CMSampleBufferGetImageBuffer(sample);
     if (!image || !CMSampleBufferDataIsReady(sample)) return;
-    CFTimeInterval now = NSProcessInfo.processInfo.systemUptime;
-    self.lastCapturedFrame = now;
-    const CFTimeInterval interval = 1.0 / 30.0;
-    if (self.encoding || self.pendingVideo || now < self.encoderRetryAfter ||
-        now + 0.002 < self.nextFrameTime) return;
-    if (!self.nextFrameTime || now - self.nextFrameTime > interval) self.nextFrameTime = now;
-    self.nextFrameTime += interval;
+    // Keep the newest frame instead of dropping it when the encoder or rate limiter is busy,
+    // so the last frame of a motion is always delivered.
+    self.heldImage = image;
+    self.heldOrientation = mirrorFrameOrientation(sample);
+    self.heldFresh = YES;
+    [self pumpVideo];
+}
 
-    CGImagePropertyOrientation orientation = mirrorFrameOrientation(sample);
-    CVPixelBufferRef oriented = [self copyOrientedImage:image orientation:orientation];
-    if (!oriented) return;
+- (void)pumpVideo {
+    if (!self.stream || !self.peer || !self.heldImage || !self.heldFresh) return;
+    // Encoder and send completions call back here once they finish.
+    if (self.encoding || self.pendingVideo) return;
+    CFTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    CFTimeInterval readyAt = MAX(self.encoderRetryAfter, self.nextFrameTime - 0.002);
+    if (now < readyAt) {
+        if (self.pumpScheduled) return;
+        self.pumpScheduled = YES;
+        __weak typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((readyAt - now) * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            MirrorController *controller = weakSelf;
+            controller.pumpScheduled = NO;
+            [controller pumpVideo];
+        });
+        return;
+    }
+    [self encodeHeldImageAt:now];
+}
+
+- (void)encodeHeldImageAt:(CFTimeInterval)now {
+    SCStream *stream = self.stream;
+    if (!self.nextFrameTime || now - self.nextFrameTime > MirrorFrameInterval) self.nextFrameTime = now;
+    self.nextFrameTime += MirrorFrameInterval;
+
+    CGImagePropertyOrientation orientation = self.heldOrientation;
+    CVPixelBufferRef oriented = [self copyOrientedImage:self.heldImage orientation:orientation];
+    self.heldFresh = NO;
+    if (!oriented) {
+        // Rebuild the rotation session/pool (it can stay broken after an app transition, like the
+        // encoder) and retry the held frame after a short delay instead of silently dropping it.
+        [self closeRotation];
+        self.needsKeyframe = YES;
+        self.encoderRetryAfter = now + MirrorRotationRetryDelay;
+        [self rearmHeldImage];
+        [self pumpVideo];
+        return;
+    }
     if (orientation != self.frameOrientation) self.needsKeyframe = YES;
     self.frameOrientation = orientation;
     int width = (int)CVPixelBufferGetWidth(oriented), height = (int)CVPixelBufferGetHeight(oriented);
@@ -533,7 +738,8 @@ static CGImagePropertyOrientation mirrorFrameOrientation(CMSampleBufferRef sampl
         [self recoverEncoderFromError:kVTVideoEncoderNotAvailableNowErr];
         return;
     }
-    NSDictionary *properties = self.needsKeyframe ? @{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES} : nil;
+    BOOL forceKeyframe = self.needsKeyframe || now - self.lastKeyframeSent >= MirrorKeyframeInterval;
+    NSDictionary *properties = forceKeyframe ? @{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES} : nil;
     self.encoding = YES;
     self.encodeStarted = now;
     NSUInteger generation = self.encoderGeneration;
@@ -546,9 +752,16 @@ static CGImagePropertyOrientation mirrorFrameOrientation(CMSampleBufferRef sampl
                 MirrorController *controller = weakSelf;
                 if (controller && controller.stream == stream && controller.encoderGeneration == generation) {
                     controller.encoding = NO;
-                    if (error) [controller recoverEncoderFromError:error];
-                    else if (output) [controller sendFrame:output];
-                    else controller.needsKeyframe = YES;
+                    if (error) {
+                        [controller recoverEncoderFromError:error];
+                    } else {
+                        if (output) controller.encoderFailures = 0;
+                        if (output) [controller sendFrame:output];
+                        else controller.needsKeyframe = YES;
+                        // A dropped or unsendable frame is re-encoded from the held image as a keyframe.
+                        if (controller.needsKeyframe) [controller rearmHeldImage];
+                        [controller pumpVideo];
+                    }
                 }
                 if (output) CFRelease(output);
             });
@@ -599,6 +812,7 @@ static CGImagePropertyOrientation mirrorFrameOrientation(CMSampleBufferRef sampl
         return;
     }
     self.needsKeyframe = NO;
+    if (keyframe) self.lastKeyframeSent = NSProcessInfo.processInfo.systemUptime;
     if (self.sending) self.pendingVideo = packet;
     else [self send:packet];
 }
@@ -609,6 +823,7 @@ static CGImagePropertyOrientation mirrorFrameOrientation(CMSampleBufferRef sampl
     BOOL video = packet.length > sizeof(uint32_t);
     self.sending = YES;
     self.lastSend = NSProcessInfo.processInfo.systemUptime;
+    self.sendStarted = self.lastSend;
     dispatch_data_t data = dispatch_data_create(packet.bytes, packet.length, NULL,
                                                 DISPATCH_DATA_DESTRUCTOR_DEFAULT);
     __weak typeof(self) weakSelf = self;
@@ -630,6 +845,7 @@ static CGImagePropertyOrientation mirrorFrameOrientation(CMSampleBufferRef sampl
         NSData *pending = controller.pendingVideo;
         controller.pendingVideo = nil;
         if (pending) [controller send:pending];
+        [controller pumpVideo];
     });
 }
 

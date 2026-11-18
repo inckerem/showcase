@@ -1,10 +1,32 @@
 #import "screen_mirror_pairing.h"
 #import <CoreImage/CoreImage.h>
 
+// Connections that have not finished the TLS-PSK handshake are untrusted: they are held in a
+// small bounded set with a short deadline and never evict each other or the live peer.
+static const NSUInteger MirrorMaxPendingHandshakes = 8;
+static const int64_t MirrorHandshakeTimeoutSeconds = 8;
+// Per remote host, so one LAN host cannot fill the whole set and lock the real iPhone out.
+// Two leaves room for an iPhone reconnect while its previous half-open attempt still waits.
+static const NSUInteger MirrorMaxPendingHandshakesPerHost = 2;
+
+static NSString *mirror_remote_host(nw_connection_t connection) {
+    nw_endpoint_t endpoint = nw_connection_copy_endpoint(connection);
+    if (!endpoint) return @"";
+    if (nw_endpoint_get_type(endpoint) == nw_endpoint_type_host) {
+        const char *name = nw_endpoint_get_hostname(endpoint);
+        return name ? @(name) : @"";
+    }
+    char *address = nw_endpoint_copy_address_string(endpoint);
+    NSString *host = address ? @(address) : @"";
+    free(address);
+    return host ?: @"";
+}
+
 @interface ShowcaseMirrorReceiver : UIViewController
 @property (nonatomic, copy) dispatch_block_t onReturnToCarPlay;
 @property (nonatomic, strong) nw_listener_t listener;
 @property (nonatomic, strong) nw_connection_t peer;
+@property (nonatomic, strong) NSMutableArray<nw_connection_t> *candidates;
 @property (nonatomic, strong) AVSampleBufferDisplayLayer *display;
 @property (nonatomic, strong) UILabel *status;
 @property (nonatomic, strong) UILabel *staleStatus;
@@ -34,7 +56,7 @@
     [self.view addSubview:self.status];
 
     self.staleStatus = [UILabel new];
-    self.staleStatus.text = @"Yeni görüntü karesi bekleniyor…\nSon alınan kare gösteriliyor.";
+    self.staleStatus.text = L(@"Waiting for a new frame…\nShowing the last frame received.");
     self.staleStatus.textAlignment = NSTextAlignmentCenter;
     self.staleStatus.numberOfLines = 0;
     self.staleStatus.textColor = UIColor.whiteColor;
@@ -47,7 +69,7 @@
     self.pairingQR.layer.magnificationFilter = kCAFilterNearest;
     self.pairingQR.layer.minificationFilter = kCAFilterNearest;
     self.pairingQR.isAccessibilityElement = YES;
-    self.pairingQR.accessibilityLabel = @"Showcase eşleştirme QR kodu";
+    self.pairingQR.accessibilityLabel = L(@"Showcase pairing QR code");
     self.pairingQR.hidden = YES;
     [self.view addSubview:self.pairingQR];
 
@@ -101,8 +123,8 @@
         }
     }
     self.pairingQR.hidden = self.pairingQR.image == nil;
-    self.status.text = self.pairingQR.hidden ? @"QR kodu oluşturulamadı. Ekranı kapatıp tekrar aç."
-        : @"Showcase Mirror’da QR kodunu okut.\nİki cihaz da aynı Wi-Fi ağında olmalı.";
+    self.status.text = self.pairingQR.hidden ? L(@"Could not create the QR code. Close this screen and open it again.")
+        : L(@"Scan the QR code in Showcase Mirror.\nBoth devices must be on the same Wi-Fi network.");
     [self.view setNeedsLayout];
 }
 
@@ -124,23 +146,23 @@
         freeifaddrs(addresses);
     }
     if (!host) {
-        self.status.text = @"iPad’i iPhone ile aynı Wi-Fi ağına bağla.";
+        self.status.text = L(@"Connect the iPad to the same Wi-Fi network as the iPhone.");
         return;
     }
 
     NSMutableData *key = [NSMutableData dataWithLength:MirrorKeyBytes];
     if (SecRandomCopyBytes(kSecRandomDefault, key.length, key.mutableBytes) != errSecSuccess) {
-        self.status.text = @"Eşleştirme kodu oluşturulamadı.";
+        self.status.text = L(@"Could not create the pairing code.");
         return;
     }
     nw_parameters_t params = mirror_parameters(key);
     nw_parameters_set_local_endpoint(params, nw_endpoint_create_host(host.UTF8String, "0"));
     self.listener = nw_listener_create(params);
     if (!self.listener) {
-        self.status.text = @"Wi-Fi alıcısı başlatılamadı.";
+        self.status.text = L(@"Could not start the Wi-Fi receiver.");
         return;
     }
-    self.status.text = @"Wi-Fi alıcısı açılıyor…";
+    self.status.text = L(@"Starting the Wi-Fi receiver…");
     __weak typeof(self) weakSelf = self;
     nw_listener_set_queue(self.listener, dispatch_get_main_queue());
     nw_listener_set_state_changed_handler(self.listener, ^(nw_listener_state_t state, nw_error_t error) {
@@ -151,17 +173,17 @@
         } else if (state == nw_listener_state_failed) {
             receiver.pairingQR.image = nil;
             receiver.pairingQR.hidden = YES;
-            receiver.status.text = @"Wi-Fi alıcısı başlatılamadı.";
+            receiver.status.text = L(@"Could not start the Wi-Fi receiver.");
             [receiver.view setNeedsLayout];
         }
     });
     nw_listener_set_new_connection_handler(self.listener, ^(nw_connection_t peer) {
         ShowcaseMirrorReceiver *receiver = weakSelf;
-        if (!receiver.listener || receiver.peer) {
+        if (!receiver.listener) {
             nw_connection_cancel(peer);
             return;
         }
-        [receiver acceptPeer:peer];
+        [receiver stageCandidate:peer];
     });
     nw_listener_start(self.listener);
 }
@@ -170,6 +192,77 @@
     if (self.staleStatus.hidden == !stale) return;
     self.staleStatus.hidden = !stale;
     self.display.opacity = stale ? 0.25f : 1.0f;
+}
+
+// Every new connection (first connect or a reconnect after a Wi-Fi blip / force-quit) waits in
+// the pending set until it finishes the TLS-PSK handshake, which proves it holds this session's
+// key. Only then may it become (or replace) the peer, so an unauthenticated connection can
+// neither cancel a handshaking iPhone nor occupy the peer slot. When the set is full the
+// newcomer is refused instead of evicting a pending one; each remote host is also capped so a
+// single LAN host cannot hold every slot.
+- (void)stageCandidate:(nw_connection_t)peer {
+    if (!self.candidates) self.candidates = [NSMutableArray array];
+    if (self.candidates.count >= MirrorMaxPendingHandshakes) {
+        ip_log("mirror: too many pending handshakes; refusing connection");
+        nw_connection_cancel(peer);
+        return;
+    }
+    NSString *host = mirror_remote_host(peer);
+    NSUInteger fromHost = 0;
+    for (nw_connection_t pending in self.candidates)
+        if ([mirror_remote_host(pending) isEqualToString:host]) fromHost++;
+    if (fromHost >= MirrorMaxPendingHandshakesPerHost) {
+        ip_log("mirror: too many pending handshakes from one host; refusing connection");
+        nw_connection_cancel(peer);
+        return;
+    }
+    [self.candidates addObject:peer];
+    __weak typeof(self) weakSelf = self;
+    nw_connection_set_queue(peer, dispatch_get_main_queue());
+    nw_connection_set_state_changed_handler(peer, ^(nw_connection_state_t state, nw_error_t error) {
+        ShowcaseMirrorReceiver *receiver = weakSelf;
+        if (![receiver isCandidate:peer]) return;
+        if (state == nw_connection_state_ready) {
+            [receiver.candidates removeObjectIdenticalTo:peer];
+            if (!receiver.listener) {
+                nw_connection_set_state_changed_handler(peer, nil);
+                nw_connection_cancel(peer);
+                return;
+            }
+            if (receiver.peer) {
+                ip_log("mirror peer reconnected; replacing previous connection");
+                [receiver disconnectPeer];
+            }
+            [receiver acceptPeer:peer];
+        } else if (state == nw_connection_state_failed || state == nw_connection_state_cancelled) {
+            [receiver dropCandidate:peer];
+        }
+    });
+    nw_connection_start(peer);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, MirrorHandshakeTimeoutSeconds * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf dropCandidate:peer];
+    });
+}
+
+- (BOOL)isCandidate:(nw_connection_t)peer {
+    return self.candidates && [self.candidates indexOfObjectIdenticalTo:peer] != NSNotFound;
+}
+
+- (void)dropCandidate:(nw_connection_t)peer {
+    if (![self isCandidate:peer]) return;
+    [self.candidates removeObjectIdenticalTo:peer];
+    nw_connection_set_state_changed_handler(peer, nil);
+    nw_connection_cancel(peer);
+}
+
+- (void)dropCandidates {
+    NSArray<nw_connection_t> *pending = [self.candidates copy];
+    [self.candidates removeAllObjects];
+    for (nw_connection_t peer in pending) {
+        nw_connection_set_state_changed_handler(peer, nil);
+        nw_connection_cancel(peer);
+    }
 }
 
 - (void)acceptPeer:(nw_connection_t)peer {
@@ -189,15 +282,14 @@
             [receiver setVideoStale:YES];
         }
     }];
-    nw_connection_set_queue(peer, dispatch_get_main_queue());
+    // The peer already passed the handshake as a candidate and runs on the main queue.
     nw_connection_set_state_changed_handler(peer, ^(nw_connection_state_t state, nw_error_t error) {
         ShowcaseMirrorReceiver *receiver = weakSelf;
         if (receiver.peer != peer) return;
-        if (state == nw_connection_state_ready) [receiver readHeaderFrom:peer];
         if (state == nw_connection_state_failed || state == nw_connection_state_cancelled)
             [receiver disconnectPeer];
     });
-    nw_connection_start(peer);
+    [self readHeaderFrom:peer];
 }
 
 - (void)disconnectPeer {
@@ -323,6 +415,7 @@
 }
 
 - (void)finish {
+    [self dropCandidates];
     [self disconnectPeer];
     if (self.listener) {
         nw_listener_cancel(self.listener);

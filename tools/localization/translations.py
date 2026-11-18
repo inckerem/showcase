@@ -10,6 +10,7 @@ LANGUAGES = ('fr', 'es', 'zh-Hans', 'ja', 'tr')
 
 T = {
     'Stop CarPlay to change Wi-Fi settings.': ('Arrêtez CarPlay pour modifier les réglages Wi-Fi.', 'Detén CarPlay para cambiar los ajustes Wi-Fi.', '请先停止 CarPlay，再更改 Wi-Fi 设置。', 'Wi-Fi設定を変更するにはCarPlayを停止してください。'),
+    'Stop CarPlay to change these settings.': ('Arrêtez CarPlay pour modifier ces réglages.', 'Detén CarPlay para cambiar estos ajustes.', '请先停止 CarPlay，再更改这些设置。', 'これらの設定を変更するにはCarPlayを停止してください。'),
     'Connected to “%@”. To use this network, enter its name and password below, then tap Save.': ('Connecté à « %@ ». Pour utiliser ce réseau, saisissez son nom et son mot de passe ci-dessous, puis touchez Enregistrer.', 'Conectado a “%@”. Para usar esta red, introduce su nombre y contraseña abajo y pulsa Guardar.', '已连接到“%@”。要使用此网络，请在下方输入其名称和密码，然后轻点保存。', '「%@」に接続中です。このネットワークを使うには、下に名前とパスワードを入力して保存をタップしてください。'),
     'Existing Wi-Fi network': ('Réseau Wi-Fi existant', 'Red Wi-Fi existente', '现有 Wi-Fi 网络', '既存のWi-Fiネットワーク'),
     'Personal Hotspot': ('Partage de connexion', 'Punto de acceso personal', '个人热点', 'インターネット共有'),
@@ -58,6 +59,11 @@ T = {
         'Conéctate a Internet',
         '请连接互联网',
         'インターネットに接続してください'),
+    'Reinstall Showcase': (
+        'Réinstallez Showcase',
+        'Reinstala Showcase',
+        '请重新安装 Showcase',
+        'Showcaseを再インストールしてください'),
     'Try Again': ('Réessayer', 'Reintentar', '重试', 'もう一度試す'),
     'Wireless CarPlay': ('CarPlay sans fil', 'CarPlay inalámbrico', '无线 CarPlay', 'ワイヤレスCarPlay'),
     'Start CarPlay': ('Démarrer CarPlay', 'Iniciar CarPlay', '启动 CarPlay', 'CarPlayを開始'),
@@ -81,7 +87,8 @@ T = {
         '在 iPhone 的 CarPlay 中选择“%@”',
         'iPhoneのCarPlayで「%@」を選択してください'),
     'See you soon': ('À bientôt', 'Hasta pronto', '下次见', 'またお会いしましょう'),
-    'Safe travels': ('Bonne route', 'Buen viaje', '一路平安', 'お気をつけて'),
+    'CarPlay disconnected': (
+        'CarPlay déconnecté', 'CarPlay desconectado', 'CarPlay 已断开', 'CarPlay を切断しました'),
     'Show Connection Steps': ('Afficher les étapes de connexion', 'Mostrar pasos de conexión', '显示连接步骤', '接続手順を表示'),
     'Stopping': ('Arrêt', 'Deteniendo', '正在停止', '停止中'),
     'Bluetooth Hardware Not Supported': (
@@ -89,6 +96,8 @@ T = {
         'Hardware Bluetooth no compatible',
         '不支持此蓝牙硬件',
         'このBluetoothハードウェアには対応していません'),
+    'CarPlay Could Not Start': ('CarPlay n’a pas pu démarrer', 'No se pudo iniciar CarPlay', '无法启动 CarPlay', 'CarPlayを開始できませんでした'),
+    "Showcase's CarPlay services could not start. Try again; if it keeps happening, reinstall Showcase or send logs to KCS from Settings.": ('Les services CarPlay de Showcase n’ont pas pu démarrer. Réessayez ; si le problème persiste, réinstallez Showcase ou envoyez les journaux à KCS depuis les Réglages.', 'No se pudieron iniciar los servicios de CarPlay de Showcase. Vuelve a intentarlo; si sigue ocurriendo, reinstala Showcase o envía los registros a KCS desde Ajustes.', 'Showcase 的 CarPlay 服务无法启动。请重试；如果问题持续出现，请重新安装 Showcase，或在设置中将日志发送给 KCS。', 'ShowcaseのCarPlayサービスを開始できませんでした。もう一度お試しください。繰り返し発生する場合は、Showcaseを再インストールするか、設定からKCSにログを送信してください。'),
     'Bluetooth Setup Failed': (
         'Échec de la configuration Bluetooth',
         'No se ha podido configurar el Bluetooth',
@@ -129,11 +138,11 @@ T = {
         'ホットスポットのパスワードは8文字以上にしてください。'),
     'OK': ('OK', 'OK', '好', 'OK'),
     'Different Name': ('Nom différent', 'Nombre distinto', '名称不一致', '名前が一致しません'),
-    "This iPad's hotspot is called “%@”. Your iPhone joins the name you enter here, so it has to match. To use “%@”, rename the iPad in Settings > General > About > Name.": (
-        'Le point d’accès de cet iPad s’appelle « %@ ». Votre iPhone rejoint le nom saisi ici, ils doivent donc correspondre. Pour utiliser « %@ », renommez l’iPad dans Réglages > Général > Informations > Nom.',
-        'El punto de acceso de este iPad se llama “%@”. Tu iPhone se conecta al nombre que introduzcas aquí, así que deben coincidir. Para usar “%@”, cambia el nombre del iPad en Ajustes > General > Información > Nombre.',
-        '此 iPad 的热点名为“%@”。你的 iPhone 会加入你在此输入的名称，因此两者必须一致。若要使用“%@”，请在“设置 > 通用 > 关于本机 > 名称”中重命名 iPad。',
-        'このiPadのホットスポット名は「%@」です。iPhoneはここに入力した名前に接続するため、一致させる必要があります。「%@」を使うには、「設定 > 一般 > 情報 > 名前」でiPadの名前を変更してください。'),
+    "This %1$@'s hotspot is called “%2$@”. Your iPhone joins the name you enter here, so it has to match. To use “%3$@”, rename the %1$@ in Settings > General > About > Name.": (
+        'Le point d’accès de cet %1$@ s’appelle « %2$@ ». Votre iPhone rejoint le nom saisi ici, ils doivent donc correspondre. Pour utiliser « %3$@ », renommez l’%1$@ dans Réglages > Général > Informations > Nom.',
+        'El punto de acceso de este %1$@ se llama “%2$@”. Tu iPhone se conecta al nombre que introduzcas aquí, así que deben coincidir. Para usar “%3$@”, cambia el nombre del %1$@ en Ajustes > General > Información > Nombre.',
+        '此 %1$@ 的热点名为“%2$@”。你的 iPhone 会加入你在此输入的名称，因此两者必须一致。若要使用“%3$@”，请在“设置 > 通用 > 关于本机 > 名称”中重命名 %1$@。',
+        'この%1$@のホットスポット名は「%2$@」です。iPhoneはここに入力した名前に接続するため、一致させる必要があります。「%3$@」を使うには、「設定 > 一般 > 情報 > 名前」で%1$@の名前を変更してください。'),
     'Use “%@”': ('Utiliser « %@ »', 'Usar “%@”', '使用“%@”', '「%@」を使用'),
     'Keep': ('Conserver', 'Mantener', '保留', 'そのままにする'),
     '%@\n\nSaved to:\n%@': (
@@ -199,11 +208,16 @@ T = {
         'Introduce un nombre para el vehículo.',
         '请输入车辆名称。',
         '車の名前を入力してください。'),
-    'Use a shorter name. CarPlay allows up to 31 characters.': (
-        'Choisissez un nom plus court. CarPlay accepte 31 caractères au maximum.',
-        'Usa un nombre más corto. CarPlay admite hasta 31 caracteres.',
-        '请使用更短的名称。CarPlay 最多允许 31 个字符。',
-        '名前を短くしてください。CarPlayで使えるのは31文字までです。'),
+    'Use a shorter name. CarPlay allows up to 31 bytes (fewer characters for non-Latin letters).': (
+        'Choisissez un nom plus court. CarPlay accepte 31 octets au maximum (moins de caractères pour les lettres non latines).',
+        'Usa un nombre más corto. CarPlay admite hasta 31 bytes (menos caracteres con letras no latinas).',
+        '请使用更短的名称。CarPlay 最多允许 31 个字节（非拉丁字母可用的字符数更少）。',
+        '名前を短くしてください。CarPlayで使えるのは31バイトまでです（ラテン文字以外は使える文字数が少なくなります）。'),
+    'Network capture could not start. Turn on Personal Hotspot or join the Wi-Fi network first, then try again.': (
+        'La capture réseau n’a pas pu démarrer. Activez le Partage de connexion ou rejoignez d’abord le réseau Wi-Fi, puis réessayez.',
+        'No se pudo iniciar la captura de red. Activa el Punto de acceso personal o conéctate primero a la red Wi-Fi y vuelve a intentarlo.',
+        '无法开始网络抓包。请先打开个人热点或加入 Wi-Fi 网络，然后重试。',
+        'ネットワークキャプチャを開始できませんでした。先にインターネット共有をオンにするか、Wi-Fiネットワークに接続してから、もう一度お試しください。'),
     'Another car already uses this name.': (
         'Une autre voiture porte déjà ce nom.',
         'Otro vehículo ya usa este nombre.',
@@ -213,11 +227,11 @@ T = {
     'Show': ('Afficher', 'Mostrar', '显示', '表示'),
     '8 characters or more': ('8 caractères ou plus', '8 caracteres o más', '至少 8 个字符', '8文字以上'),
     'Rename This %@': ('Renommer cet %@', 'Cambiar el nombre de este %@', '重命名这台 %@', 'この%@の名前を変更'),
-    "Saved, but this iPad's hotspot is called “%@”. Your iPhone can't join until the names match.": (
-        'Enregistré, mais le point d’accès de cet iPad s’appelle « %@ ». Votre iPhone ne pourra pas s’y connecter tant que les noms ne correspondent pas.',
-        'Guardado, pero el punto de acceso de este iPad se llama “%@”. Tu iPhone no podrá conectarse hasta que los nombres coincidan.',
-        '已存储，但此 iPad 的热点名为“%@”。名称一致之前，你的 iPhone 无法加入。',
-        '保存しましたが、このiPadのホットスポット名は「%@」です。名前が一致するまでiPhoneは接続できません。'),
+    "Saved, but this %1$@'s hotspot is called “%2$@”. Your iPhone can't join until the names match.": (
+        'Enregistré, mais le point d’accès de cet %1$@ s’appelle « %2$@ ». Votre iPhone ne pourra pas s’y connecter tant que les noms ne correspondent pas.',
+        'Guardado, pero el punto de acceso de este %1$@ se llama “%2$@”. Tu iPhone no podrá conectarse hasta que los nombres coincidan.',
+        '已存储，但此 %1$@ 的热点名为“%2$@”。名称一致之前，你的 iPhone 无法加入。',
+        '保存しましたが、この%1$@のホットスポット名は「%2$@」です。名前が一致するまでiPhoneは接続できません。'),
     'Saved.': ('Enregistré.', 'Guardado.', '已存储。', '保存しました。'),
     'Play Sound on This %@': (
         'Lire le son sur cet %@',
@@ -341,6 +355,20 @@ T = {
         'Edición KCS. Showcase original de Amine Rostane. Licencia GPL-3.0.',
         'KCS 版本。原版 Showcase 由 Amine Rostane 开发。采用 GPL-3.0 许可。',
         'KCS版。オリジナルのShowcaseはAmine Rostaneが開発。GPL-3.0ライセンス。'),
+    'The Personal Hotspot password is different from the one saved in Showcase. Update the hotspot details and try again.': (
+        'Le mot de passe du Partage de connexion est différent de celui enregistré dans Showcase. Modifiez les infos du point d’accès et réessayez.',
+        'La contraseña del punto de acceso personal no coincide con la guardada en Showcase. Actualiza los datos del punto de acceso y vuelve a intentarlo.',
+        '个人热点密码与 Showcase 中保存的密码不同。请更新热点信息后重试。',
+        'インターネット共有のパスワードがShowcaseに保存されているものと異なります。ホットスポット情報を更新して、もう一度お試しください。'),
+    'Mirror iPhone Screen': ('Recopier l’écran de l’iPhone', 'Duplicar pantalla del iPhone', '镜像 iPhone 屏幕', 'iPhoneの画面をミラーリング'),
+    'Waiting for a new frame…\nShowing the last frame received.': ('En attente d’une nouvelle image…\nAffichage de la dernière image reçue.', 'Esperando un nuevo fotograma…\nSe muestra el último fotograma recibido.', '正在等待新画面…\n显示最后收到的画面。', '新しいフレームを待っています…\n最後に受信したフレームを表示しています。'),
+    'Showcase pairing QR code': ('Code QR de jumelage Showcase', 'Código QR de enlace de Showcase', 'Showcase 配对二维码', 'Showcaseペアリング用QRコード'),
+    'Could not create the QR code. Close this screen and open it again.': ('Impossible de créer le code QR. Fermez cet écran et rouvrez-le.', 'No se pudo crear el código QR. Cierra esta pantalla y vuelve a abrirla.', '无法生成二维码。请关闭此屏幕后重新打开。', 'QRコードを作成できませんでした。この画面を閉じてもう一度開いてください。'),
+    'Scan the QR code in Showcase Mirror.\nBoth devices must be on the same Wi-Fi network.': ('Scannez le code QR dans Showcase Mirror.\nLes deux appareils doivent être sur le même réseau Wi-Fi.', 'Escanea el código QR en Showcase Mirror.\nAmbos dispositivos deben estar en la misma red Wi-Fi.', '在 Showcase Mirror 中扫描二维码。\n两个设备必须连接到同一 Wi-Fi 网络。', 'Showcase MirrorでQRコードを読み取ってください。\n両方のデバイスを同じWi-Fiネットワークに接続する必要があります。'),
+    'Connect the iPad to the same Wi-Fi network as the iPhone.': ('Connectez l’iPad au même réseau Wi-Fi que l’iPhone.', 'Conecta el iPad a la misma red Wi-Fi que el iPhone.', '请将 iPad 连接到与 iPhone 相同的 Wi-Fi 网络。', 'iPadをiPhoneと同じWi-Fiネットワークに接続してください。'),
+    'Could not create the pairing code.': ('Impossible de créer le code de jumelage.', 'No se pudo crear el código de enlace.', '无法生成配对码。', 'ペアリングコードを作成できませんでした。'),
+    'Could not start the Wi-Fi receiver.': ('Impossible de démarrer le récepteur Wi-Fi.', 'No se pudo iniciar el receptor Wi-Fi.', '无法启动 Wi-Fi 接收器。', 'Wi-Fi受信機を開始できませんでした。'),
+    'Starting the Wi-Fi receiver…': ('Démarrage du récepteur Wi-Fi…', 'Iniciando el receptor Wi-Fi…', '正在启动 Wi-Fi 接收器…', 'Wi-Fi受信機を開始しています…'),
 }
 
 from turkish import TURKISH

@@ -23,6 +23,8 @@ PAYLOAD="$ROOT/payload"
 PAYLOAD_APP="$ROOT/payload/Applications/Showcase.app"
 BTSTACK_DYLIB="$PAYLOAD/usr/lib/libBTstack.dylib"
 BUILD="$ROOT/build"
+# REMOTE_BASE is only a prefix for a fresh `mktemp -d` directory on the iPad;
+# it is never removed itself.
 REMOTE_BASE="${REMOTE_BASE:-/tmp/showcase-deb-build}"
 SDK_REMOTE="${SDK_REMOTE:-/tmp/iPhoneOS10.3.sdk}"
 
@@ -96,6 +98,13 @@ need_file "$REPO_ROOT/source/ent_svc.xml"
 need_file "$REPO_ROOT/icon/generated/Icon-OEM-104.png"
 need_file "$REPO_ROOT/icon/generated/Icon-OEM-120.png"
 
+# REMOTE_BASE is embedded in remote root shell commands. Restrict it so it
+# cannot break out of the quoting or name '/', '..' or another existing tree.
+if [[ ! "$REMOTE_BASE" =~ ^/([a-zA-Z0-9_-][a-zA-Z0-9._-]*/)*[a-zA-Z0-9_-][a-zA-Z0-9._-]*$ ]]; then
+  echo "REMOTE_BASE must be an absolute path prefix containing only letters, digits, '.', '_' or '-'." >&2
+  exit 1
+fi
+
 sshpass -p "$IPAD_PASS" ssh "${SSH_OPTS[@]}" "$IPAD_USER@$IPAD_HOST" "
 set -e
 test -d '$SDK_REMOTE'
@@ -105,7 +114,15 @@ command -v dpkg-deb >/dev/null
 "
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/showcase-rootful.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+REMOTE_DIR=""
+cleanup() {
+  rm -rf "$WORK"
+  if [ -n "$REMOTE_DIR" ]; then
+    sshpass -p "$IPAD_PASS" ssh "${SSH_OPTS[@]}" "$IPAD_USER@$IPAD_HOST" \
+      "rm -rf '$REMOTE_DIR'" || echo "Could not remove remote directory: $REMOTE_DIR" >&2
+  fi
+}
+trap cleanup EXIT
 
 mkdir -p "$WORK/send" "$WORK/rootfs" "$WORK/rootfs/DEBIAN" "$BUILD" "$ROOT/repo/debs"
 
@@ -129,16 +146,25 @@ fi
 COPYFILE_DISABLE=1 tar --format ustar -C "$REPO_ROOT/source" \
   -cf "$WORK/send/crypto-vendor.tar" vendor
 
+NEW_REMOTE_DIR="$(sshpass -p "$IPAD_PASS" ssh "${SSH_OPTS[@]}" "$IPAD_USER@$IPAD_HOST" \
+  "umask 077; mktemp -d '${REMOTE_BASE}.XXXXXX'")"
+REMOTE_SUFFIX="${NEW_REMOTE_DIR#"$REMOTE_BASE".}"
+if [[ "$REMOTE_SUFFIX" == "$NEW_REMOTE_DIR" || ! "$REMOTE_SUFFIX" =~ ^[a-zA-Z0-9]{6}$ ]]; then
+  echo "Remote mktemp returned an unexpected path; refusing to use it." >&2
+  exit 1
+fi
+REMOTE_DIR="$NEW_REMOTE_DIR"
+
 sshpass -p "$IPAD_PASS" ssh "${SSH_OPTS[@]}" "$IPAD_USER@$IPAD_HOST" \
-  "rm -rf '$REMOTE_BASE' && mkdir -p '$REMOTE_BASE'"
+  "mkdir '$REMOTE_DIR/compile' '$REMOTE_DIR/package'"
 
 sshpass -p "$IPAD_PASS" scp "${SCP_OPTS[@]}" \
   "$WORK/send/"* \
-  "$IPAD_USER@$IPAD_HOST:$REMOTE_BASE/"
+  "$IPAD_USER@$IPAD_HOST:$REMOTE_DIR/compile/"
 
 sshpass -p "$IPAD_PASS" ssh "${SSH_OPTS[@]}" "$IPAD_USER@$IPAD_HOST" "
 set -e
-cd '$REMOTE_BASE'
+cd '$REMOTE_DIR/compile'
 tar -xf crypto-vendor.tar
 
 clang -fobjc-arc -miphoneos-version-min=12.0 -isysroot '$SDK_REMOTE' \
@@ -165,7 +191,7 @@ clang -fobjc-arc -miphoneos-version-min=12.0 -isysroot '$SDK_REMOTE' \
 cp -R "$PAYLOAD"/. "$WORK/rootfs"/
 for bin in Showcase carplay_bt carplay_services; do
   sshpass -p "$IPAD_PASS" scp "${SCP_OPTS[@]}" \
-    "$IPAD_USER@$IPAD_HOST:$REMOTE_BASE/$bin" \
+    "$IPAD_USER@$IPAD_HOST:$REMOTE_DIR/compile/$bin" \
     "$WORK/rootfs/Applications/Showcase.app/$bin"
 done
 fill_version "$REPO_ROOT/source/Info.plist" > "$WORK/rootfs/Applications/Showcase.app/Info.plist"
@@ -197,16 +223,13 @@ xattr -cr "$WORK/rootfs" 2>/dev/null || true
 
 COPYFILE_DISABLE=1 tar --format ustar -C "$WORK" -cf "$WORK/rootfs.tar" rootfs
 
-sshpass -p "$IPAD_PASS" ssh "${SSH_OPTS[@]}" "$IPAD_USER@$IPAD_HOST" \
-  "rm -rf '$REMOTE_BASE' && mkdir -p '$REMOTE_BASE'"
-
 sshpass -p "$IPAD_PASS" scp "${SCP_OPTS[@]}" \
   "$WORK/rootfs.tar" \
-  "$IPAD_USER@$IPAD_HOST:$REMOTE_BASE/rootfs.tar"
+  "$IPAD_USER@$IPAD_HOST:$REMOTE_DIR/package/rootfs.tar"
 
 sshpass -p "$IPAD_PASS" ssh "${SSH_OPTS[@]}" "$IPAD_USER@$IPAD_HOST" "
 set -e
-cd '$REMOTE_BASE'
+cd '$REMOTE_DIR/package'
 tar xf rootfs.tar
 cd rootfs
 find . -name '._*' -delete
@@ -242,7 +265,7 @@ dpkg-deb -c '../$DEB_NAME' | sed -n '1,80p'
 "
 
 sshpass -p "$IPAD_PASS" scp "${SCP_OPTS[@]}" \
-  "$IPAD_USER@$IPAD_HOST:$REMOTE_BASE/$DEB_NAME" \
+  "$IPAD_USER@$IPAD_HOST:$REMOTE_DIR/package/$DEB_NAME" \
   "$BUILD/$DEB_NAME"
 
 cp "$BUILD/$DEB_NAME" "$ROOT/repo/debs/$DEB_NAME"

@@ -73,8 +73,11 @@ fill_version packaging/control/control > "$TASK_STAGE/control/control"
 cp packaging/control/{postinst,prerm,postrm} source/{ent_app.xml,ent_bt.xml,ent_svc.xml} "$TASK_STAGE/control/"
 chmod 0755 "$TASK_STAGE/control/postinst" "$TASK_STAGE/control/prerm" "$TASK_STAGE/control/postrm"
 chmod 0644 "$TASK_STAGE/control/control" "$TASK_STAGE/control/"*.xml
-( cd "$TASK_STAGE/control" && COPYFILE_DISABLE=1 tar --format ustar --no-xattrs -czf "$TASK_STAGE/control.tar.gz" . )
-( cd "$TASK_STAGE/rootfs" && COPYFILE_DISABLE=1 tar --format ustar --no-xattrs -czf "$TASK_STAGE/data.tar.gz" . )
+# Package entries must be root-owned: postinst later makes binaries setuid root,
+# so a mobile-owned (501:20) payload would be replaceable before configure runs.
+tar_flags=(--format ustar --no-xattrs --uid 0 --gid 0 --uname root --gname wheel)
+( cd "$TASK_STAGE/control" && COPYFILE_DISABLE=1 tar "${tar_flags[@]}" -czf "$TASK_STAGE/control.tar.gz" . )
+( cd "$TASK_STAGE/rootfs" && COPYFILE_DISABLE=1 tar "${tar_flags[@]}" -czf "$TASK_STAGE/data.tar.gz" . )
 printf '2.0\n' > "$TASK_STAGE/debian-binary"
 TASK_DEB="$TASK_STAGE/repo/debs/com.rostane.showcase_${PACKAGE_VERSION}_iphoneos-arm.deb"
 ( cd "$TASK_STAGE" && ar -qS "$TASK_DEB" debian-binary control.tar.gz data.tar.gz )

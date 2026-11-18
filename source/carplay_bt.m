@@ -60,8 +60,14 @@ static char kWifiPassword[64]  = "";
 static const uint8_t kWifiSecurityType = 2;   /* 0=None, 1=WEP, 2=WPA/WPA2 */
 #define BT_READY_PATH "/tmp/showcase_bt_ready"
 #define BT_DOWN_PATH  "/tmp/showcase_bt_down"
+/* Exit status when the BTstack daemon connection is gone (closed socket or
+ * HCI_STATE_OFF after setup); 62 remains BTSTACK_EVENT_POWERON_FAILED. */
+#define EXIT_BTSTACK_DAEMON_GONE 63
 #define BT_ID_PATH    "/tmp/showcase_bt_id"
+#define BT_ID_PATH_DIR  "/tmp"
+#define BT_ID_PATH_NAME "showcase_bt_id"
 #define BT_ID_PERSIST_PATH "/var/mobile/Library/Showcase/bt-id"
+#define BT_ID_PERSIST_NAME "bt-id"   /* opened via open_showcase_dir() */
 
 #ifndef SHOWCASE_SEND_WIFI_CHANNEL
 #define SHOWCASE_SEND_WIFI_CHANNEL 0
@@ -77,6 +83,21 @@ static int g_wifi_channel = 0;          /* 0 = unknown / omit */
 static uint8_t g_ap_bssid[6] = {0};
 static int g_have_ap_bssid = 0;
 
+/* Largest length <= maxLen that does not split a UTF-8 sequence. */
+static size_t utf8_boundary_len(const char *s, size_t maxLen) {
+    size_t len = maxLen;
+    size_t start = len;
+    while (start > 0 && (((uint8_t)s[start - 1]) & 0xC0) == 0x80) start--;
+    if (start == 0) return len;
+    uint8_t lead = (uint8_t)s[start - 1];
+    size_t need = (lead & 0x80) == 0x00 ? 1 :
+                  (lead & 0xE0) == 0xC0 ? 2 :
+                  (lead & 0xF0) == 0xE0 ? 3 :
+                  (lead & 0xF8) == 0xF0 ? 4 : 1;
+    if (len - (start - 1) < need) len = start - 1;
+    return len;
+}
+
 static int parse_args(int argc, char *argv[]) {
     int have_ssid = 0, have_password = 0;
     if ((argc % 2) == 0) return -1;
@@ -84,6 +105,8 @@ static int parse_args(int argc, char *argv[]) {
         if (!strcmp(argv[i], "--name") || !strcmp(argv[i], "-n")) {
             strncpy(kDeviceName, argv[i+1], sizeof(kDeviceName) - 1);
             kDeviceName[sizeof(kDeviceName) - 1] = '\0';
+            /* Never leave a partial UTF-8 sequence after truncation. */
+            kDeviceName[utf8_boundary_len(kDeviceName, strlen(kDeviceName))] = '\0';
         } else if (!strcmp(argv[i], "--ssid") || !strcmp(argv[i], "-s")) {
             if (!argv[i+1][0] || strlen(argv[i+1]) >= sizeof(kWifiSSID)) return -1;
             strncpy(kWifiSSID, argv[i+1], sizeof(kWifiSSID) - 1);
@@ -140,7 +163,9 @@ static const char *kWifiInterface      = "bridge100";
 typedef uint8_t bd_addr_t[6];
 extern int  bt_open(void);
 extern int  bt_send_cmd(const void *cmd, ...);
-extern int  bt_send_rfcomm(uint16_t cid, uint8_t *data, uint16_t len);
+/* BTstack's client API (btstack_client.h) returns void: the daemon socket
+ * write result is discarded and rfcomm_send() failures stay in the daemon. */
+extern void bt_send_rfcomm(uint16_t cid, uint8_t *data, uint16_t len);
 extern void bt_register_packet_handler(void(*)(uint8_t,uint16_t,uint8_t*,uint16_t));
 extern void run_loop_init(int);
 extern void run_loop_execute(void);
@@ -150,10 +175,17 @@ extern const void *btstack_set_system_bluetooth_enabled;
 extern const void *hci_write_local_name, *hci_write_class_of_device;
 extern const void *hci_write_extended_inquiry_response, *hci_write_simple_pairing_mode;
 extern const void *hci_accept_connection_request;
-extern const void *hci_disconnect;
+/* Weak: used only as the fallback to drop a stuck iAP2 link when the
+ * library lacks rfcomm_disconnect. */
+extern const void *hci_disconnect __attribute__((weak_import));
 extern const void *hci_io_capability_request_reply, *hci_user_confirmation_request_reply;
 extern const void *rfcomm_register_service, *rfcomm_accept_connection;
 extern const void *rfcomm_create_channel, *sdp_client_query_rfcomm_services;
+/* Used only to refuse/close a second iAP2 channel while one is active.
+ * Weak so an older libBTstack without them still loads (we then just ignore
+ * the extra channel instead of closing it). */
+extern const void *rfcomm_decline_connection __attribute__((weak_import));
+extern const void *rfcomm_disconnect __attribute__((weak_import));
 extern void run_loop_set_timer(void *timer, uint32_t milliseconds);
 extern void run_loop_set_timer_handler(void *timer, void (*handler)(void *timer));
 extern void run_loop_add_timer(void *timer);
@@ -168,6 +200,10 @@ static uint8_t sdp_rec[512];
 static uint8_t did_sdp_rec[256];
 static int setup_done = 0;
 static uint16_t active_cid = 0;
+/* ACL handle carrying active_cid; a disconnect or channel close of any other
+ * link (a second device, an SCO link, a failed page) must not reset it. */
+static uint16_t active_acl_handle = 0;
+static int have_active_acl_handle = 0;
 static uint16_t rfcomm_mtu = 1007;
 static volatile sig_atomic_t bluetooth_handoff_requested = 0;
 static int iap2_detected = 0, link_established = 0, detect_count = 0;
@@ -187,13 +223,76 @@ static uint8_t iap2_detect[] = { 0xFF, 0x55, 0x02, 0x00, 0xEE, 0x10 };
  * A car pages the phone it knows and opens the phone's iAP2 channel itself;
  * the phone does not reconnect on its own. The last iPhone that passed
  * authentication is remembered and paged until it connects. */
-#define LAST_IPHONE_PATH "/var/mobile/Library/Showcase/last-iphone"
+#define LAST_IPHONE_NAME "last-iphone"   /* inside /var/mobile/Library/Showcase */
 #define PAGE_RETRY_MS 10000
 static uint8_t page_addr[6];            /* display order */
 static int page_known = 0, page_busy = 0, page_channel = 0, timer_armed = 0;
+/* Set once page_iphone()'s SDP result has sent rfcomm_create_channel; only the
+ * 0x80 for that outgoing channel may finish the page (see 0x80). */
+static int page_create_pending = 0;
 static uint8_t peer_addr[6];            /* peer of the open channel, display order */
 static int have_peer = 0;
 static uint64_t page_timer[16];         /* opaque timer_source_t, zeroed */
+/* iAP2 detect retries run on the BTstack run loop, not SIGALRM: the retry
+ * sends RFCOMM data and logs, neither of which is async-signal-safe. */
+#define DETECT_RETRY_MS 1000
+#define DETECT_MAX_ATTEMPTS 10
+/* After our SYN the iPhone must complete the iAP2 link handshake within this
+ * window; otherwise the channel is closed so a fresh one can be paged/accepted
+ * ("first channel wins" must only protect a channel that makes progress). */
+#define SYN_TIMEOUT_MS 5000
+static uint64_t detect_timer[16];       /* opaque timer_source_t, zeroed */
+static int detect_timer_armed = 0;
+
+/* carplay_bt runs as root but writes into /tmp and the mobile-owned
+ * Showcase folder. Drop whatever is at the path (a symlink is removed, not
+ * followed) and create a fresh file; O_EXCL|O_NOFOLLOW makes a symlink that
+ * reappears in between fail instead of redirecting the root write. */
+static int open_new_private_file(const char *path) {
+    if (unlink(path) != 0 && errno != ENOENT) return -1;
+    return open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+}
+
+/* Same as open_new_private_file(), relative to an already opened directory. */
+static int open_new_private_file_at(int dirFd, const char *name) {
+    if (unlinkat(dirFd, name, 0) != 0 && errno != ENOENT) return -1;
+    return openat(dirFd, name,
+                  O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+}
+
+/* Opens /var/mobile/Library/Showcase without following a symlink in any
+ * mobile-writable component (O_NOFOLLOW on the full path protects only the
+ * final name): a mobile process could otherwise point "Showcase" at a
+ * root-only directory and make this root helper rename/unlink files there.
+ * With create != 0 a missing Showcase directory is created first, as the
+ * former mkdir() did. Returns -1 when it is missing or not a plain directory
+ * owned by mobile or root. Mirrors open_legacy_showcase_dir() in
+ * carplay_services.m. */
+#define SHOWCASE_MOBILE_UID 501
+static int open_showcase_dir(int create) {
+    static const char *const components[] = { "mobile", "Library", "Showcase" };
+    const size_t count = sizeof(components) / sizeof(components[0]);
+    /* /var itself is a root-owned symlink to /private/var. */
+    int dirFd = open("/var", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    for (size_t i = 0; dirFd >= 0 && i < count; i++) {
+        if (create && i == count - 1) mkdirat(dirFd, components[i], 0755);
+        int next = openat(dirFd, components[i],
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        int openErrno = errno;
+        close(dirFd);
+        dirFd = next;
+        errno = openErrno;
+    }
+    if (dirFd < 0) return -1;
+    struct stat st;
+    if (fstat(dirFd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        (st.st_uid != SHOWCASE_MOBILE_UID && st.st_uid != 0)) {
+        close(dirFd);
+        errno = EPERM;
+        return -1;
+    }
+    return dirFd;
+}
 /* Service search pattern: the iPhone's iAP2 UUID 00000000-DECA-FADE-DECA-DEAFDECACAFE */
 static uint8_t iap2_device_pattern[] = {
     0x35, 0x11, 0x1C, 0x00, 0x00, 0x00, 0x00, 0xDE, 0xCA, 0xFA, 0xDE,
@@ -355,14 +454,22 @@ static void build_eir(uint8_t *e) {
     memcpy(&e[p],c,16); p+=16;
     uint8_t a[]={0xFF,0xCA,0xCA,0xDE,0xAF,0xDE,0xCA,0xDE,0xDE,0xFA,0xCA,0xDE,0x00,0x00,0x00,0x00};
     memcpy(&e[p],a,16); p+=16;
-    /* Complete Local Name: TLV [length=1+nameLen] [type=0x09] [name bytes] */
+    /* Local Name: TLV [length=1+nameLen] [type] [name bytes]. The full name
+     * (<=31 bytes) always fits; only if it ever did not would it be cut at a
+     * UTF-8 boundary and sent as Shortened Local Name (0x08). */
     {
-        uint8_t nameLen = (uint8_t)strlen(kDeviceName);
-        if (nameLen > 30) nameLen = 30; /* keep EIR under 240 */
-        e[p++] = 1 + nameLen;
-        e[p++] = 0x09;
+        size_t fullLen = strlen(kDeviceName);
+        size_t room = 240 - (size_t)p - 2 /* name TLV header */ - 3 /* TX power TLV */;
+        size_t nameLen = fullLen;
+        uint8_t type = 0x09;
+        if (nameLen > room) {
+            nameLen = utf8_boundary_len(kDeviceName, room);
+            type = 0x08;
+        }
+        e[p++] = (uint8_t)(1 + nameLen);
+        e[p++] = type;
         memcpy(&e[p], kDeviceName, nameLen);
-        p += nameLen;
+        p += (int)nameLen;
     }
     e[p++]=2; e[p++]=0x0A; e[p++]=0;
 }
@@ -440,7 +547,7 @@ static void perform_bt_setup(void) {
     printf("[CP] READY — identity: RoadLink / RL-100 / RoadLink Labs\n");
     load_last_iphone();
     schedule_page(1000);
-    int ready_fd = open(BT_READY_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int ready_fd = open_new_private_file(BT_READY_PATH);
     if (ready_fd >= 0) {
         dprintf(ready_fd, "ready\n");
         close(ready_fd);
@@ -464,31 +571,72 @@ static void print_hci_addr(const char *prefix, const uint8_t *raw) {
 }
 
 static void load_last_iphone(void) {
-    char text[32] = {0};
-    FILE *file = fopen(LAST_IPHONE_PATH, "r");
-    if (!file) return;
+    /* The file lives in the mobile-owned Showcase folder: never block on a
+     * FIFO (this runs before the ready sentinel is written), never follow a
+     * symlink (e.g. to /dev/zero) and read only a short regular file. */
+    enum { LAST_IPHONE_MAX_FILE = 31 };
+    char text[LAST_IPHONE_MAX_FILE + 1] = {0};
+    int dirFd = open_showcase_dir(0);
+    if (dirFd < 0) return;
+    int fd = openat(dirFd, LAST_IPHONE_NAME,
+                    O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    close(dirFd);
+    if (fd < 0) return;
+    struct stat st;
+    size_t got = 0;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&
+        st.st_size <= LAST_IPHONE_MAX_FILE) {
+        while (got < (size_t)st.st_size) {
+            ssize_t n = read(fd, text + got, (size_t)st.st_size - got);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            got += (size_t)n;
+        }
+    }
+    close(fd);
+    text[got] = '\0';
     unsigned b[6];
-    if (fgets(text, sizeof(text), file) &&
-        sscanf(text, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
+    if (sscanf(text, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
         for (int i = 0; i < 6; i++) page_addr[i] = (uint8_t)b[i];
         page_known = 1;
         printf("[PAGE] last iPhone %02X:%02X:%02X:%02X:%02X:%02X\n",
                page_addr[0], page_addr[1], page_addr[2], page_addr[3], page_addr[4], page_addr[5]);
     }
-    fclose(file);
 }
 
 static void save_last_iphone(void) {
     if (!have_peer) return;
     memcpy(page_addr, peer_addr, 6);
     page_known = 1;
-    mkdir("/var/mobile/Library/Showcase", 0755);
-    FILE *file = fopen(LAST_IPHONE_PATH ".tmp", "w");
-    if (!file) return;
-    fprintf(file, "%02X:%02X:%02X:%02X:%02X:%02X\n",
-            peer_addr[0], peer_addr[1], peer_addr[2], peer_addr[3], peer_addr[4], peer_addr[5]);
-    fclose(file);
-    rename(LAST_IPHONE_PATH ".tmp", LAST_IPHONE_PATH);
+    int dirFd = open_showcase_dir(1);
+    if (dirFd < 0) {
+        printf("[PAGE] WARN: could not open Showcase folder: %s\n", strerror(errno));
+        return;
+    }
+    int fd = open_new_private_file_at(dirFd, LAST_IPHONE_NAME ".tmp");
+    if (fd < 0) { close(dirFd); return; }
+    FILE *file = fdopen(fd, "w");
+    if (!file) {
+        close(fd);
+        unlinkat(dirFd, LAST_IPHONE_NAME ".tmp", 0);
+        close(dirFd);
+        return;
+    }
+    /* Only replace the good last-iphone file once the new copy is complete
+     * and on disk: a full volume or I/O error would otherwise rename an empty
+     * .tmp over it, load_last_iphone() would fail to parse it on the next
+     * launch and automatic reconnection would stop until a fresh pairing. */
+    int ok = fprintf(file, "%02X:%02X:%02X:%02X:%02X:%02X\n",
+            peer_addr[0], peer_addr[1], peer_addr[2], peer_addr[3], peer_addr[4], peer_addr[5]) > 0;
+    ok = ok && fflush(file) == 0;
+    ok = ok && fsync(fileno(file)) == 0;
+    if (fclose(file) != 0) ok = 0;
+    if (!ok || renameat(dirFd, LAST_IPHONE_NAME ".tmp",
+                        dirFd, LAST_IPHONE_NAME) != 0) {
+        printf("[PAGE] WARN: could not save last iPhone: %s\n", strerror(errno));
+        unlinkat(dirFd, LAST_IPHONE_NAME ".tmp", 0);
+    }
+    close(dirFd);
 }
 
 static void page_iphone(void);
@@ -511,16 +659,21 @@ static void page_iphone(void) {
     if (!page_known || active_cid || page_busy || bluetooth_handoff_requested) return;
     page_busy = 1;
     page_channel = 0;
+    page_create_pending = 0;
     printf("[PAGE] looking for the iPhone's iAP2 service\n");
     bt_send_cmd(&sdp_client_query_rfcomm_services, page_addr, iap2_device_pattern);
 }
 
+/* bt_send_rfcomm() gives no send status and the daemon drops a frame when it
+ * has no RFCOMM credits / ACL buffers, so space consecutive MTU-sized chunks
+ * deterministically instead of branching on a non-existent return value. */
+#define RFCOMM_CHUNK_GAP_US 50000
 static void rfcomm_send_chunked(uint8_t *data, int len) {
     int s=0;
     while(s<len) {
         int c=len-s; if(c>rfcomm_mtu) c=rfcomm_mtu;
-        int rc=bt_send_rfcomm(active_cid,&data[s],c); s+=c;
-        if(rc!=c) usleep(50000);
+        bt_send_rfcomm(active_cid,&data[s],(uint16_t)c); s+=c;
+        if(s<len) usleep(RFCOMM_CHUNK_GAP_US);
     }
 }
 
@@ -932,9 +1085,69 @@ static void send_detect(void) {
     printf("[DET] #%d\n",detect_count);
 }
 
-static void alarm_handler(int sig) {
-    (void)sig;
-    if(active_cid&&!iap2_detected&&detect_count<10){send_detect();alarm(1);}
+static void cancel_detect_retry(void) {
+    if (detect_timer_armed) run_loop_remove_timer(detect_timer);
+    detect_timer_armed = 0;
+}
+
+static void detect_timer_fired(void *timer);
+static void syn_timer_fired(void *timer);
+
+static void schedule_detect_retry(void) {
+    cancel_detect_retry();
+    if (!active_cid || iap2_detected) return;
+    /* Armed once more after the last detect so a channel that never answers
+     * is abandoned in detect_timer_fired instead of being held forever. */
+    run_loop_set_timer_handler(detect_timer, detect_timer_fired);
+    run_loop_set_timer(detect_timer, DETECT_RETRY_MS);
+    run_loop_add_timer(detect_timer);
+    detect_timer_armed = 1;
+}
+
+/* Shares detect_timer: detect retries end when the detect arrives, which is
+ * exactly when the SYN watchdog starts. */
+static void schedule_syn_timeout(void) {
+    cancel_detect_retry();
+    if (!active_cid || link_established) return;
+    run_loop_set_timer_handler(detect_timer, syn_timer_fired);
+    run_loop_set_timer(detect_timer, SYN_TIMEOUT_MS);
+    run_loop_add_timer(detect_timer);
+    detect_timer_armed = 1;
+}
+
+/* The iAP2 channel stalled before the link came up: close it and go back to
+ * paging, as if the iPhone had closed it (0x81). */
+static size_t iap2_rx_len;  /* defined with iap2_rx below */
+static void abandon_stalled_iap2_channel(const char *why) {
+    uint16_t cid = active_cid;
+    if (!cid) return;
+    printf("[CP] iAP2 cid=0x%04x stalled (%s); closing and paging again\n", cid, why);
+    if (&rfcomm_disconnect) bt_send_cmd(&rfcomm_disconnect, cid, 0);
+    else if (have_active_acl_handle && &hci_disconnect)
+        bt_send_cmd(&hci_disconnect, active_acl_handle, 0x13);
+    /* Reset locally too: the close event may never come, and a late 0x81/0x05
+     * for this cid/handle then only repeats this reset. */
+    have_active_acl_handle=0;
+    cancel_detect_retry();active_cid=0;iap2_detected=0;link_established=0;iap2_rx_len=0;reset_wireless_handoff_state();
+    schedule_page(PAGE_RETRY_MS);
+}
+
+static void detect_timer_fired(void *timer) {
+    (void)timer;
+    detect_timer_armed = 0;
+    if (!active_cid || iap2_detected) return;
+    if (detect_count >= DETECT_MAX_ATTEMPTS) {
+        abandon_stalled_iap2_channel("no iAP2 detect reply");
+        return;
+    }
+    send_detect();
+    schedule_detect_retry();
+}
+
+static void syn_timer_fired(void *timer) {
+    (void)timer;
+    detect_timer_armed = 0;
+    if (active_cid && !link_established) abandon_stalled_iap2_channel("no SYN/ACK");
 }
 
 static void bluetooth_handoff_signal_handler(int sig) {
@@ -1303,11 +1516,12 @@ static size_t iap2_rx_len;
 
 static void handle_iap2_frame(uint8_t *pkt, size_t sz) {
     if (sz >= 6 && memcmp(pkt, iap2_detect, 6) == 0 && !iap2_detected) {
-        iap2_detected=1; alarm(0);
+        iap2_detected=1; cancel_detect_retry();
         srand(time(NULL));
         my_initial_psn=(rand()%254)+1;
         my_next_psn=my_initial_psn+1;
         send_syn();
+        schedule_syn_timeout();
         return;
     }
     if (sz < 9 || pkt[0] != 0xff || pkt[1] != 0x5a || ck(pkt, 8) != pkt[8]) return;
@@ -1316,11 +1530,11 @@ static void handle_iap2_frame(uint8_t *pkt, size_t sz) {
     if (ctrl == 0x10) {
         link_established=0; reset_wireless_handoff_state();
         my_initial_psn=(rand()%254)+1; my_next_psn=my_initial_psn+1;
-        send_syn(); return;
+        send_syn(); schedule_syn_timeout(); return;
     }
     if ((ctrl & 0xc0) == 0xc0 && !link_established) {
         peer_psn=seq;
-        if (ack == my_initial_psn) { send_ack(); link_established=1; }
+        if (ack == my_initial_psn) { send_ack(); link_established=1; cancel_detect_retry(); }
         return;
     }
     if (!link_established) return;
@@ -1392,6 +1606,32 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
         exit(62);
     }
 
+    /* BTdaemon went away (crash, launchctl unload, upgrade, SIGTERM). The
+     * client library delivers DAEMON_EVENT_CONNECTION_CLOSED once as a
+     * DAEMON_EVENT_PACKET and frees its connection; nothing will ever
+     * arrive again and any later bt_send_cmd would touch freed memory.
+     * Exit with a distinct code so Showcase hands Bluetooth back instead of
+     * waiting on a helper that can no longer make progress. */
+    if(type==0x05 && sz>=1 && pkt[0]==0x68) {
+        printf("[BT] FATAL: BTstack daemon closed the connection\n");
+        fflush(stdout);
+        fflush(stderr);
+        unlink(BT_READY_PATH);
+        exit(EXIT_BTSTACK_DAEMON_GONE);
+    }
+
+    /* The controller dropped back to HCI_STATE_OFF after setup completed
+     * (daemon power-down, wedged UART): no more pages or iAP2 traffic can
+     * happen, so report it the same way. Before setup, OFF is the normal
+     * initial state reported ahead of power-on. */
+    if(type==4 && sz>=3 && pkt[0]==0x60 && pkt[2]==0 && setup_done) {
+        printf("[BT] FATAL: BTstack reported HCI_STATE_OFF after setup\n");
+        fflush(stdout);
+        fflush(stderr);
+        unlink(BT_READY_PATH);
+        exit(EXIT_BTSTACK_DAEMON_GONE);
+    }
+
     if(type==4&&sz>=1&&pkt[0]==0x6c) return;
 
     if(type==7) {
@@ -1419,22 +1659,66 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
             /* /tmp is emptied at boot, so also keep a persistent copy for
              * the AirPlay info "bluetoothIDs" identity. Without it the
              * iPhone treats the accessory as a different, first-time car. */
-            mkdir("/var/mobile/Library/Showcase", 0755);
+            /* The persistent copy lives in the mobile-owned Showcase folder,
+             * so every step goes through a directory fd opened without
+             * following symlinks (open_showcase_dir); a "Showcase" symlink
+             * planted by mobile cannot redirect the root rename/unlink. */
             const char *idPaths[] = { BT_ID_PATH, BT_ID_PERSIST_PATH, NULL };
+            const char *idNames[] = { BT_ID_PATH_NAME, BT_ID_PERSIST_NAME, NULL };
             for (int p = 0; idPaths[p]; p++) {
-                int addressFd = open(
-                    idPaths[p], O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                if (addressFd >= 0) {
-                    ssize_t written = write(
-                        addressFd, address, (size_t)addressLength);
-                    close(addressFd);
-                    printf("[BT] AirPlay Bluetooth ID %s at %s (%s)\n", address,
-                        idPaths[p],
-                        written == addressLength ? "published" : "short write");
-                } else {
+                int idDirFd = p == 0
+                    ? open(BT_ID_PATH_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                    : open_showcase_dir(1);
+                if (idDirFd < 0) {
+                    printf("[BT] WARN: could not open folder for Bluetooth ID %s: %s\n",
+                        idPaths[p], strerror(errno));
+                    continue;
+                }
+                /* Publish through a temporary file and rename: a crash, a
+                 * power loss or a full volume between open() and write() would
+                 * otherwise leave a truncated ID behind, and the AirPlay info
+                 * reads that file as the car identity — a short value looks
+                 * like a different car to the iPhone. save_last_iphone() uses
+                 * the same temp-plus-rename pattern. */
+                char tempName[64];
+                if (snprintf(tempName, sizeof(tempName), "%s.tmp", idNames[p])
+                        >= (int)sizeof(tempName)) {
+                    printf("[BT] WARN: Bluetooth ID path too long: %s\n",
+                        idPaths[p]);
+                    close(idDirFd);
+                    continue;
+                }
+                int addressFd = open_new_private_file_at(idDirFd, tempName);
+                if (addressFd < 0) {
                     printf("[BT] WARN: could not publish Bluetooth ID at %s: %s\n",
                         idPaths[p], strerror(errno));
+                    close(idDirFd);
+                    continue;
                 }
+                ssize_t written = write(
+                    addressFd, address, (size_t)addressLength);
+                /* fsync before rename so the new ID is on disk before it
+                 * replaces the old one; otherwise a power loss can leave an
+                 * empty file at the final path. */
+                int synced = written == (ssize_t)addressLength
+                    && fsync(addressFd) == 0;
+                if (close(addressFd) != 0 || !synced) {
+                    printf("[BT] WARN: short write for Bluetooth ID at %s\n",
+                        idPaths[p]);
+                    unlinkat(idDirFd, tempName, 0);
+                    close(idDirFd);
+                    continue;
+                }
+                if (renameat(idDirFd, tempName, idDirFd, idNames[p]) != 0) {
+                    printf("[BT] WARN: could not publish Bluetooth ID at %s: %s\n",
+                        idPaths[p], strerror(errno));
+                    unlinkat(idDirFd, tempName, 0);
+                    close(idDirFd);
+                    continue;
+                }
+                close(idDirFd);
+                printf("[BT] AirPlay Bluetooth ID %s at %s (published)\n",
+                    address, idPaths[p]);
             }
         }
     }
@@ -1477,12 +1761,20 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
         printf("[CP] Connected status=0x%02X handle=0x%04X\n",
                sz > 2 ? pkt[2] : 0xff, sz > 4 ? R16(pkt,3) : 0);
         break;
-    case 0x05:
+    case 0x05: {
+        uint16_t handle = sz > 4 ? (R16(pkt,3) & 0x0fff) : 0;
         printf("[CP] Disconnected handle=0x%04X reason=0x%02X\n",
-               sz > 4 ? R16(pkt,3) : 0, sz > 5 ? pkt[5] : 0xff);
-        active_cid=0;iap2_detected=0;link_established=0;iap2_rx_len=0;reset_wireless_handoff_state();
+               handle, sz > 5 ? pkt[5] : 0xff);
+        if (active_cid && (sz <= 4 || !have_active_acl_handle || handle != active_acl_handle)) {
+            printf("[CP] not the iAP2 link (handle=0x%04X); keeping cid=0x%04x\n",
+                   active_acl_handle, active_cid);
+            break;
+        }
+        have_active_acl_handle=0;
+        cancel_detect_retry();active_cid=0;iap2_detected=0;link_established=0;iap2_rx_len=0;reset_wireless_handoff_state();
         schedule_page(PAGE_RETRY_MS);
         break;
+    }
     case 0x06:
         printf("[CP] Auth complete status=0x%02X handle=0x%04X\n",
                sz > 2 ? pkt[2] : 0xff, sz > 4 ? R16(pkt,3) : 0);
@@ -1547,6 +1839,7 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
         if (!page_busy) break;
         if (page_channel && !active_cid) {
             printf("[PAGE] opening iAP2 to the iPhone\n");
+            page_create_pending = 1;
             bt_send_cmd(&rfcomm_create_channel, page_addr, page_channel);
         } else {
             page_busy = 0;
@@ -1557,33 +1850,69 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
     case 0x82:{
         if(sz<11) break;
         uint16_t c=R16(pkt,9);
+        if (active_cid) {
+            /* One iAP2 session at a time: an incoming channel (same iPhone
+             * racing our own page, or a second phone) must not replace the
+             * live one mid-handshake. Product default: first channel wins. */
+            printf("[CP] RFCOMM IN cid=0x%04x refused (iAP2 cid=0x%04x active)\n", c, active_cid);
+            if (&rfcomm_decline_connection) bt_send_cmd(&rfcomm_decline_connection,c,0x13);
+            break;
+        }
         bt_send_cmd(&rfcomm_accept_connection,c);
         printf("[CP] RFCOMM IN\n");
         break;
     }
-    case 0x80:
+    case 0x80: {
         if(sz<3) break;
-        page_busy = 0;
+        /* Only the channel our own page created finishes the page. An incoming
+         * channel (BTstack sets pkt[16]=1 for it) or one for another address/
+         * server channel must not clear page_busy: that would drop our pending
+         * SDP result (0x91) or let a second outgoing create start. */
+        int page_owned = page_busy && page_create_pending && sz >= 12 &&
+                         !(sz >= 17 && pkt[16]) && pkt[11] == page_channel;
+        for (int i = 0; page_owned && i < 6; i++)
+            if (pkt[8-i] != page_addr[i]) page_owned = 0;
+        if (page_owned) { page_busy = 0; page_create_pending = 0; }
         if(pkt[2]!=0){
-            printf("[PAGE] iAP2 channel failed status=0x%02X; retrying\n", pkt[2]);
-            schedule_page(PAGE_RETRY_MS);
+            printf("[PAGE] iAP2 channel failed status=0x%02X (%s); %s\n", pkt[2],
+                   page_owned ? "our page" : "not our page",
+                   page_busy ? "page still in progress" : "retrying");
+            if (!page_busy) schedule_page(PAGE_RETRY_MS);
+        }
+        if(pkt[2]==0 && sz>=16 && active_cid){
+            /* Outgoing page and incoming accept both completed: keep the
+             * channel already carrying iAP2 and close the duplicate, otherwise
+             * its data/close events are ignored and the live handshake is lost. */
+            uint16_t extra=R16(pkt,12);
+            if (extra != active_cid) {
+                printf("[CP] RFCOMM OPEN cid=0x%04x ignored (iAP2 cid=0x%04x active); closing it\n",
+                       extra, active_cid);
+                if (&rfcomm_disconnect) bt_send_cmd(&rfcomm_disconnect,extra,0);
+            }
+            break;
         }
         if(pkt[2]==0 && sz>=16){
             for(int i=0;i<6;i++) peer_addr[i]=pkt[8-i];
             have_peer=1;
             active_cid=R16(pkt,12);rfcomm_mtu=R16(pkt,14);
+            active_acl_handle=R16(pkt,9)&0x0fff;have_active_acl_handle=1;
             iap2_detected=0;link_established=0;detect_count=0;iap2_rx_len=0;reset_wireless_handoff_state();
             printf("[CP] RFCOMM OPEN cid=0x%04x mtu=%d\n",active_cid,rfcomm_mtu);
             bt_progress(BT_PROGRESS_CONNECTED);
             usleep(100000);
             send_detect();
-            signal(SIGALRM,alarm_handler);
-            alarm(1);
+            schedule_detect_retry();
         }
         break;
+    }
     case 0x81:
+        if (sz >= 4 && active_cid && R16(pkt,2) != active_cid) {
+            printf("[CP] RFCOMM CLOSED cid=0x%04x (not iAP2 cid=0x%04x)\n", R16(pkt,2), active_cid);
+            break;
+        }
         printf("[CP] RFCOMM CLOSED\n");
-        alarm(0);active_cid=0;iap2_detected=0;link_established=0;iap2_rx_len=0;reset_wireless_handoff_state();
+        have_active_acl_handle=0;
+        cancel_detect_retry();active_cid=0;iap2_detected=0;link_established=0;iap2_rx_len=0;reset_wireless_handoff_state();
         schedule_page(PAGE_RETRY_MS);
         break;
     }
@@ -1598,6 +1927,9 @@ int main(int argc, char *argv[]) {
     unlink(BT_DOWN_PATH);
     unlink(BT_ID_PATH);
     signal(SIGUSR1, bluetooth_handoff_signal_handler);
+    /* A write to the BTstack socket after the daemon closed it must fail
+     * with EPIPE, not kill the helper before it can report why it stopped. */
+    signal(SIGPIPE, SIG_IGN);
     bt_progress(0);
     if (parse_args(argc, argv) != 0) {
         fprintf(stderr, "[BT] Missing or invalid Wi-Fi credentials or arguments\n");

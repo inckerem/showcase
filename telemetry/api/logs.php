@@ -5,6 +5,10 @@ require_post('application/x-tar');
 
 const MAX_LOG_BYTES = 8 * 1024 * 1024;
 const MAX_STORED_LOGS = 100;
+// One client network must not take every slot: a few uploads per hour and a
+// small share of the store (operator review still clears the rest).
+const MAX_LOGS_PER_CLIENT_HOUR = 3;
+const MAX_STORED_LOGS_PER_CLIENT = 10;
 if ((int)($_SERVER['CONTENT_LENGTH'] ?? 0) > MAX_LOG_BYTES) {
     http_response_code(413);
     exit;
@@ -14,8 +18,6 @@ if (!is_dir($dir) || !is_writable($dir)) {
     http_response_code(503);
     exit;
 }
-$name = gmdate('Ymd-His') . '-' . bin2hex(random_bytes(8)) . '.tar';
-$path = $dir . '/' . $name;
 $input = fopen('php://input', 'rb');
 $temp = tempnam($dir, '.incoming-');
 $output = $temp !== false ? fopen($temp, 'r+b') : false;
@@ -41,11 +43,34 @@ if (!$lock || !flock($lock, LOCK_EX)) {
     http_response_code(503);
     exit;
 }
+try {
+    $client = substr(client_key(), 0, 12);
+} catch (RuntimeException $error) {
+    error_log('Showcase client key failed: ' . $error->getMessage());
+    unlink($temp);
+    http_response_code(503);
+    exit;
+}
+foreach (glob($dir . '/.clients/*') ?: [] as $old) if (filemtime($old) < time() - 3600) unlink($old);
+if (count(glob($dir . '/*-' . $client . '-*.tar') ?: []) >= MAX_STORED_LOGS_PER_CLIENT) {
+    unlink($temp);
+    http_response_code(429);
+    exit;
+}
 if (count(glob($dir . '/*.tar') ?: []) >= MAX_STORED_LOGS) {
     unlink($temp);
     http_response_code(507);
     exit;
 }
+// Last check: only an upload that will take a slot consumes the hourly budget.
+if (!client_rate_ok($dir, MAX_LOGS_PER_CLIENT_HOUR)) {
+    unlink($temp);
+    http_response_code(429);
+    exit;
+}
+// The client tag (keyed hash prefix, not the address) enables the per-client quota.
+$name = gmdate('Ymd-His') . '-' . $client . '-' . bin2hex(random_bytes(8)) . '.tar';
+$path = $dir . '/' . $name;
 if (!rename($temp, $path)) {
     unlink($temp);
     http_response_code(503);

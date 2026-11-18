@@ -15,7 +15,9 @@ with tempfile.TemporaryDirectory(prefix="bluetooth recovery ") as directory:
                                  ("calls", "ready", "socket", "owned"))
     restore = root / "restore"
     command = root / "mock command"
-    command.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "' + str(log) + '"\n')
+    # killall -0 reports "no such process" so the BTdaemon wait loop ends.
+    command.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "' + str(log) + '"\n'
+                       '[ "$1" = "-0" ] && exit 1\nexit 0\n')
     command.chmod(0o755)
     btstack, bluetool, bluetoothd = (root / name for name in
                                      ("BTstack plist", "BlueTool plist",
@@ -43,6 +45,7 @@ with tempfile.TemporaryDirectory(prefix="bluetooth recovery ") as directory:
         assert guard.wait(timeout=5) == 0
         assert log.read_text().splitlines() == [
             "-TERM CarDisplaySim", "unload " + str(btstack),
+            "-KILL BTdaemon", "-0 BTdaemon",
             "load " + str(bluetool), "load " + str(bluetoothd)]
         assert not ready.exists() and not socket.exists() and not restore.exists()
         # The restore file must abort the wait loop before the owner dies.

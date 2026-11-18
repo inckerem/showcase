@@ -54,6 +54,14 @@ for name in ('control.tar.gz', 'data.tar.gz'):
 
 control = archives['control.tar.gz']
 data = archives['data.tar.gz']
+# Every entry must be root-owned: postinst makes helpers setuid root, so a
+# mobile-owned payload could be swapped before configure runs.
+for name, archive in archives.items():
+    for member in archive:
+        if member.uid != 0 or member.gid != 0:
+            raise SystemExit(f'{name}: {member.name} is owned by {member.uid}:{member.gid}, not root')
+        if member.isfile() and member.mode & 0o022:
+            raise SystemExit(f'{name}: {member.name} is group/other writable')
 def extract_member(archive, name):
     for member in archive:
         if member.name.removeprefix('./') == name:
