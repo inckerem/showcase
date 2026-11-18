@@ -32,7 +32,12 @@ def archive(entries):
     return gzip.compress(buf.getvalue(), compresslevel=9, mtime=0)
 root = out/'root'
 control = archive([('./'+n, here/n, mode) for n, mode in [('control',0o644),('postinst',0o755),('prerm',0o755),('postrm',0o755)]])
-items = [('var/lib/showcase-power',0o755),('usr/libexec/showcase-powerd',0o755),('Library/LaunchDaemons/tr.net.kcs.showcase.powerd.plist',0o644),('Library/MobileSubstrate/DynamicLibraries/ShowcasePower.dylib',0o755),('Library/MobileSubstrate/DynamicLibraries/ShowcasePower.plist',0o644)]
+# Ship the parent directories as their own entries, parent-first. Without them
+# dpkg cannot place the files on a device where the tweak directory does not
+# already exist (e.g. a Chimera device with no Substitute yet): it fails with
+# "unable to create .../ShowcasePower.dylib.dpkg-new: No such file or directory"
+# and aborts the whole transaction, which also leaves Showcase unconfigured.
+items = [('usr',0o755),('usr/libexec',0o755),('Library',0o755),('Library/MobileSubstrate',0o755),('Library/MobileSubstrate/DynamicLibraries',0o755),('var',0o755),('var/lib',0o755),('var/lib/showcase-power',0o755),('Library/LaunchDaemons',0o755),('usr/libexec/showcase-powerd',0o755),('Library/LaunchDaemons/tr.net.kcs.showcase.powerd.plist',0o644),('Library/MobileSubstrate/DynamicLibraries/ShowcasePower.dylib',0o755),('Library/MobileSubstrate/DynamicLibraries/ShowcasePower.plist',0o644)]
 data = archive([('./'+n,root/n,mode) for n,mode in items])
 def member(name, body):
     header=f'{name + "/":<16}{int(time.time()):<12}{0:<6}{0:<6}{"100644":<8}{len(body):<10}`\n'.encode('ascii')
